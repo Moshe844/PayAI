@@ -25,7 +25,7 @@ import {
   Prism as SyntaxHighlighter,
 } from "react-syntax-highlighter";
 
-import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
+import { oneDark, vscDarkPlus } from "react-syntax-highlighter/dist/esm/styles/prism";
 
 import remarkGfm from "remark-gfm";
 
@@ -187,6 +187,16 @@ function compactContextPreview(value: string) {
   const lines = trimmed.split(/\r?\n/);
   const preview = lines.slice(0, 12).join("\n");
   return preview.length > 1600 ? `${preview.slice(0, 1600)}...` : preview;
+}
+
+function codeLanguageFromContent(value: string) {
+  if (/#import|NSString|NSInteger|BOOL|@interface|@implementation|\[[A-Za-z]/.test(value)) return "objectivec";
+  if (/import\s+React|className=|<\/?[A-Za-z]/.test(value)) return "tsx";
+  if (/using\s+System|public\s+class|namespace\s+/.test(value)) return "csharp";
+  if (/function\s+\w*|const\s+\w+|let\s+\w+|=>/.test(value)) return "typescript";
+  if (/^\s*(SELECT|UPDATE|INSERT|DELETE)\b/im.test(value)) return "sql";
+  if (/^\s*[{[]/.test(value.trim())) return "json";
+  return "text";
 }
 
 function ChatMessages({
@@ -777,7 +787,7 @@ function ChatMessages({
                             return (
                               <div
                                 key={item.key}
-                                className="overflow-hidden rounded-2xl bg-slate-950 text-slate-100 shadow-sm ring-1 ring-slate-800"
+                                className="overflow-hidden rounded-2xl bg-[#1e1e1e] text-[#d4d4d4] shadow-sm ring-1 ring-[#3c3c3c]"
                               >
                                 <div className="flex items-center justify-between gap-3 border-b border-slate-800 px-3 py-2">
                                   <div className="text-xs font-black uppercase tracking-wide text-slate-300">
@@ -801,13 +811,39 @@ function ChatMessages({
                                     {expanded ? "Minimize" : "Expand"}
                                   </button>
                                 </div>
-                                <pre
-                                  className={`overscroll-contain whitespace-pre-wrap break-words p-3 text-xs leading-5 text-emerald-100 ${
-                                    expanded ? "max-h-[520px] overflow-auto" : "max-h-40 overflow-hidden"
-                                  }`}
-                                >
-                                  {expanded ? item.value.trim() : compactContextPreview(item.value)}
-                                </pre>
+                                {item.key === "code" ? (
+                                  <SyntaxHighlighter
+                                    style={vscDarkPlus as Record<string, CSSProperties>}
+                                    language={codeLanguageFromContent(item.value)}
+                                    PreTag="div"
+                                    wrapLongLines
+                                    customStyle={{
+                                      margin: 0,
+                                      maxHeight: expanded ? "520px" : "160px",
+                                      overflow: expanded ? "auto" : "hidden",
+                                      padding: "14px",
+                                      background: "#1e1e1e",
+                                      fontSize: "13px",
+                                      lineHeight: 1.65,
+                                    }}
+                                    codeTagProps={{
+                                      style: {
+                                        fontFamily:
+                                          "Consolas, 'Cascadia Code', 'Courier New', monospace",
+                                      },
+                                    }}
+                                  >
+                                    {expanded ? item.value.trim() : compactContextPreview(item.value)}
+                                  </SyntaxHighlighter>
+                                ) : (
+                                  <pre
+                                    className={`overscroll-contain whitespace-pre-wrap break-words bg-[#1e1e1e] p-3 text-xs leading-5 text-[#d4d4d4] ${
+                                      expanded ? "max-h-[520px] overflow-auto" : "max-h-40 overflow-hidden"
+                                    }`}
+                                  >
+                                    {expanded ? item.value.trim() : compactContextPreview(item.value)}
+                                  </pre>
+                                )}
                               </div>
                             );
                           })}
