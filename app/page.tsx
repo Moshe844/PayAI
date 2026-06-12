@@ -3,6 +3,7 @@
 import { startTransition, useEffect, useMemo, useRef, useState } from "react";
 import Image from "next/image";
 import {
+  Activity,
   BrainCircuit,
   ChevronDown,
   CreditCard,
@@ -13,6 +14,7 @@ import {
   Radio,
   RotateCcw,
   Search,
+  ShieldAlert,
   Usb,
   Webhook,
   Wrench,
@@ -156,6 +158,8 @@ type WatchModeResult = {
   }[];
   error?: string;
 };
+
+type WatchEvent = NonNullable<WatchModeResult["events"]>[number];
 
 type ProjectFileContent = {
   file: string;
@@ -465,6 +469,8 @@ export default function Home() {
   const [gitStatusResult, setGitStatusResult] = useState<GitStatusResult | null>(null);
   const [watchModeResult, setWatchModeResult] = useState<WatchModeResult | null>(null);
   const [watchFilePath, setWatchFilePath] = useState("");
+  const [liveCaptureEnabled, setLiveCaptureEnabled] = useState(false);
+  const [dismissedLiveCaptureEventKey, setDismissedLiveCaptureEventKey] = useState("");
   const [toolsOpen, setToolsOpen] = useState(false);
   const [emvDecodeResult, setEmvDecodeResult] = useState<EmvTlvDecodeResult | null>(null);
   const chatEndRef = useRef<HTMLDivElement | null>(null);
@@ -581,6 +587,32 @@ export default function Home() {
 
     return () => window.clearTimeout(clearStatusTimer);
   }, [agentStatus, loading, agentLoading, timelineLoading, dependencyInstalling]);
+
+  useEffect(() => {
+    if (!liveCaptureEnabled || !connectedProjectPath) return;
+
+    let canceled = false;
+    const pollLiveCapture = async () => {
+      try {
+        const response = await fetch("/api/local-agent/project/watch/events", { cache: "no-store" });
+        const data = (await response.json()) as WatchModeResult;
+        if (!canceled) setWatchModeResult(data);
+      } catch (err: unknown) {
+        if (!canceled) {
+          setLiveCaptureEnabled(false);
+          setAgentStatus(`Live Capture paused: ${errorMessage(err)}`);
+        }
+      }
+    };
+
+    const pollTimer = window.setInterval(pollLiveCapture, 4000);
+    void pollLiveCapture();
+
+    return () => {
+      canceled = true;
+      window.clearInterval(pollTimer);
+    };
+  }, [connectedProjectPath, liveCaptureEnabled]);
 
   const hasConversation = messages.length > 0;
   const hasAttachment =
@@ -750,6 +782,28 @@ export default function Home() {
 
     return alerts.slice(0, 8);
   }, [liveInspectorResult, sandboxRunnerResult, watchModeResult]);
+  const liveCaptureEvent = useMemo(() => {
+    if (!liveCaptureEnabled) return null;
+
+    return (
+      [...(watchModeResult?.events || [])]
+        .sort((left, right) => new Date(right.at).getTime() - new Date(left.at).getTime())
+        .find((event) => {
+        const eventKey = watchEventKey(event);
+        const hasRiskyAnalysis = Boolean(event.analysis && event.analysis.risk !== "low");
+        const hasBlockingIssue = Boolean(event.issues?.some((issue) => issue.severity !== "info"));
+
+        return eventKey !== dismissedLiveCaptureEventKey && (hasRiskyAnalysis || hasBlockingIssue);
+        }) || null
+    );
+  }, [dismissedLiveCaptureEventKey, liveCaptureEnabled, watchModeResult]);
+  useEffect(() => {
+    if (!liveCaptureEvent) return;
+
+    const target = liveCaptureEvent.relative || liveCaptureEvent.file;
+    const title = liveCaptureEvent.analysis?.title || liveCaptureEvent.issues?.[0]?.message || "possible breakage";
+    setAgentStatus(`Live Capture flagged ${target}: ${title}`);
+  }, [liveCaptureEvent]);
   const canBuildTimeline = hasFreshTimelineInput || hasConversation || timelineSourceCandidates.length > 0;
   const runnerSrcDoc = useMemo(
     () => buildRunnerSrcDoc(runnerHtml, runnerCss, runnerJs),
@@ -760,6 +814,19 @@ export default function Home() {
     return /\b(screenshot|screen shot|image|picture|photo|attached image|uploaded image|jpg|jpeg|png|webp)\b/i.test(
       text,
     );
+  }
+
+  function watchEventKey(event: WatchEvent) {
+    return event.eventId || `${event.watcherId || event.id || event.file}-${event.at}`;
+  }
+
+  function resolveProjectFilePath(file: string) {
+    const clean = file.trim();
+    if (!clean || /^[A-Za-z]:[\\/]/.test(clean)) return clean;
+
+    return connectedProjectPath
+      ? `${connectedProjectPath.replace(/[\\/]+$/, "")}\\${clean.replace(/^[\\/]+/, "").replace(/\//g, "\\")}`
+      : clean;
   }
 
   function imageConversionTarget(text: string): ImageConversionTarget | null {
@@ -1578,6 +1645,115 @@ ${uploads ? `\n${uploads}` : ""}`;
       setAgentStatus(`Watch mode failed: ${errorMessage(err)}`);
     } finally {
       setProjectIqLoading(false);
+    }
+  }
+
+  async function startLiveCapture() {
+    if (!connectedProjectPath) {
+      setAgentStatus("Connect a project first, then start Live Capture.");
+      return;
+    }
+
+    setProjectIqOpen(true);
+    setProjectIqLoading(true);
+    setAgentStatus("Starting Live Capture...");
+
+    try {
+      await ensureLocalAgentProjectRoot();
+
+      const gitResponse = await fetch("/api/local-agent/project/git/status");
+      const gitData = (await gitResponse.json()) as GitStatusResult;
+      setGitStatusResult(gitData);
+
+      const currentWatchers = watchModeResult?.watchers || [];
+      const typedFile = watchFilePath.trim();
+      const changedFile = gitData.ok ? gitData.changedFiles?.find((file) => Boolean(file.file))?.file || "" : "";
+      const fileToWatch = typedFile || (currentWatchers.length ? "" : resolveProjectFilePath(changedFile));
+
+      if (!currentWatchers.length && fileToWatch) {
+        const watchResponse = await fetch("/api/local-agent/project/watch/start", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ file: fileToWatch }),
+        });
+        const watchData = await watchResponse.json();
+        if (!watchData.ok) throw new Error(watchData.error || "Could not start file watch.");
+        setWatchFilePath(watchData.file || fileToWatch);
+      }
+
+      if (!currentWatchers.length && !fileToWatch) {
+        setAgentStatus("Live Capture needs a file to watch. Paste a full file path or make a Git change first.");
+        return;
+      }
+
+      const eventsResponse = await fetch("/api/local-agent/project/watch/events", { cache: "no-store" });
+      setWatchModeResult((await eventsResponse.json()) as WatchModeResult);
+      setLiveCaptureEnabled(true);
+      setDismissedLiveCaptureEventKey("");
+      setAgentStatus("Live Capture is watching saved code changes.");
+    } catch (err: unknown) {
+      setLiveCaptureEnabled(false);
+      setAgentStatus(`Live Capture failed: ${errorMessage(err)}`);
+    } finally {
+      setProjectIqLoading(false);
+    }
+  }
+
+  async function openAgentFromWatchEvent(event: WatchEvent) {
+    const issueSummary = (event.issues || [])
+      .filter((issue) => issue.severity !== "info")
+      .map((issue) => `- ${issue.severity.toUpperCase()}: ${issue.message}`)
+      .join("\n");
+    const analysisSummary = event.analysis
+      ? `Title: ${event.analysis.title}
+Risk: ${event.analysis.risk}
+Confidence: ${event.analysis.confidence}%
+Probable cause: ${event.analysis.probableCause}
+Suggested fix: ${event.analysis.suggestedFix}
+Evidence:
+${event.analysis.evidence.map((item) => `- ${item}`).join("\n")}
+Validation:
+${event.analysis.validation.map((item) => `- ${item}`).join("\n")}`
+      : "No structured analysis was attached to this event.";
+    const prompt = `Live Capture flagged a risky code change while I was coding.
+
+File: ${event.file}
+Relative: ${event.relative || "unknown"}
+Event: ${event.eventType}
+Changed lines: +${event.addedLines || 0} / -${event.removedLines || 0}
+Time: ${event.at}
+
+WATCH ANALYSIS
+${analysisSummary}
+
+WATCH ISSUES
+${issueSummary || "None"}
+
+RECENT FILE PREVIEW
+${event.preview || "(No preview captured.)"}
+
+Please inspect the exact project file and neighboring code. Decide whether this is invalid code, wrongly placed code, broken logic, or a false positive. If there is a real issue, produce a safe patch preview with the corrected code and validation steps.`;
+
+    setAgentSessionOpen(true);
+    setAgentSessionMessages([]);
+    setAgentSessionUploads([]);
+    setAgentLoading(true);
+    setAgentStatus("PayFix Agent is investigating the Live Capture event...");
+
+    try {
+      await runAgentPromptInSession({
+        userContent: prompt,
+        submittedLog: "",
+        submittedCode: event.preview || "",
+        submittedUploadedFiles: [],
+        submittedComputerSearchResults: "",
+        resetSession: true,
+      });
+      setDismissedLiveCaptureEventKey(watchEventKey(event));
+    } catch {
+      // runAgentPromptInSession already writes the failure into the Agent session.
+    } finally {
+      setAgentLoading(false);
     }
   }
 
@@ -3651,6 +3827,62 @@ ${shouldUseProjectContext ? fullProjectFiles || "No project file content was loa
             </div>
           )}
 
+          {liveCaptureEvent && (
+            <div className="pointer-events-none fixed bottom-28 right-[206px] z-[150] w-[min(520px,calc(100vw-240px))]">
+              <div className="pointer-events-auto overflow-hidden rounded-2xl border border-amber-200 bg-white shadow-2xl shadow-slate-950/20">
+                <div className="flex items-start gap-3 bg-amber-50 px-4 py-3 text-amber-950">
+                  <ShieldAlert size={20} className="mt-0.5 shrink-0 text-amber-600" />
+                  <div className="min-w-0 flex-1">
+                    <div className="text-sm font-black">Live Capture flagged this save</div>
+                    <div className="mt-1 break-all text-xs font-semibold text-amber-800">
+                      {liveCaptureEvent.relative || liveCaptureEvent.file}
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setDismissedLiveCaptureEventKey(watchEventKey(liveCaptureEvent))}
+                    className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-white/70 text-amber-700 transition hover:bg-white"
+                    title="Dismiss Live Capture alert"
+                  >
+                    <X size={14} />
+                  </button>
+                </div>
+                <div className="px-4 py-3">
+                  <div className="text-sm font-bold text-slate-950">
+                    {liveCaptureEvent.analysis?.title || liveCaptureEvent.issues?.[0]?.message || "Possible regression"}
+                  </div>
+                  <p className="mt-1 text-xs leading-5 text-slate-600">
+                    {liveCaptureEvent.analysis?.probableCause ||
+                      liveCaptureEvent.issues?.find((issue) => issue.severity !== "info")?.message ||
+                      "PayFix noticed a risky watched-file change."}
+                  </p>
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      onClick={() => openAgentFromWatchEvent(liveCaptureEvent)}
+                      disabled={agentLoading}
+                      className="inline-flex h-9 items-center gap-2 rounded-xl bg-blue-600 px-4 text-xs font-black text-white transition hover:bg-blue-500 disabled:bg-slate-300"
+                    >
+                      <BrainCircuit size={15} />
+                      Open Agent Fix
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setProjectIqOpen(true);
+                        void refreshWatchMode();
+                      }}
+                      className="inline-flex h-9 items-center gap-2 rounded-xl border border-slate-300 bg-white px-4 text-xs font-black text-slate-700 transition hover:bg-slate-50"
+                    >
+                      <Activity size={15} />
+                      View in IQ
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
           <Composer
             hasConversation={hasConversation}
             hasAttachment={hasAttachment}
@@ -4140,6 +4372,19 @@ ${shouldUseProjectContext ? fullProjectFiles || "No project file content was loa
                 </button>
                 <button
                   type="button"
+                  onClick={liveCaptureEnabled ? () => setLiveCaptureEnabled(false) : startLiveCapture}
+                  disabled={projectIqLoading}
+                  className={`inline-flex h-10 items-center gap-2 rounded-xl px-4 text-sm font-bold shadow-sm transition disabled:bg-slate-300 ${
+                    liveCaptureEnabled
+                      ? "border border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100"
+                      : "bg-indigo-600 text-white hover:bg-indigo-500"
+                  }`}
+                >
+                  <Activity size={16} />
+                  {liveCaptureEnabled ? "Live Capture On" : "Capture Live Moves"}
+                </button>
+                <button
+                  type="button"
                   onClick={clearWatchMode}
                   disabled={projectIqLoading}
                   className="inline-flex h-10 items-center gap-2 rounded-xl border border-rose-200 bg-white px-4 text-sm font-bold text-rose-700 shadow-sm transition hover:bg-rose-50"
@@ -4176,6 +4421,37 @@ ${shouldUseProjectContext ? fullProjectFiles || "No project file content was loa
                       >
                         {smartWatchAlerts.length ? `${smartWatchAlerts.length} alert(s)` : "Clean"}
                       </span>
+                    </div>
+
+                    <div
+                      className={`mt-4 rounded-2xl border p-3 ${
+                        liveCaptureEnabled
+                          ? "border-emerald-200 bg-emerald-50 text-emerald-950"
+                          : "border-slate-200 bg-slate-50 text-slate-700"
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-3">
+                        <div>
+                          <div className="text-xs font-black uppercase tracking-wide">
+                            {liveCaptureEnabled ? "Live Capture Active" : "Live Capture"}
+                          </div>
+                          <p className="mt-1 text-xs leading-5">
+                            Polls watched saves and flags invalid code, misplaced edits, risky logic, and broken checks.
+                          </p>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={liveCaptureEnabled ? () => setLiveCaptureEnabled(false) : startLiveCapture}
+                          disabled={projectIqLoading}
+                          className={`shrink-0 rounded-xl px-3 py-2 text-xs font-black transition disabled:bg-slate-200 ${
+                            liveCaptureEnabled
+                              ? "bg-white text-emerald-700 ring-1 ring-emerald-200 hover:bg-emerald-100"
+                              : "bg-slate-950 text-white hover:bg-slate-800"
+                          }`}
+                        >
+                          {liveCaptureEnabled ? "Pause" : "Start"}
+                        </button>
+                      </div>
                     </div>
 
                     <div className="mt-4 space-y-2">
@@ -4364,6 +4640,18 @@ ${shouldUseProjectContext ? fullProjectFiles || "No project file content was loa
                                 </div>
                               ))}
                             </div>
+                          ) : null}
+                          {(event.analysis?.risk && event.analysis.risk !== "low") ||
+                          event.issues?.some((issue) => issue.severity !== "info") ? (
+                            <button
+                              type="button"
+                              onClick={() => openAgentFromWatchEvent(event)}
+                              disabled={agentLoading}
+                              className="mt-3 inline-flex h-9 items-center gap-2 rounded-xl bg-blue-600 px-3 text-xs font-black text-white transition hover:bg-blue-500 disabled:bg-slate-300"
+                            >
+                              <BrainCircuit size={14} />
+                              Open Agent Fix
+                            </button>
                           ) : null}
                           <div className="mt-2 text-[11px] font-semibold text-slate-400">
                             {new Date(event.at).toLocaleTimeString()}
