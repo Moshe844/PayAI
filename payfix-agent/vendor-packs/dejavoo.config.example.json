@@ -1,0 +1,18 @@
+{
+  "timeoutMs": 10000,
+  "sdkModule": "",
+  "sdkMethods": {
+    "start-sale": "startSale",
+    "get-terminal-status": "getTerminalStatus"
+  },
+  "commands": {
+    "start-sale": {
+      "hex": "",
+      "description": "Optional: exact Dejavoo-approved payment command bytes for your gateway profile."
+    },
+    "get-terminal-status": {
+      "hex": "",
+      "description": "Optional: exact Dejavoo-approved status command bytes."
+    }
+  }
+}

@@ -19,8 +19,95 @@
   }
 }
 
+/* === Global page lock: prevent the document from scrolling ===
+   This keeps the composer fixed/visible and prevents the whole body
+   from moving. Internal areas (e.g. chat messages) should use
+   the .allow-scroll utility (see below) to enable internal scrolling. */
+html,
+body,
+#__next {
+  height: 100%;
+  min-height: 100%;
+  overflow: hidden;
+}
+
 body {
   background: var(--background);
   color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  font-family: var(--font-geist-sans), Arial, Helvetica, sans-serif;
+  font-size: 15px;
+  font-weight: 500;
+  line-height: 1.5;
+  font-feature-settings: "rlig" 1, "calt" 1;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  /* keep full width when locked */
+  width: 100%;
+}
+
+/* Utility: apply this class to the chat/messages container so it scrolls internally */
+.allow-scroll {
+  height: 100%;
+  overflow: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+/* Small helper if you need a fixed-height messages area:
+   .messages-area { height: calc(100vh - 96px); overflow: auto; } */
+
+/* keep form controls accessible styling */
+button,
+input,
+textarea,
+select {
+  outline-color: #2563eb;
+  font: inherit;
+  font-weight: 600;
+}
+
+textarea,
+input,
+select {
+  color: #0f172a;
+}
+
+textarea::placeholder,
+input::placeholder {
+  color: #64748b;
+  opacity: 1;
+}
+
+button {
+  letter-spacing: 0;
+}
+
+/* selection color */
+::selection {
+  background: #bfdbfe;
+  color: #0f172a;
+}
+
+
+/* Ensure long strings wrap and break inside chat messages */
+.prose {
+  word-wrap: break-word;
+  overflow-wrap: break-word;
+  word-break: break-word;
+  white-space: pre-wrap; /* preserve whitespace and wrap */
+  color: #0f172a;
+}
+
+.prose p,
+.prose li {
+  font-size: 15px;
+  line-height: 1.65;
+}
+
+/* Add this class to message containers to ensure wrapping */
+.message {
+  word-wrap: break-word;
+  overflow-wrap: break-word;
+  word-break: break-word;
+  white-space: pre-wrap;
 }

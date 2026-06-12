@@ -1,0 +1,18 @@
+{
+  "timeoutMs": 10000,
+  "sdkModule": "",
+  "sdkMethods": {
+    "start-card-read": "startCardRead",
+    "get-device-info": "getDeviceInfo"
+  },
+  "commands": {
+    "start-card-read": {
+      "hex": "",
+      "description": "Optional: exact ID TECH-approved command bytes for starting card read on your model/firmware."
+    },
+    "get-device-info": {
+      "hex": "",
+      "description": "Optional: exact ID TECH-approved command bytes for querying device identity."
+    }
+  }
+}

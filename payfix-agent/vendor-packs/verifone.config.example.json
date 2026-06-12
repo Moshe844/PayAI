@@ -1,0 +1,18 @@
+{
+  "timeoutMs": 10000,
+  "sdkModule": "",
+  "sdkMethods": {
+    "start-sale": "startSale",
+    "get-terminal-status": "getTerminalStatus"
+  },
+  "commands": {
+    "start-sale": {
+      "hex": "",
+      "description": "Optional: exact Verifone-approved ECR/SDK command bytes for your estate."
+    },
+    "get-terminal-status": {
+      "hex": "",
+      "description": "Optional: exact Verifone-approved status command bytes."
+    }
+  }
+}

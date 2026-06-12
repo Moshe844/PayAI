@@ -1,0 +1,14 @@
+{
+  "name": "agent-test-project",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "check": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "uuid": "^14.0.0"
+  }
+}
