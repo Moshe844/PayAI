@@ -85,7 +85,7 @@ const inputClass =
   "rounded-xl border border-slate-300 bg-white px-3 py-3 text-[15px] font-medium text-slate-950 shadow-sm transition placeholder:text-slate-400 focus:border-blue-500 focus:ring-4 focus:ring-blue-100";
 
 const codeInputClass =
-  "rounded-xl border border-[#3c3c3c] bg-[#1e1e1e] px-3 py-3 font-mono text-[14px] font-medium leading-6 text-[#d4d4d4] shadow-inner outline-none transition placeholder:text-[#858585] selection:bg-[#264f78] focus:border-[#007acc] focus:ring-4 focus:ring-[#007acc]/20";
+  "rounded-xl border border-slate-300 bg-white px-3 py-3 font-mono text-[14px] font-medium leading-6 text-[#1f1f1f] shadow-inner outline-none transition placeholder:text-slate-400 selection:bg-[#add6ff] focus:border-[#007acc] focus:ring-4 focus:ring-[#007acc]/20";
 
 const panelClass =
   "rounded-2xl bg-white/90 p-4 shadow-sm ring-1 ring-slate-200";
@@ -585,7 +585,7 @@ export default function Composer({
                   style={{ height: composerHeight }}
                   className={`w-full resize-none rounded-b-none px-4 py-3 pr-40 text-[15px] font-medium shadow-sm transition focus:ring-4 ${
                     questionLooksLikeCode
-                      ? "rounded-t-2xl border border-[#3c3c3c] bg-[#1e1e1e] font-mono leading-6 text-[#d4d4d4] caret-[#569cd6] placeholder:text-[#858585] shadow-inner selection:bg-[#264f78] focus:border-[#007acc] focus:ring-[#007acc]/20"
+                      ? "rounded-t-2xl border border-slate-300 bg-white font-mono leading-6 text-[#1f1f1f] caret-[#007acc] placeholder:text-slate-400 shadow-inner selection:bg-[#add6ff] focus:border-[#007acc] focus:ring-[#007acc]/20"
                       : `${inputClass} rounded-t-2xl`
                   }`}
                   spellCheck={!questionLooksLikeCode}
@@ -594,7 +594,7 @@ export default function Composer({
 
                 <div
                   className={`pointer-events-none absolute bottom-3 right-3 rounded-full px-3 py-1 text-xs font-semibold ${
-                    questionLooksLikeCode ? "bg-[#252526] text-[#9cdcfe] shadow-sm ring-1 ring-[#3c3c3c]" : "bg-slate-100 text-slate-500"
+                    questionLooksLikeCode ? "bg-blue-50 text-blue-700 shadow-sm ring-1 ring-blue-200" : "bg-slate-100 text-slate-500"
                   }`}
                 >
                   {questionLooksLikeCode ? "Code detected" : "Paste screenshot"}
