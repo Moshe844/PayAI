@@ -786,6 +786,44 @@ export default function Home() {
     return /\b(decode|encoded|base64|base64url|hex|url encoded|jwt|token)\b/i.test(text);
   }
 
+  function looksLikeSourceCode(value: string) {
+    const trimmed = value.trim();
+    if (!trimmed) return true;
+
+    if (/^[\[{]/.test(trimmed)) {
+      try {
+        JSON.parse(trimmed);
+        return true;
+      } catch {
+        // Keep checking for JavaScript/CSS/object literal style code below.
+      }
+    }
+
+    const lines = trimmed.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    const codeKeywordPattern =
+      /\b(function|const|let|var|class|interface|type|enum|import|export|return|if|else|for|while|switch|case|try|catch|async|await|public|private|protected|namespace|using|def|from|select|update|insert|delete|create|where|join|bool|BOOL|NSString|NSInteger|NSError|void|int|string|boolean)\b/i;
+    const syntaxPattern =
+      /(^\s*(#include|#import|@interface|@implementation|[-+]\s*\(|<\/?[a-z][\s\S]*?>)|=>|::|->|\/\/|\/\*|\*\/|[{}[\]();=<>])/i;
+
+    const codeLikeLines = lines.filter((line) => codeKeywordPattern.test(line) || syntaxPattern.test(line)).length;
+    const symbolCount = (trimmed.match(/[{}[\]();=<>]/g) || []).length;
+    const hasNaturalSentence =
+      /[.!?]\s+[A-Z]/.test(trimmed) || /\b(please|can you|how do i|what is|explain|issue|problem|error message)\b/i.test(trimmed);
+
+    if (codeLikeLines >= 2) return true;
+    if (codeLikeLines === 1 && (symbolCount >= 2 || lines.length === 1)) return true;
+    if (symbolCount >= 4 && !hasNaturalSentence) return true;
+
+    return false;
+  }
+
+  function validateCodeBoxBeforeSubmit(value: string) {
+    if (looksLikeSourceCode(value)) return true;
+
+    setAgentStatus("Invalid code: the Code box only accepts source code. Move notes or questions to the message box.");
+    return false;
+  }
+
   function bytesToBase64(bytes: Uint8Array) {
     let binary = "";
     bytes.forEach((byte) => {
@@ -2794,6 +2832,7 @@ SIZE: ${item.size || 0} bytes`;
     }
 
     if (!canSend) return;
+    if (!validateCodeBoxBeforeSubmit(code)) return;
     const resolvedUploads = resolveReferencedUploads(options.referencedUploads);
     if (resolvedUploads === null) return;
 
@@ -3096,6 +3135,7 @@ ${submittedComputerSearchResults}`,
     }
 
     if (!canSend) return;
+    if (!validateCodeBoxBeforeSubmit(code)) return;
 
     const submittedQuestion = question;
     const submittedLog = log;
@@ -3408,6 +3448,8 @@ ${shouldUseProjectContext ? fullProjectFiles || "No project file content was loa
       setAgentStatus("Choose which previous source to build the timeline from.");
       return;
     }
+
+    if (!validateCodeBoxBeforeSubmit(code)) return;
 
     const currentTimelineSource = {
       id: "current-draft",
