@@ -3,6 +3,7 @@ import {
   Bot,
   Clock3,
   Code2,
+  MoreHorizontal,
   FileText,
   FolderOpen,
   Loader2,
@@ -137,8 +138,9 @@ export default function Composer({
 }: ComposerProps) {
   const [previewImage, setPreviewImage] = useState<UploadedFile | null>(null);
   const [previewFile, setPreviewFile] = useState<UploadedFile | null>(null);
-  const [setupOpen, setSetupOpen] = useState(true);
+  const [setupOpen, setSetupOpen] = useState(false);
   const [replyContextOpen, setReplyContextOpen] = useState(false);
+  const [advancedActionsOpen, setAdvancedActionsOpen] = useState(false);
   const canSubmitMessage = canSend && !loading && !agentLoading && !timelineLoading;
   const questionLineCount = Math.max(1, question.split(/\r?\n/).length);
   const questionLooksLikeCode =
@@ -173,8 +175,32 @@ export default function Composer({
   return (
     <>
       {!hasConversation && (
-        <div className="min-h-0 flex-1 overflow-y-auto border-b border-slate-200/80 bg-white/50 px-5 pb-8 pt-5 backdrop-blur">
-          <div className="mx-auto max-w-[1500px] rounded-2xl bg-white/92 shadow-[0_18px_46px_rgba(15,23,42,0.08)] ring-1 ring-slate-200/80">
+        <div className="min-h-0 flex-1 overflow-y-auto border-b border-slate-200/80 bg-white/55 px-5 pb-6 pt-5 backdrop-blur">
+          <div className="mx-auto max-w-[1100px] text-center">
+            <div className="text-xs font-black uppercase tracking-wide text-blue-600">
+              PayFix Workspace
+            </div>
+            <h1 className="mt-2 text-2xl font-black tracking-tight text-slate-950">
+              Ask a question, drop logs, or connect a project.
+            </h1>
+            <p className="mx-auto mt-2 max-w-2xl text-sm leading-6 text-slate-500">
+              Start with the message box below. Add project files, logs, screenshots, or code only when they help the investigation.
+            </p>
+            <div className="mt-4 grid grid-cols-1 gap-2 text-left md:grid-cols-3">
+              {[
+                { label: "1. Ask", detail: "Describe the bug, error, or payment flow." },
+                { label: "2. Attach", detail: "Add logs, screenshots, source, or search results." },
+                { label: "3. Analyze", detail: "Let PayFix inspect the context and respond." },
+              ].map((step) => (
+                <div key={step.label} className="rounded-xl border border-slate-200 bg-white/80 px-4 py-3 shadow-sm">
+                  <div className="text-sm font-black text-slate-900">{step.label}</div>
+                  <div className="mt-1 text-xs leading-5 text-slate-500">{step.detail}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div className="mx-auto mt-5 max-w-[1200px] rounded-2xl bg-white/92 shadow-[0_18px_46px_rgba(15,23,42,0.08)] ring-1 ring-slate-200/80">
             <button
               type="button"
               onClick={() => setSetupOpen((open) => !open)}
@@ -183,7 +209,7 @@ export default function Composer({
               <div>
                 <div className="font-bold text-slate-950">Context Workspace</div>
                 <div className="mt-1 text-sm text-slate-500">
-                  Search, upload, connect a project, or paste logs before asking.
+                  Optional context: search, upload, connect a project, or paste logs/code.
                 </div>
               </div>
               <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-bold text-slate-600">
@@ -316,31 +342,10 @@ export default function Composer({
 
       {children}
 
-      <div className="shrink-0 border-t border-slate-300/80 bg-white/88 px-5 py-1.5 shadow-[0_-18px_52px_rgba(15,23,42,0.14)] backdrop-blur-xl">
-        <div className="mx-auto max-w-[1500px]">
+      <div className="shrink-0 border-t border-slate-300/80 bg-white/90 px-5 py-2 shadow-[0_-12px_34px_rgba(15,23,42,0.12)] backdrop-blur-xl">
+        <div className="mx-auto max-w-[1200px]">
           {hasConversation && (
             <>
-              <div className="mb-2 flex items-center justify-between gap-3">
-                <button
-                  type="button"
-                  onClick={() => setReplyContextOpen((open) => !open)}
-                  className="inline-flex h-8 items-center gap-2 rounded-full border border-slate-300 bg-white/90 px-3.5 text-xs font-bold text-slate-700 shadow-sm transition hover:border-blue-300 hover:bg-blue-50"
-                >
-                  <Plus size={14} />
-                  Add Context
-                </button>
-
-                {replyContextOpen && (
-                  <button
-                    type="button"
-                    onClick={() => setReplyContextOpen(false)}
-                    className="rounded-full bg-slate-100 px-3 py-1 text-xs font-bold text-slate-500 transition hover:bg-slate-200"
-                  >
-                    Collapse
-                  </button>
-                )}
-              </div>
-
               {replyContextOpen && (
                 <div className="mb-2 rounded-2xl bg-white p-3 shadow-sm ring-1 ring-slate-200">
                   <div className="mb-2 flex items-center justify-between gap-3">
@@ -546,7 +551,7 @@ export default function Composer({
             className="relative"
           >
             {/* Unified container so textarea + buttons look like one connected control */}
-            <div className="rounded-2xl bg-white/95 p-2 shadow-[0_14px_42px_rgba(15,23,42,0.16)] ring-1 ring-slate-300/90 transition focus-within:ring-blue-200">
+            <div className="rounded-2xl bg-white/95 p-2 shadow-[0_10px_30px_rgba(15,23,42,0.13)] ring-1 ring-slate-300/90 transition focus-within:ring-blue-200">
               <div className="relative">
                 {questionLooksLikeCode && (
                   <div className="hidden">
@@ -602,21 +607,37 @@ export default function Composer({
               </div>
 
               {/* buttons area shares the same parent background and gets the bottom rounded corners */}
-              <div className="mt-2 flex flex-nowrap items-center gap-2 overflow-x-auto rounded-b-2xl bg-transparent">
-                {!hasConversation && (
+              <div className="mt-2 flex flex-wrap items-center justify-between gap-2 rounded-b-2xl bg-transparent">
+                <div className="flex min-w-0 flex-wrap items-center gap-2">
                   <button
-                    onClick={loadProjectContext}
-                    disabled={loading || !connectedProjectPath}
-                    className="h-10 rounded-xl bg-violet-600 px-4 text-sm font-black text-white shadow-sm transition hover:bg-violet-500 disabled:cursor-not-allowed disabled:bg-slate-300 disabled:text-slate-500 disabled:shadow-none"
+                    type="button"
+                    onClick={() => {
+                      setReplyContextOpen((open) => !open);
+                      if (!hasConversation) setSetupOpen((open) => !open);
+                    }}
+                    className="inline-flex h-10 items-center gap-2 rounded-xl border border-slate-300 bg-white px-4 text-sm font-bold text-slate-700 shadow-sm transition hover:border-blue-300 hover:bg-blue-50"
                   >
-                    Use Project Files
+                    <Plus size={16} />
+                    {hasConversation ? "Add Context" : "Context Workspace"}
                   </button>
-                )}
 
+                  {!hasConversation && (
+                    <button
+                      onClick={loadProjectContext}
+                      disabled={loading || !connectedProjectPath}
+                      className="inline-flex h-10 items-center gap-2 rounded-xl border border-violet-200 bg-violet-50 px-4 text-sm font-bold text-violet-700 shadow-sm transition hover:bg-violet-100 disabled:cursor-not-allowed disabled:border-slate-200 disabled:bg-slate-100 disabled:text-slate-400 disabled:shadow-none"
+                    >
+                      <FolderOpen size={16} />
+                      Use Project Files
+                    </button>
+                  )}
+                </div>
+
+                <div className="flex min-w-0 flex-wrap items-center justify-end gap-2">
                 <button
                   onClick={analyze}
                   disabled={!canSubmitMessage}
-                  className="inline-flex h-10 items-center gap-2 rounded-xl bg-blue-600 px-5 text-sm font-black text-white shadow-sm transition hover:bg-blue-500 disabled:cursor-not-allowed disabled:bg-blue-300 disabled:shadow-none"
+                  className="inline-flex h-11 items-center gap-2 rounded-xl bg-blue-600 px-6 text-sm font-black text-white shadow-lg shadow-blue-950/20 transition hover:bg-blue-500 disabled:cursor-not-allowed disabled:bg-blue-300 disabled:shadow-none"
                 >
                   {loading ? (
                     <>
@@ -646,7 +667,7 @@ export default function Composer({
                 <button
                   onClick={buildTimeline}
                   disabled={loading || timelineLoading || agentLoading || !canBuildTimeline}
-                  className="inline-flex h-10 items-center gap-2 rounded-xl bg-slate-950 px-4 text-sm font-black text-white shadow-sm transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-300 disabled:text-slate-500 disabled:shadow-none"
+                  className="inline-flex h-10 items-center gap-2 rounded-xl border border-slate-300 bg-white px-4 text-sm font-black text-slate-700 shadow-sm transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:bg-slate-100 disabled:text-slate-400 disabled:shadow-none"
                 >
                   {timelineLoading ? (
                     <>
@@ -662,32 +683,46 @@ export default function Composer({
                 </button>
 
                 <button
-                  onClick={runAgent}
-                  disabled={loading || timelineLoading || agentLoading || !canSend}
-                  className="inline-flex h-10 items-center gap-2 rounded-xl bg-indigo-600 px-4 text-sm font-black text-white shadow-sm transition hover:bg-indigo-500 disabled:cursor-not-allowed disabled:bg-slate-300 disabled:text-slate-500 disabled:shadow-none"
+                  type="button"
+                  onClick={() => setAdvancedActionsOpen((open) => !open)}
+                  className="inline-flex h-10 items-center gap-2 rounded-xl border border-slate-300 bg-white px-3 text-sm font-black text-slate-700 shadow-sm transition hover:bg-slate-50"
                 >
-                  {agentLoading ? (
-                    <>
-                      <Loader2 size={16} className="animate-spin" />
-                      Agent...
-                    </>
-                  ) : (
-                    <>
-                      <Bot size={16} />
-                      Run Agent
-                    </>
-                  )}
+                  <MoreHorizontal size={16} />
+                  Advanced
                 </button>
-
-                <button
-                  onClick={openColorTool}
-                  disabled={loading || agentLoading}
-                  className="inline-flex h-10 items-center gap-2 rounded-xl bg-rose-600 px-4 text-sm font-black text-white shadow-sm transition hover:bg-rose-500 disabled:cursor-not-allowed disabled:bg-slate-300 disabled:text-slate-500 disabled:shadow-none"
-                >
-                  <Wand2 size={16} />
-                  Color Tool
-                </button>
+                </div>
               </div>
+
+              {advancedActionsOpen && (
+                <div className="mt-2 flex flex-wrap justify-end gap-2 rounded-xl border border-slate-200 bg-slate-50 p-2">
+                  <button
+                    onClick={runAgent}
+                    disabled={loading || timelineLoading || agentLoading || !canSend}
+                    className="inline-flex h-10 items-center gap-2 rounded-xl bg-indigo-600 px-4 text-sm font-black text-white shadow-sm transition hover:bg-indigo-500 disabled:cursor-not-allowed disabled:bg-slate-300 disabled:text-slate-500 disabled:shadow-none"
+                  >
+                    {agentLoading ? (
+                      <>
+                        <Loader2 size={16} className="animate-spin" />
+                        Agent...
+                      </>
+                    ) : (
+                      <>
+                        <Bot size={16} />
+                        Run Agent
+                      </>
+                    )}
+                  </button>
+
+                  <button
+                    onClick={openColorTool}
+                    disabled={loading || agentLoading}
+                    className="inline-flex h-10 items-center gap-2 rounded-xl border border-rose-200 bg-white px-4 text-sm font-black text-rose-700 shadow-sm transition hover:bg-rose-50 disabled:cursor-not-allowed disabled:bg-slate-100 disabled:text-slate-400 disabled:shadow-none"
+                  >
+                    <Wand2 size={16} />
+                    Color Tool
+                  </button>
+                </div>
+              )}
             </div>
           </div>
         </div>

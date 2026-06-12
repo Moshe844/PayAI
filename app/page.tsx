@@ -3479,7 +3479,7 @@ ${shouldUseProjectContext ? fullProjectFiles || "No project file content was loa
 
   return (
     <main className="h-screen overflow-hidden bg-[#eef3f8] text-slate-950">
-      <div className="grid h-screen grid-cols-[1fr_220px]">
+      <div className="grid h-screen grid-cols-[1fr_190px]">
         <section className="flex h-screen min-h-0 flex-col overflow-hidden">
           <header className="relative z-[120] shrink-0 overflow-visible border-b border-slate-200/80 bg-white/95 px-6 py-3 shadow-sm backdrop-blur">
             <div className="flex items-center justify-between gap-4">
@@ -3614,7 +3614,7 @@ ${shouldUseProjectContext ? fullProjectFiles || "No project file content was loa
           </header>
 
           {agentStatus && (
-            <div className="pointer-events-none fixed right-[236px] top-20 z-[110] max-w-[520px]">
+            <div className="pointer-events-none fixed right-[206px] top-20 z-[110] max-w-[520px]">
               {(() => {
                 const tone = statusTone(agentStatus);
 

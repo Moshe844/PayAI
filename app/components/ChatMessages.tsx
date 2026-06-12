@@ -9,6 +9,8 @@ import {
   Download,
   FileText,
   Loader2,
+  Maximize2,
+  Minimize2,
   Pencil,
   Play,
   Sparkles,
@@ -25,7 +27,7 @@ import {
   Prism as SyntaxHighlighter,
 } from "react-syntax-highlighter";
 
-import { oneDark, vscDarkPlus } from "react-syntax-highlighter/dist/esm/styles/prism";
+import { vscDarkPlus } from "react-syntax-highlighter/dist/esm/styles/prism";
 
 import remarkGfm from "remark-gfm";
 
@@ -222,6 +224,7 @@ function ChatMessages({
   const [previewFile, setPreviewFile] = useState<UploadedFile | null>(null);
   const [expandedMessages, setExpandedMessages] = useState<Set<number>>(new Set());
   const [expandedContexts, setExpandedContexts] = useState<Set<string>>(new Set());
+  const [expandedCodeBlocks, setExpandedCodeBlocks] = useState<Set<string>>(new Set());
   const [showAllMessages, setShowAllMessages] = useState(false);
   const hiddenMessageCount = showAllMessages ? 0 : Math.max(0, messages.length - 12);
   const visibleMessages = hiddenMessageCount ? messages.slice(hiddenMessageCount) : messages;
@@ -237,8 +240,8 @@ function ChatMessages({
 
   return (
     <>
-      <div className="allow-scroll min-h-0 flex-1 bg-[radial-gradient(circle_at_top_left,_rgba(37,99,235,0.08),_transparent_28%),linear-gradient(180deg,#edf4fb_0%,#e7eef6_100%)] px-5 py-3">
-        <div className="mx-auto max-w-[1500px] space-y-2.5">
+      <div className="allow-scroll min-h-0 flex-1 bg-[linear-gradient(180deg,#edf4fb_0%,#e7eef6_100%)] px-5 py-2.5">
+        <div className="mx-auto max-w-[1200px] space-y-2">
           {messages.length === 0 && (
             <div className="rounded-2xl border border-dashed border-blue-200 bg-white/80 p-8 text-center text-slate-500 shadow-sm">
               <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-2xl bg-blue-50 text-blue-600">
@@ -353,16 +356,22 @@ function ChatMessages({
               // MULTILINE CODE BLOCK
               if (className) {
                 const codeIsLarge = codeString.length > 12000 || codeString.split(/\r?\n/).length > 240;
+                const codeBlockKey = `${messageIndex}-${language}-${codeString.length}`;
+                const codeExpanded = expandedCodeBlocks.has(codeBlockKey);
 
                 return (
-                  <div className="group relative overflow-hidden rounded-2xl border border-slate-800 shadow-lg">
-                    <div className="flex items-center justify-between border-b border-slate-700 bg-slate-900 px-4 py-2">
-                      <div className="text-xs font-semibold uppercase tracking-wide text-slate-400">
-                        {language}
+                  <div className="group relative overflow-hidden rounded-2xl border border-[#3c3c3c] bg-[#1e1e1e] shadow-lg shadow-slate-950/15">
+                    <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[#3c3c3c] bg-[#252526] px-4 py-2.5">
+                      <div>
+                        <div className="text-xs font-black uppercase tracking-wide text-[#9cdcfe]">
+                          {language}
+                        </div>
+                        <div className="mt-0.5 text-[11px] font-semibold text-slate-400">
+                          {codeString.split(/\r?\n/).length} lines
+                        </div>
                       </div>
 
-                      <div className="flex items-center gap-2">
-                        {/* COPY */}
+                      <div className="flex flex-wrap items-center gap-2">
                         <button
                           onClick={() => {
                             navigator.clipboard.writeText(
@@ -379,7 +388,7 @@ function ChatMessages({
                               );
                             }, 2000);
                           }}
-                          className="flex items-center gap-2 rounded-lg bg-slate-800 px-3 py-1 text-xs font-semibold text-white hover:bg-slate-700"
+                          className="flex h-8 items-center gap-2 rounded-lg border border-slate-600 bg-slate-800 px-3 text-xs font-bold text-white transition hover:bg-slate-700"
                         >
                           {copiedKey ===
                           copyKey ? (
@@ -395,7 +404,6 @@ function ChatMessages({
                           )}
                         </button>
 
-                        {/* RUN */}
                         <button
                           onClick={() =>
                             openRunnerFromCode(
@@ -403,13 +411,12 @@ function ChatMessages({
                               language
                             )
                           }
-                          className="flex items-center gap-2 rounded-lg bg-emerald-600 px-3 py-1 text-xs font-semibold text-white hover:bg-emerald-700"
+                          className="flex h-8 items-center gap-2 rounded-lg bg-emerald-600 px-3 text-xs font-bold text-white shadow-sm transition hover:bg-emerald-500"
                         >
                           <Play size={14} />
                           Run
                         </button>
 
-                        {/* APPLY */}
                         <button
                           onClick={() =>
                             openApplyModalWithContent(
@@ -417,22 +424,45 @@ function ChatMessages({
                               message.content
                             )
                           }
-                          className="flex items-center gap-2 rounded-lg bg-blue-600 px-3 py-1 text-xs font-semibold text-white hover:bg-blue-700"
+                          className="flex h-8 items-center gap-2 rounded-lg bg-blue-600 px-3 text-xs font-bold text-white shadow-sm transition hover:bg-blue-500"
                         >
                           <FileText size={14} />
                           Apply
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setExpandedCodeBlocks((current) => {
+                              const next = new Set(current);
+                              if (next.has(codeBlockKey)) {
+                                next.delete(codeBlockKey);
+                              } else {
+                                next.add(codeBlockKey);
+                              }
+                              return next;
+                            });
+                          }}
+                          className="flex h-8 items-center gap-2 rounded-lg border border-slate-600 bg-[#1e1e1e] px-3 text-xs font-bold text-slate-100 transition hover:bg-slate-800"
+                        >
+                          {codeExpanded ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
+                          {codeExpanded ? "Collapse" : "Expand"}
                         </button>
                       </div>
                     </div>
 
                     {codeIsLarge ? (
-                      <pre className="max-h-[520px] overflow-auto whitespace-pre-wrap break-words bg-slate-950 p-5 text-sm leading-6 text-slate-200">
+                      <pre
+                        className={`overflow-auto whitespace-pre-wrap break-words bg-[#1e1e1e] p-5 font-mono text-[14px] leading-6 text-[#d4d4d4] ${
+                          codeExpanded ? "max-h-[78vh]" : "max-h-[520px]"
+                        }`}
+                      >
                         {codeString}
                       </pre>
                     ) : (
                       <SyntaxHighlighter
                         style={
-                          oneDark as Record<
+                          vscDarkPlus as Record<
                             string,
                             CSSProperties
                           >
@@ -448,9 +478,17 @@ function ChatMessages({
                           margin: 0,
                           borderRadius: 0,
                           padding: "20px",
-                          background:
-                            "#020617",
+                          background: "#1e1e1e",
                           fontSize: "14px",
+                          lineHeight: 1.65,
+                          maxHeight: codeExpanded ? "78vh" : "520px",
+                          overflow: "auto",
+                        }}
+                        codeTagProps={{
+                          style: {
+                            fontFamily:
+                              "Consolas, 'Cascadia Code', 'Courier New', monospace",
+                          },
                         }}
                       >
                         {codeString}
