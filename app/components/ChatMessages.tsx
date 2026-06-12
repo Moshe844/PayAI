@@ -152,7 +152,7 @@ function extractAgentRunStats(content: string) {
 }
 
 function isActivityMessage(content: string) {
-  return /^(Thinking|Converting image|Agent is running|Analyzing|Building timeline|Searching project|Reading files|Generating patch)/i.test(
+  return /^(Thinking|Converting image|Agent is running|PayFix Agent is investigating|Analyzing|Building timeline|Searching project|Reading files|Generating patch)/i.test(
     content.trim(),
   );
 }
@@ -822,10 +822,10 @@ function ChatMessages({
                       <div>
                         <div className="flex items-center gap-2 text-sm font-black text-indigo-950">
                           <Sparkles size={16} className="text-indigo-600" />
-                          Agent session saved
+                          PayFix investigation saved
                         </div>
                         <div className="mt-1 text-xs font-semibold text-indigo-700">
-                          {message.agentSessionMessages.length} message(s) saved from the Agent popup.
+                          {message.agentSessionMessages.length} investigation message(s) saved with its evidence trail.
                         </div>
                       </div>
                       <button
@@ -833,7 +833,7 @@ function ChatMessages({
                         onClick={() => onOpenAgentSession(message.agentSessionMessages || [])}
                         className="rounded-xl bg-indigo-600 px-3 py-2 text-xs font-black text-white shadow-sm transition hover:bg-indigo-500"
                       >
-                        Reopen Agent
+                        Reopen Investigation
                       </button>
                     </div>
                   </div>

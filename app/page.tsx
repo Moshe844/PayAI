@@ -1763,21 +1763,21 @@ ${uploads ? `\n${uploads}` : ""}`;
       return;
     }
 
-    const firstUser = agentSessionMessages.find((message) => message.role === "user")?.content || "Agent investigation";
+    const firstUser = agentSessionMessages.find((message) => message.role === "user")?.content || "PayFix investigation";
     const lastAssistant = [...agentSessionMessages].reverse().find((message) => message.role === "assistant")?.content || "";
     const agentSummary: ChatMessage = {
       role: "assistant",
       isAgentSessionSummary: true,
       agentSessionMessages,
-      content: `AGENT SESSION SAVED
+      content: `PAYFIX INVESTIGATION SAVED
 
-Question:
+Investigation question:
 ${firstUser.slice(0, 700)}
 
-Latest result:
+Latest investigation result:
 ${lastAssistant.slice(0, 1400)}
 
-Open this saved Agent session to continue the investigation, upload more evidence, or ask it to revise the fix.`,
+Reopen this saved investigation to continue the project review, upload more evidence, or ask PayFix to revise the fix.`,
     };
 
     setMessages((currentMessages) => {
@@ -1794,7 +1794,7 @@ Open this saved Agent session to continue the investigation, upload more evidenc
       return nextMessages;
     });
     setAgentSessionOpen(false);
-    setAgentStatus("Agent session saved to this chat.");
+    setAgentStatus("PayFix investigation saved to this chat.");
   }
 
   function cancelApplyModal() {
@@ -2999,15 +2999,15 @@ ${submittedComputerSearchResults}`,
       {
         role: "assistant",
         content: connectedProjectPath
-          ? "Agent is running: selecting files, reading them, and verifying a patch..."
-          : "Agent is running in evidence-only mode: reading uploads, logs, screenshots, and pasted context...",
+          ? "PayFix Agent is investigating: indexing the project, selecting files, reading evidence, and preparing a reviewable fix..."
+          : "PayFix Agent is investigating evidence: reading uploads, logs, screenshots, and pasted context...",
       },
     ]);
 
     try {
       let projectFileList = "";
       if (connectedProjectPath) {
-        setAgentStatus("Agent is connecting to the selected project...");
+        setAgentStatus("PayFix Agent is connecting to the selected project...");
         await ensureLocalAgentRoot(connectedProjectPath);
 
         projectFileList = await loadFileList();
@@ -3015,9 +3015,9 @@ ${submittedComputerSearchResults}`,
           throw new Error("Could not load the project file list from the local agent.");
         }
 
-        setAgentStatus("Agent is choosing exact files to inspect...");
+        setAgentStatus("PayFix Agent is choosing exact files to inspect...");
       } else {
-        setAgentStatus("Agent is investigating attached evidence without project file access...");
+        setAgentStatus("PayFix Agent is investigating attached evidence without project file access...");
       }
 
       const response = await fetch("/api/agent", {
@@ -3047,17 +3047,17 @@ ${submittedComputerSearchResults}`,
       const inspectedNames = data.filesRead?.map((file) => file.name).join(", ");
       setAgentStatus(
         !connectedProjectPath
-          ? "Agent finished evidence-only investigation. Connect a project to inspect or patch code."
+          ? "Evidence investigation complete. Connect a project to inspect or patch code."
           : data.patchReady
-          ? `Agent verified a patch after inspecting: ${inspectedNames || "selected files"}`
+          ? `Project investigation complete. Patch verified after inspecting: ${inspectedNames || "selected files"}`
           : data.warning
-            ? `Agent finished without a safe Apply preview: ${data.warning}`
-            : "Agent finished without opening Apply. See the response for details.",
+            ? `Project investigation complete without a safe Apply preview: ${data.warning}`
+            : "Project investigation complete. See the response for inspected evidence and next steps.",
       );
 
       const finalSessionMessages: ChatMessage[] = [
         ...baseSessionMessages,
-        { role: "assistant", content: data.markdown || "Agent finished without a response." },
+        { role: "assistant", content: data.markdown || "PayFix investigation finished without a response." },
       ];
       setAgentSessionMessages(finalSessionMessages);
       setEditSnapshot(null);
@@ -3066,11 +3066,11 @@ ${submittedComputerSearchResults}`,
     } catch (err: unknown) {
       const finalSessionMessages: ChatMessage[] = [
         ...baseSessionMessages,
-        { role: "assistant", content: `Agent failed: ${errorMessage(err)}` },
+        { role: "assistant", content: `PayFix investigation failed: ${errorMessage(err)}` },
       ];
       setAgentSessionMessages(finalSessionMessages);
       setEditSnapshot(null);
-      setAgentStatus(`Agent failed: ${errorMessage(err)}`);
+      setAgentStatus(`PayFix investigation failed: ${errorMessage(err)}`);
       throw err;
     }
   }
@@ -3078,7 +3078,7 @@ ${submittedComputerSearchResults}`,
   async function runAgent() {
     const isReplyMode = messages.length > 0;
     if (isReplyMode && !question.trim() && !log.trim() && !code.trim() && uploadedFiles.length === 0) {
-      setAgentStatus("Please type a message or attach evidence before running Agent.");
+      setAgentStatus("Please type a message or attach evidence before starting an investigation.");
       return;
     }
 
@@ -3091,11 +3091,11 @@ ${submittedComputerSearchResults}`,
     const submittedComputerSearchResults = computerSearchResults;
     const userContent =
       submittedQuestion.trim() ||
-      (submittedLog.trim() ? "Run agent on this payment log / error." : "") ||
-      (submittedCode.trim() ? "Run agent on this code." : "") ||
-      (submittedUploadedFiles.length ? "Run agent on uploaded file(s)." : "") ||
-      (submittedComputerSearchResults ? "Run agent on attached computer search." : "") ||
-      "Run agent on the connected project.";
+      (submittedLog.trim() ? "Investigate this payment log / error." : "") ||
+      (submittedCode.trim() ? "Investigate this code." : "") ||
+      (submittedUploadedFiles.length ? "Investigate uploaded file(s)." : "") ||
+      (submittedComputerSearchResults ? "Investigate attached computer search." : "") ||
+      "Investigate the connected project.";
 
     resetApplyModal();
     setAgentSessionOpen(true);
@@ -3108,7 +3108,7 @@ ${submittedComputerSearchResults}`,
     setLoading(true);
     setAgentLoading(true);
     setDependencyProposal(null);
-    setAgentStatus(connectedProjectPath ? "Agent is listing project files..." : "Agent is preparing evidence-only investigation...");
+    setAgentStatus(connectedProjectPath ? "PayFix Agent is indexing project files..." : "PayFix Agent is preparing an evidence investigation...");
 
     try {
       await runAgentPromptInSession({
@@ -3131,7 +3131,7 @@ ${submittedComputerSearchResults}`,
 
   async function runAgentSessionFollowUp(prompt: string) {
     setAgentLoading(true);
-    setAgentStatus(connectedProjectPath ? "Agent is continuing the investigation..." : "Agent is continuing evidence-only investigation...");
+    setAgentStatus(connectedProjectPath ? "PayFix Agent is continuing the project investigation..." : "PayFix Agent is continuing the evidence investigation...");
 
     try {
       await runAgentPromptInSession({
@@ -3151,7 +3151,7 @@ ${submittedComputerSearchResults}`,
 
   async function runApplyAgentFollowUp(prompt: string) {
     if (!connectedProjectPath) {
-      setAgentStatus("Agent follow-up needs a connected project.");
+      setAgentStatus("Patch investigation needs a connected project.");
       return;
     }
 
@@ -3177,8 +3177,8 @@ ${prompt}`;
     const baseMessages = [...messages, userMessage];
 
     setApplyAgentFollowUpLoading(true);
-    setAgentStatus("Agent is revising the patch with your follow-up...");
-    setMessages([...baseMessages, { role: "assistant", content: "Agent is revising the current patch..." }]);
+    setAgentStatus("PayFix Agent is revising the patch investigation with your follow-up...");
+    setMessages([...baseMessages, { role: "assistant", content: "PayFix Agent is revising the current patch investigation..." }]);
 
     try {
       await ensureLocalAgentRoot(connectedProjectPath);
@@ -3203,7 +3203,7 @@ ${prompt}`;
       });
 
       const data: AgentApiResponse = await response.json();
-      if (!data.ok) throw new Error(data.error || "Agent follow-up failed.");
+      if (!data.ok) throw new Error(data.error || "Patch investigation follow-up failed.");
 
       if (data.dependencyProposal?.needed && data.dependencyProposal.packageName) {
         setDependencyProposal(data.dependencyProposal);
@@ -3211,7 +3211,7 @@ ${prompt}`;
 
       const finalMessages: ChatMessage[] = [
         ...baseMessages,
-        { role: "assistant", content: data.markdown || "Agent follow-up finished without a response." },
+        { role: "assistant", content: data.markdown || "Patch investigation follow-up finished without a response." },
       ];
       setMessages(finalMessages);
       saveActiveChat(finalMessages);
@@ -3220,19 +3220,19 @@ ${prompt}`;
       const inspectedNames = data.filesRead?.map((file) => file.name).join(", ");
       setAgentStatus(
         openedPatch
-          ? `Agent revised the patch after inspecting: ${inspectedNames || "selected files"}`
+          ? `Patch investigation revised after inspecting: ${inspectedNames || "selected files"}`
           : data.warning
-            ? `Agent follow-up finished without a safe preview: ${data.warning}`
-            : "Agent follow-up finished. See the response for details.",
+            ? `Patch investigation follow-up finished without a safe preview: ${data.warning}`
+            : "Patch investigation follow-up complete. See the response for details.",
       );
     } catch (err: unknown) {
       const finalMessages: ChatMessage[] = [
         ...baseMessages,
-        { role: "assistant", content: `Agent follow-up failed: ${errorMessage(err)}` },
+        { role: "assistant", content: `Patch investigation follow-up failed: ${errorMessage(err)}` },
       ];
       setMessages(finalMessages);
       saveActiveChat(finalMessages);
-      setAgentStatus(`Agent follow-up failed: ${errorMessage(err)}`);
+      setAgentStatus(`Patch investigation follow-up failed: ${errorMessage(err)}`);
     } finally {
       setApplyAgentFollowUpLoading(false);
     }
@@ -3674,7 +3674,7 @@ ${shouldUseProjectContext ? fullProjectFiles || "No project file content was loa
                   const sessionUploads = sessionMessages.flatMap((message) => message.attachedUploads || []);
                   setAgentSessionUploads(sessionUploads);
                   setAgentSessionOpen(true);
-                  setAgentStatus("Agent session reopened.");
+                  setAgentStatus("PayFix investigation reopened.");
                 }}
               />
             )}

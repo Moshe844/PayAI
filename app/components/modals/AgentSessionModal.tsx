@@ -16,7 +16,7 @@ type AgentSessionModalProps = {
 };
 
 function roleLabel(role: ChatMessage["role"]) {
-  return role === "user" ? "You" : "PayFix Agent";
+  return role === "user" ? "You" : "PayFix Investigator";
 }
 
 type AgentAction = {
@@ -112,7 +112,7 @@ export default function AgentSessionModal({
           <div className="min-w-0">
             <div className="flex items-center gap-2 text-xs font-black uppercase tracking-wide text-blue-600">
               <Bot size={16} />
-                Agent Workspace / {modeLabel}
+                Investigation Workspace / {modeLabel}
               </div>
             <h2 className="mt-1 text-2xl font-black text-slate-950">{title}</h2>
             <p className="mt-1 truncate text-sm text-slate-500">
@@ -123,7 +123,7 @@ export default function AgentSessionModal({
           <button
             onClick={onClose}
             className="inline-flex h-11 w-11 items-center justify-center rounded-2xl bg-slate-100 text-slate-700 transition hover:bg-slate-200"
-            title="Close agent workspace"
+            title="Close investigation workspace"
           >
             <X size={20} />
           </button>
@@ -149,7 +149,9 @@ export default function AgentSessionModal({
             {messages.length === 0 && (
               <div className="rounded-3xl border border-dashed border-slate-300 bg-white p-8 text-center shadow-sm">
                 <div className="text-lg font-black text-slate-950">
-              {hasProject ? "Ask Agent to investigate the connected project." : "Ask Agent to investigate attached evidence."}
+                  {hasProject
+                    ? "Ask PayFix to investigate the connected project."
+                    : "Ask PayFix to investigate attached evidence."}
                 </div>
                 <p className="mx-auto mt-2 max-w-2xl text-sm leading-6 text-slate-500">
                   {hasProject
@@ -177,16 +179,16 @@ export default function AgentSessionModal({
                     </span>
                   )}
                 </div>
-                {message.role === "assistant" && /^Agent is running/i.test(message.content) ? (
+                {message.role === "assistant" && /^(Agent is running|PayFix Agent is investigating)/i.test(message.content) ? (
                   <div className="rounded-2xl bg-slate-950 p-4 text-slate-100">
                     <div className="flex items-center gap-3 text-sm font-black">
                       <Loader2 size={16} className="animate-spin text-blue-300" />
                       {message.content}
                     </div>
                     <div className="mt-3 grid grid-cols-1 gap-2 text-xs text-slate-300 sm:grid-cols-3">
-                      <span className="rounded-xl bg-white/5 px-3 py-2">Inspect context</span>
-                      <span className="rounded-xl bg-white/5 px-3 py-2">Find evidence</span>
-                      <span className="rounded-xl bg-white/5 px-3 py-2">Prepare reviewable action</span>
+                      <span className="rounded-xl bg-white/5 px-3 py-2">Map context</span>
+                      <span className="rounded-xl bg-white/5 px-3 py-2">Read evidence</span>
+                      <span className="rounded-xl bg-white/5 px-3 py-2">Prepare review</span>
                     </div>
                   </div>
                 ) : (
@@ -268,7 +270,7 @@ export default function AgentSessionModal({
                           onClick={() => onSend(action.prompt)}
                           disabled={loading}
                           className="rounded-xl bg-white px-3 py-2 text-left text-xs font-black text-blue-700 shadow-sm ring-1 ring-blue-100 transition hover:bg-blue-600 hover:text-white disabled:cursor-not-allowed disabled:opacity-60"
-                          title={`Send to Agent: ${action.prompt}`}
+                          title={`Continue investigation: ${action.prompt}`}
                         >
                           {action.label}
                         </button>
@@ -309,7 +311,7 @@ export default function AgentSessionModal({
                   sendDraft();
                 }
               }}
-              placeholder="Ask Agent what to inspect, change, validate, or install..."
+              placeholder="Ask PayFix what to inspect, change, validate, or install..."
               className="min-h-28 w-full resize-y rounded-2xl border border-white/10 bg-slate-900 p-4 text-[15px] leading-6 text-white outline-none transition placeholder:text-slate-500 focus:border-blue-400 focus:ring-2 focus:ring-blue-500/30"
             />
 
@@ -335,7 +337,7 @@ export default function AgentSessionModal({
                   className="inline-flex h-10 items-center gap-2 rounded-xl bg-blue-600 px-5 text-sm font-black text-white shadow-sm transition hover:bg-blue-500 disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-slate-400"
                 >
                   {loading ? <Loader2 size={16} className="animate-spin" /> : <Send size={16} />}
-                  Send to Agent
+                  Continue Investigation
                 </button>
               </div>
             </div>
