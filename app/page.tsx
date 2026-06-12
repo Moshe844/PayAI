@@ -1823,6 +1823,19 @@ Reopen this saved investigation to continue the project review, upload more evid
     setAgentStatus("Attachments cleared.");
   }
 
+  function clearOneShotContextAfterSubmit() {
+    setLog("");
+    setCode("");
+    setProjectContext("");
+    setProjectMatches([]);
+    setLoadedProjectFiles([]);
+    setComputerSearchResults("");
+    setComputerSearchPreview("");
+    setUploadedFiles([]);
+    setSearchFileName("");
+    setSearchText("");
+  }
+
   function saveChats(chats: SavedChat[]) {
     setSavedChats(chats);
     window.setTimeout(() => {
@@ -2795,7 +2808,7 @@ SIZE: ${item.size || 0} bytes`;
     setPendingQuestion(submittedQuestion);
     setPendingUploads(submittedUploadedFiles);
     setQuestion("");
-    setUploadedFiles([]);
+    clearOneShotContextAfterSubmit();
     setLoading(true);
 
     const userContent =
@@ -3104,7 +3117,7 @@ ${submittedComputerSearchResults}`,
     setPendingQuestion(submittedQuestion);
     setPendingUploads(submittedUploadedFiles);
     setQuestion("");
-    setUploadedFiles([]);
+    clearOneShotContextAfterSubmit();
     setLoading(true);
     setAgentLoading(true);
     setDependencyProposal(null);
@@ -3136,10 +3149,10 @@ ${submittedComputerSearchResults}`,
     try {
       await runAgentPromptInSession({
         userContent: prompt,
-        submittedLog: log,
-        submittedCode: code,
+        submittedLog: "",
+        submittedCode: "",
         submittedUploadedFiles: agentSessionUploads,
-        submittedComputerSearchResults: computerSearchResults,
+        submittedComputerSearchResults: "",
         resetSession: false,
       });
     } catch {
