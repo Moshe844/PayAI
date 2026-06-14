@@ -368,6 +368,19 @@ function findWorkflowRelevantFiles(text: string, projectFileList: string) {
   const normalizedText = text.toLowerCase();
   const requestedFiles: string[] = [];
 
+  if (/\b(ui|ux|style|styles|css|cursor|hover|color|font|spacing|layout|visual|button|buttons|theme|responsive|mobile)\b/i.test(normalizedText)) {
+    requestedFiles.push(
+      ...candidates.filter((file) =>
+        /(^|[\\/])app[\\/]globals\.css$/i.test(normalizePath(file)) ||
+        /(^|[\\/])globals\.css$/i.test(normalizePath(file)) ||
+        /(^|[\\/])app[\\/]layout\.tsx$/i.test(normalizePath(file)) ||
+        /(^|[\\/])app[\\/]page\.tsx$/i.test(normalizePath(file)) ||
+        /(^|[\\/])Composer\.tsx$/i.test(normalizePath(file)) ||
+        /(^|[\\/])AgentSessionModal\.tsx$/i.test(normalizePath(file)),
+      ),
+    );
+  }
+
   if (
     /\b(refresh|reload|browser refresh|stay(?:ing)? in (?:the )?chat|open(?:ed)? chat|new chat|saved chats?|active chat|chat id|localstorage|sessionstorage|draft)\b/i.test(
       normalizedText,
@@ -1162,6 +1175,7 @@ async function selectFiles({
 Pick the smallest set of exact project files needed to answer the request or create a patch.
 Return only files that appear in PROJECT FILE LIST. Prefer source, config, API route, component, server, and style files.
 If the user asks for an edit, include the file where the edit most likely belongs and any nearby dependency file needed to verify it.
+For UI/style requests, include global style files such as app/globals.css plus the relevant component/layout files. Do not choose package/config files unless the request is about dependencies, build config, or tooling.
 If the user or recent conversation names a file exactly, select that file first.
 If multiple files share a similar name, select the most exact path match and explain the ambiguity in rationale.
 For refresh, reload, saved chat, active chat, localStorage/sessionStorage, draft restore, or "opens new chat instead of current chat" bugs, select the state owner / route entry file first, especially app/page.tsx or page.tsx, before presentational components.
@@ -1333,6 +1347,121 @@ ${projectSummary.slice(0, 60000)}`,
   });
 }
 
+async function buildFeaturePatchFallback({
+  question,
+  projectFiles,
+  selection,
+}: {
+  question: string;
+  projectFiles: ProjectFilePayload[];
+  selection: FileSelectionResult;
+}): Promise<AgentResult | null> {
+  if (!isFeatureRequest(question) || !projectFiles.length) return null;
+
+  const projectSummary = summarizeProjectFiles(projectFiles);
+  if (!projectSummary.trim()) return null;
+
+  const response = await openai.responses.create({
+    model: AGENT_REASONING_MODEL,
+    max_output_tokens: 1800,
+    text: {
+      format: {
+        type: "json_schema",
+        name: "payfix_feature_patch_fallback",
+        schema: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            mode: { type: "string", enum: ["replace", "insert", "none"] },
+            file: { type: "string" },
+            search: { type: "string" },
+            replacement: { type: "string" },
+            language: { type: "string" },
+            explanation: { type: "string" },
+          },
+          required: ["mode", "file", "search", "replacement", "language", "explanation"],
+        },
+        strict: true,
+      },
+    },
+    input: [
+      {
+        role: "system",
+        content: `You are PayFix Agent's generic feature-patch recovery pass.
+The full investigation schema failed, but inspected project files are available.
+Return one safe patch for the user's requested feature/change.
+Use mode "replace" when editing an existing file, and search MUST be an exact substring copied from PROJECT FILES.
+Use mode "insert" only for new files or clear append-only changes.
+Use mode "none" if the inspected files are not enough.
+Do not hard-code behavior for a specific request. Infer the target from the request and inspected files.
+Do not claim the patch was applied.`,
+      },
+      {
+        role: "user",
+        content: `USER REQUEST:
+${question}
+
+FILE SELECTION RATIONALE:
+${selection.rationale}
+
+PROJECT FILES:
+${projectSummary.slice(0, 70000)}`,
+      },
+    ],
+  });
+
+  const patch = safeJsonParse<AgentPatch>(response.output_text || "", {
+    mode: "none",
+    file: "",
+    search: "",
+    replacement: "",
+    language: "text",
+    explanation: "Feature patch recovery did not return valid JSON.",
+  });
+  const verification = verifyPatchAgainstFiles(patch, projectFiles);
+  if (!verification.ok) return null;
+
+  const normalizedFile = normalizePath(patch.file);
+
+  return {
+    answer: `I prepared a safe patch preview for ${baseName(normalizedFile)} from the inspected project files.`,
+    inspectedFiles: projectFiles.map((file) => normalizePath(file.file)),
+    findings: [
+      `Recovered from an invalid full-schema response by generating a narrow patch-only preview for ${baseName(normalizedFile)}.`,
+      patch.explanation,
+    ].filter(Boolean),
+    rootCause: {
+      status: "not_applicable",
+      title: "Requested project change",
+      confidence: 0.82,
+      why: "The user asked for a code/style change rather than a bug diagnosis. The patch is grounded in inspected file content and still must pass preview/validation before Apply.",
+      evidence: [`Patch target: ${normalizedFile}`],
+      exactReferences: [normalizedFile],
+    },
+    investigation: {
+      filesScanned: projectFiles.map((file) => normalizePath(file.file)),
+      filesIgnored: [],
+      searchTermsUsed: tokenizeForEvidence(question).slice(0, 10),
+      selectionReason: selection.rationale || "Selected likely implementation files from the current request.",
+    },
+    patch,
+    patchConfidence: {
+      confidence: 0.82,
+      risk: "medium",
+      filesAffected: 1,
+      reason: `Patch-only recovery passed local safety checks: ${verification.reason || "target and exact replacement were verified."}`,
+    },
+    dependencyProposal: {
+      needed: false,
+      packageName: "",
+      devDependency: false,
+      reason: "No dependency was required for this requested change.",
+    },
+    validationPlan: ["Review the Apply preview.", "Apply the patch if it matches the request.", "Run project validation after applying."],
+    confidence: 0.82,
+  };
+}
+
 async function readProjectDiagnostics() {
   try {
     const response = await fetch("http://localhost:7777/project/diagnostics");
@@ -1363,8 +1492,13 @@ async function readStructuralScan() {
 function verifyPatchAgainstFiles(patch: AgentPatch, projectFiles: ProjectFilePayload[]) {
   if (patch.mode === "none") return { ok: false, reason: "No patch was requested." };
 
+  const normalizedPatchFile = normalizePath(patch.file).toLowerCase();
   const matchingFile = projectFiles.find(
-    (file) => normalizePath(file.file).toLowerCase() === normalizePath(patch.file).toLowerCase(),
+    (file) => normalizePath(file.file).toLowerCase() === normalizedPatchFile,
+  ) || projectFiles.find(
+    (file) =>
+      !pathLooksAbsolute(patch.file) &&
+      normalizePath(file.file).toLowerCase().endsWith(`\\${normalizedPatchFile.replace(/^\\+/, "")}`),
   );
 
   if (!matchingFile) {
@@ -1400,16 +1534,19 @@ function verifyPatchAgainstFiles(patch: AgentPatch, projectFiles: ProjectFilePay
     return { ok: false, reason: "Unsupported patch mode." };
   }
 
-  if (patch.search.trim().length < 40) {
-    return { ok: false, reason: "The exact code to replace is too small to apply safely." };
-  }
-
   if (patch.search === patch.replacement) {
     return { ok: false, reason: "Patch replacement is identical to the current code." };
   }
 
   if (patch.mode === "replace" && !matchingFile.content.includes(patch.search)) {
     return { ok: false, reason: "The exact code to replace was not found in the inspected file." };
+  }
+
+  if (patch.search.trim().length < 40) {
+    const occurrences = matchingFile.content.split(patch.search).length - 1;
+    if (patch.search.trim().length < 8 || occurrences !== 1) {
+      return { ok: false, reason: "The exact code to replace is too small or not unique enough to apply safely." };
+    }
   }
 
   return { ok: true, reason: "" };
@@ -2592,7 +2729,6 @@ export async function POST(req: Request) {
       });
     }
 
-    const combinedRequest = `${question}\n${history}`;
     const currentRequest = `${question}\n${log}\n${code}\n${computerSearchResults}`;
     const shouldRunProjectHealthScan = hasProjectFileList && asksForProjectHealthScan(currentRequest);
     const shouldRunBehaviorAudit = hasProjectFileList && asksForBehaviorAudit(currentRequest);
@@ -2629,8 +2765,8 @@ export async function POST(req: Request) {
           selectedFiles: [],
           rationale: "No connected project file list was available; Agent is running in evidence-only mode.",
         };
-    const deterministicFiles = findExplicitlyMentionedFiles(`${question}\n${history}\n${code}`, projectFileList);
-    const workflowRelevantFiles = findWorkflowRelevantFiles(combinedRequest, projectFileList);
+    const deterministicFiles = findExplicitlyMentionedFiles(`${question}\n${code}`, projectFileList);
+    const workflowRelevantFiles = findWorkflowRelevantFiles(currentRequest, projectFileList);
     const behaviorAuditFiles = shouldRunBehaviorAudit ? findBehaviorAuditFiles(projectFileList) : [];
     const selectedFileSet = new Set<string>();
     const selectedFiles = [
@@ -3070,6 +3206,10 @@ ${uploadedSummary || "No uploaded files."}`,
     }
 
     if (result.patch.mode === "none") {
+      const featurePatchFallback =
+        hasProjectFileList && isFeatureRequest(question) && result.confidence < 0.72
+          ? await buildFeaturePatchFallback({ question, projectFiles, selection })
+          : null;
       const evidenceOnlyReview =
         !hasProjectFileList &&
         hasEvidenceOnlyText({ log, code, computerSearchResults, uploadedFiles }) &&
@@ -3081,6 +3221,7 @@ ${uploadedSummary || "No uploaded files."}`,
           : null;
       const fallbackResult =
         evidenceOnlyReview ||
+        featurePatchFallback ||
         (!hasProjectFileList && (result.confidence < 0.6 || looksLikeEmvTlv(evidenceTextForFallback))
           ? evidenceOnlyFallback({ question, log, code, computerSearchResults, uploadedFiles })
           : null) ||

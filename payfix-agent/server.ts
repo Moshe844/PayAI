@@ -1075,6 +1075,7 @@ async function runProjectCommand(command: string, args: string[]) {
   const displayCommand = [command, ...args]
     .map((part) => (/[\s"]/g.test(part) ? `"${part.replace(/"/g, '\\"')}"` : part))
     .join(" ");
+  const needsWindowsCommandShell = process.platform === "win32" && /\.(cmd|bat)$/i.test(command);
 
   try {
     const result = await execFileAsync(command, args, {
@@ -1082,7 +1083,7 @@ async function runProjectCommand(command: string, args: string[]) {
       timeout: 45000,
       windowsHide: true,
       maxBuffer: 1024 * 1024,
-      shell: false,
+      shell: needsWindowsCommandShell,
     });
 
     return {

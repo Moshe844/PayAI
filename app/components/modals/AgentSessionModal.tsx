@@ -313,6 +313,7 @@ export default function AgentSessionModal({
               }}
               placeholder="Ask PayFix what to inspect, change, validate, or install..."
               className="min-h-28 w-full resize-y rounded-2xl border border-white/10 bg-slate-900 p-4 text-[15px] leading-6 text-white outline-none transition placeholder:text-slate-500 focus:border-blue-400 focus:ring-2 focus:ring-blue-500/30"
+              style={{ color: "#f8fafc" }}
             />
 
             <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
