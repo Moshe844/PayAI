@@ -475,6 +475,7 @@ function stripCodeForDelimiterScan(content: string) {
   return content
     .replace(/\/\*[\s\S]*?\*\//g, (match) => " ".repeat(match.length))
     .replace(/\/\/.*$/gm, (match) => " ".repeat(match.length))
+    .replace(/\/(?![/*])(?:\\.|\[[^\]\r\n]*(?:\\.[^\]\r\n]*)*\]|[^/\\\r\n])+\/[dgimsuvy]*/g, (match) => " ".repeat(match.length))
     .replace(/@?"(?:\\.|""|[^"\\])*"/g, (match) => " ".repeat(match.length))
     .replace(/'(?:\\.|[^'\\])'/g, (match) => " ".repeat(match.length))
     .replace(/`(?:\\.|[^`\\])*`/g, (match) => " ".repeat(match.length));
@@ -532,12 +533,12 @@ function diagnoseCStyleControlStatementParens(content: string, languageLabel: st
     if (!match) continue;
 
     const nearby = lines.slice(index, Math.min(lines.length, index + 4)).join("\n");
-    const braceIndex = nearby.indexOf("{");
-    const terminatorIndex = nearby.search(/[;{]/);
+    const scannedNearby = stripCodeForDelimiterScan(nearby);
+    const braceIndex = scannedNearby.indexOf("{");
+    const terminatorIndex = scannedNearby.search(/[;{]/);
     if (braceIndex < 0 || (terminatorIndex >= 0 && terminatorIndex !== braceIndex)) continue;
 
-    const beforeBrace = nearby.slice(0, braceIndex);
-    const scanned = stripCodeForDelimiterScan(beforeBrace);
+    const scanned = scannedNearby.slice(0, braceIndex);
     const openCount = (scanned.match(/\(/g) || []).length;
     const closeCount = (scanned.match(/\)/g) || []).length;
 

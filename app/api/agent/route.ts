@@ -2593,11 +2593,12 @@ export async function POST(req: Request) {
     }
 
     const combinedRequest = `${question}\n${history}`;
-    const shouldRunProjectHealthScan = hasProjectFileList && asksForProjectHealthScan(combinedRequest);
-    const shouldRunBehaviorAudit = hasProjectFileList && asksForBehaviorAudit(combinedRequest);
+    const currentRequest = `${question}\n${log}\n${code}\n${computerSearchResults}`;
+    const shouldRunProjectHealthScan = hasProjectFileList && asksForProjectHealthScan(currentRequest);
+    const shouldRunBehaviorAudit = hasProjectFileList && asksForBehaviorAudit(currentRequest);
     const projectDiagnostics = hasProjectFileList ? await readProjectDiagnostics() : null;
     const diagnosticIssues = parseDiagnosticIssues(projectDiagnostics);
-    const shouldRunStructuralScan = shouldRunProjectHealthScan || asksForStructuralScan(combinedRequest) || diagnosticIssues.length > 0;
+    const shouldRunStructuralScan = shouldRunProjectHealthScan || asksForStructuralScan(currentRequest) || diagnosticIssues.length > 0;
     const rawStructuralScan = hasProjectFileList && shouldRunStructuralScan ? await readStructuralScan() : null;
     const structuralScan = filterStructuralScanToDiagnostics(rawStructuralScan, diagnosticIssues);
     const diagnosticIssueFiles = resolveFilesFromProjectList(
@@ -3084,7 +3085,7 @@ ${uploadedSummary || "No uploaded files."}`,
           ? evidenceOnlyFallback({ question, log, code, computerSearchResults, uploadedFiles })
           : null) ||
         (shouldRunBehaviorAudit ? buildBehaviorAuditFallback({ projectFiles, projectDiagnostics }) : null) ||
-        (!shouldRunBehaviorAudit && structuralScan?.issues?.some((issue) => issue.severity !== "info")
+        (!shouldRunBehaviorAudit && shouldRunStructuralScan && structuralScan?.issues?.some((issue) => issue.severity !== "info")
           ? buildStructuralScanFallback(structuralScan, projectFiles)
           : null) ||
         (result.confidence === 0 && shouldRunProjectHealthScan && !shouldRunBehaviorAudit
