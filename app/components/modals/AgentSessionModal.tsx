@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, type ClipboardEvent, type DragEvent } from "react";
 import { Bot, FileText, Loader2, Send, Upload, X } from "lucide-react";
 
 import type { ChatMessage, UploadedFile } from "../../lib/payfixTypes";
@@ -162,9 +162,47 @@ export default function AgentSessionModal({
   const [draft, setDraft] = useState("");
   const [expandedContexts, setExpandedContexts] = useState<Set<string>>(new Set());
   const [pendingActionPrompt, setPendingActionPrompt] = useState("");
+  const [draggingFiles, setDraggingFiles] = useState(false);
   const hasProject = Boolean(connectedProjectPath);
   const modeLabel = hasProject ? "Engineering mode" : "Evidence-only mode";
   const title = hasProject ? "Project Investigation" : "Evidence Investigation";
+
+  function uploadFiles(files: FileList | null) {
+    if (!files?.length) return false;
+    onUpload(files);
+    return true;
+  }
+
+  function handlePaste(event: ClipboardEvent<HTMLTextAreaElement>) {
+    if (uploadFiles(event.clipboardData.files)) {
+      event.preventDefault();
+    }
+  }
+
+  function handleDragEnter(event: DragEvent<HTMLDivElement>) {
+    if (!event.dataTransfer.types.includes("Files")) return;
+    event.preventDefault();
+    setDraggingFiles(true);
+  }
+
+  function handleDragOver(event: DragEvent<HTMLDivElement>) {
+    if (!event.dataTransfer.types.includes("Files")) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "copy";
+    setDraggingFiles(true);
+  }
+
+  function handleDragLeave(event: DragEvent<HTMLDivElement>) {
+    if (event.currentTarget.contains(event.relatedTarget as Node | null)) return;
+    setDraggingFiles(false);
+  }
+
+  function handleDrop(event: DragEvent<HTMLDivElement>) {
+    if (!event.dataTransfer.files.length) return;
+    event.preventDefault();
+    setDraggingFiles(false);
+    uploadFiles(event.dataTransfer.files);
+  }
 
   function sendDraft() {
     const prompt = draft.trim();
@@ -366,7 +404,20 @@ export default function AgentSessionModal({
         </div>
 
         <div className="border-t border-slate-200 bg-white p-4">
-          <div className="rounded-2xl bg-slate-950 p-3 shadow-xl shadow-slate-950/10">
+          <div
+            onDragEnter={handleDragEnter}
+            onDragOver={handleDragOver}
+            onDragLeave={handleDragLeave}
+            onDrop={handleDrop}
+            className={`relative rounded-2xl bg-slate-950 p-3 shadow-xl shadow-slate-950/10 ring-1 transition ${
+              draggingFiles ? "ring-blue-400 shadow-blue-950/30" : "ring-transparent"
+            }`}
+          >
+            {draggingFiles && (
+              <div className="pointer-events-none absolute inset-2 z-10 flex items-center justify-center rounded-2xl border-2 border-dashed border-blue-300 bg-blue-950/80 text-sm font-black text-white backdrop-blur-sm">
+                Drop files or screenshots into this Agent workspace
+              </div>
+            )}
             {uploads.length > 0 && (
               <div className="mb-3 flex flex-wrap gap-2">
                 {uploads.map((file, index) => (
@@ -387,19 +438,20 @@ export default function AgentSessionModal({
             <textarea
               value={draft}
               onChange={(event) => setDraft(event.target.value)}
+              onPaste={handlePaste}
               onKeyDown={(event) => {
                 if (event.key === "Enter" && !event.shiftKey) {
                   event.preventDefault();
                   sendDraft();
                 }
               }}
-              placeholder="Ask PayFix what to inspect, change, validate, or install..."
+              placeholder="Ask PayFix what to inspect, change, validate, or install... paste screenshots or drag files here too..."
               className="min-h-28 w-full resize-y rounded-2xl border border-white/10 bg-slate-900 p-4 text-[15px] leading-6 text-white outline-none transition placeholder:text-slate-500 focus:border-blue-400 focus:ring-2 focus:ring-blue-500/30"
               style={{ color: "#f8fafc" }}
             />
 
             <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
-              <div className="text-xs text-slate-400">Enter sends. Shift+Enter adds a new line.</div>
+              <div className="text-xs text-slate-400">Enter sends. Shift+Enter adds a new line. Paste screenshots or drag files here.</div>
               <div className="flex flex-wrap gap-2">
                 <label className="inline-flex h-10 cursor-pointer items-center gap-2 rounded-xl bg-slate-800 px-4 text-sm font-black text-slate-100 ring-1 ring-white/10 transition hover:bg-slate-700">
                   <Upload size={16} />
