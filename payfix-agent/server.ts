@@ -568,6 +568,80 @@ function dedupeWatchIssues(issues: WatchIssue[]) {
   });
 }
 
+const htmlVoidTags = new Set([
+  "area",
+  "base",
+  "br",
+  "col",
+  "embed",
+  "hr",
+  "img",
+  "input",
+  "link",
+  "meta",
+  "param",
+  "source",
+  "track",
+  "wbr",
+]);
+
+const svgSelfClosingTags = new Set([
+  "animate",
+  "circle",
+  "ellipse",
+  "feblend",
+  "fecolormatrix",
+  "fecomponenttransfer",
+  "fecomposite",
+  "feconvolvematrix",
+  "fediffuselighting",
+  "fedisplacementmap",
+  "fedistantlight",
+  "fedropshadow",
+  "feflood",
+  "fefunca",
+  "fefuncb",
+  "fefuncg",
+  "fefuncr",
+  "fegaussianblur",
+  "feimage",
+  "femerge",
+  "femergenode",
+  "femorphology",
+  "feoffset",
+  "fepointlight",
+  "fespecularlighting",
+  "fespotlight",
+  "fetile",
+  "feturbulence",
+  "line",
+  "path",
+  "polygon",
+  "polyline",
+  "rect",
+  "stop",
+  "use",
+]);
+
+function diagnoseHtmlSelfClosingNonVoidTags(content: string): WatchIssue[] {
+  const issues: WatchIssue[] = [];
+
+  for (const match of content.matchAll(/<([a-z][a-z0-9:-]*)(?:\s[^<>]*)?\/>/gi)) {
+    const tag = match[1].toLowerCase();
+    if (htmlVoidTags.has(tag) || svgSelfClosingTags.has(tag)) continue;
+
+    const line = lineNumberForIndex(content, match.index || 0);
+    const snippet = match[0].replace(/\s+/g, " ").slice(0, 120);
+    issues.push({
+      severity: "warning",
+      line,
+      message: `Line ${line}: suspicious self-closing <${tag} /> tag. HTML treats ${snippet} as an opening <${tag}> tag; use <${tag}></${tag}> instead.`,
+    });
+  }
+
+  return issues;
+}
+
 async function diagnoseWatchedFile(file: string, content: string): Promise<WatchIssue[]> {
   const issues: WatchIssue[] = [];
   const extension = path.extname(file).toLowerCase();
@@ -612,12 +686,13 @@ async function diagnoseWatchedFile(file: string, content: string): Promise<Watch
       }
     }
 
-    const voidTags = new Set(["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"]);
+    issues.push(...diagnoseHtmlSelfClosingNonVoidTags(content));
+
     const stack: string[] = [];
     for (const match of content.matchAll(/<\/?([a-z][a-z0-9-]*)(?:\s[^>]*)?>/gi)) {
       const full = match[0];
       const tag = match[1].toLowerCase();
-      if (voidTags.has(tag) || full.endsWith("/>") || full.startsWith("<!")) continue;
+      if (htmlVoidTags.has(tag) || full.endsWith("/>") || full.startsWith("<!")) continue;
       if (!full.startsWith("</")) {
         stack.push(tag);
         continue;
