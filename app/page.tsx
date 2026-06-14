@@ -279,6 +279,13 @@ type RollbackSnapshot = {
   reason: string;
 };
 
+type AppliedPatchNotice = {
+  key: string;
+  files: string[];
+  validationLabel: string;
+  appliedAt: string;
+};
+
 type ConversationImage = {
   id: string;
   file: UploadedFile;
@@ -436,6 +443,8 @@ export default function Home() {
   const [diffOldContent, setDiffOldContent] = useState("");
   const [diffNewContent, setDiffNewContent] = useState("");
   const [applyPreviewKey, setApplyPreviewKey] = useState("");
+  const [appliedPatchKeys, setAppliedPatchKeys] = useState<string[]>([]);
+  const [appliedPatchNotice, setAppliedPatchNotice] = useState<AppliedPatchNotice | null>(null);
   const [showRunner, setShowRunner] = useState(false);
   const [runnerMode, setRunnerMode] = useState<RunnerMode>("js");
   const [runnerLanguage, setRunnerLanguage] = useState("javascript");
@@ -1950,6 +1959,18 @@ Please inspect the exact project file and neighboring code. Decide whether this 
     }
 
     const apiPatchSet = data.result?.patchSet || data.patchSet || [];
+    const nextApplyKey = makeApplyPreviewKey({
+      file: patch.file,
+      mode: patch.mode,
+      search: patch.search,
+      content: patch.replacement,
+    });
+
+    if (appliedPatchKeys.includes(nextApplyKey)) {
+      setAgentStatus(`Patch for ${basename(patch.file)} was already applied. No Apply preview reopened.`);
+      return false;
+    }
+
     setApplyFilePath(patch.file);
     setApplyMode(patch.mode);
     setApplySearchContent(patch.search);
@@ -1975,14 +1996,7 @@ Please inspect the exact project file and neighboring code. Decide whether this 
           }))
         : [],
     );
-    setApplyPreviewKey(
-      makeApplyPreviewKey({
-        file: patch.file,
-        mode: patch.mode,
-        search: patch.search,
-        content: patch.replacement,
-      }),
-    );
+    setApplyPreviewKey(nextApplyKey);
     setShowApplyModal(true);
     return true;
   }
@@ -2015,6 +2029,19 @@ Please inspect the exact project file and neighboring code. Decide whether this 
     });
   }
 
+  function markPatchApplied(files: string[], key = currentApplyPreviewKey()) {
+    const cleanFiles = files.filter(Boolean);
+    const validationLabel = [...new Set(cleanFiles.map(validationLabelForFile))].slice(0, 3).join(", ") || "project diagnostics";
+
+    setAppliedPatchKeys((current) => (current.includes(key) ? current : [...current, key]));
+    setAppliedPatchNotice({
+      key,
+      files: cleanFiles,
+      validationLabel,
+      appliedAt: new Date().toLocaleString(),
+    });
+  }
+
   function invalidateApplyPreview() {
     setApplyPreviewKey("");
     setDiffOldContent("");
@@ -2041,11 +2068,36 @@ Please inspect the exact project file and neighboring code. Decide whether this 
 
     const firstUser = agentSessionMessages.find((message) => message.role === "user")?.content || "PayFix investigation";
     const lastAssistant = [...agentSessionMessages].reverse().find((message) => message.role === "assistant")?.content || "";
+    const appliedFiles = appliedPatchNotice?.files || [];
+    const appliedSummary = appliedPatchNotice
+      ? `PATCH ALREADY APPLIED
+
+PayFix already wrote this change while the Agent workspace was open.
+
+Updated file${appliedFiles.length === 1 ? "" : "s"}:
+${appliedFiles.map((file) => `- ${file}`).join("\n")}
+
+Validation/checks:
+${appliedPatchNotice.validationLabel}
+
+Applied:
+${appliedPatchNotice.appliedAt}
+
+No Apply preview is attached to this saved summary because the patch is no longer pending. Reopen the investigation only if you want follow-up review, more changes, or explanation.`
+      : "";
     const agentSummary: ChatMessage = {
       role: "assistant",
       isAgentSessionSummary: true,
+      patchAlreadyApplied: Boolean(appliedPatchNotice),
       agentSessionMessages,
-      content: `PAYFIX INVESTIGATION SAVED
+      content: appliedSummary
+        ? `PAYFIX INVESTIGATION SAVED
+
+${appliedSummary}
+
+Original investigation question:
+${firstUser.slice(0, 700)}`
+        : `PAYFIX INVESTIGATION SAVED
 
 Investigation question:
 ${firstUser.slice(0, 700)}
@@ -2070,6 +2122,8 @@ Reopen this saved investigation to continue the project review, upload more evid
       return nextMessages;
     });
     setAgentSessionOpen(false);
+    setShowApplyModal(false);
+    setAppliedPatchNotice(null);
     setAgentStatus("PayFix investigation saved to this chat.");
   }
 
@@ -2147,6 +2201,8 @@ Reopen this saved investigation to continue the project review, upload more evid
     resetColorTool();
     resetRunner();
     resetApplyModal();
+    setAppliedPatchKeys([]);
+    setAppliedPatchNotice(null);
     setDependencyProposal(null);
     setAgentStatus("New chat started.");
   }
@@ -2590,6 +2646,8 @@ SIZE: ${item.size || 0} bytes`;
       if (data.rollback?.id) {
         setLastRollback(data.rollback as RollbackSnapshot);
       }
+      const appliedKey = currentApplyPreviewKey();
+      markPatchApplied([applyFilePath], appliedKey);
       setShowApplyModal(false);
       setAgentStatus(`Patch applied to ${basename(applyFilePath)}. Running ${validationLabelForFile(applyFilePath)} checks...`);
       appendAssistantStatusMessage(
@@ -2725,6 +2783,15 @@ SIZE: ${item.size || 0} bytes`;
 
       setDiffOldContent(previews.map((preview) => `FILE: ${preview.file}\n\n${preview.oldContent || ""}`).join("\n\n---\n\n"));
       setDiffNewContent(previews.map((preview) => `FILE: ${preview.file}\n\n${preview.newContent || ""}`).join("\n\n---\n\n"));
+      markPatchApplied(
+        uniquePatchSet.map((item) => item.resolvedFile),
+        JSON.stringify(uniquePatchSet.map((item) => ({
+          file: item.resolvedFile,
+          mode: item.mode,
+          search: item.search,
+          content: item.replacement,
+        }))),
+      );
       setShowApplyModal(false);
       setAgentStatus(`Applied ${uniquePatchSet.length} file changes. Running language checks and project diagnostics...`);
       const rereadResults = await rereadAppliedFiles(uniquePatchSet.map((item) => item.resolvedFile));
@@ -2975,6 +3042,18 @@ SIZE: ${item.size || 0} bytes`;
       return;
     }
 
+    const resolvedApplyKey = makeApplyPreviewKey({
+      file: resolvedFile,
+      mode: parsed.mode,
+      search: parsed.search,
+      content: parsed.replacement,
+    });
+
+    if (appliedPatchKeys.includes(resolvedApplyKey)) {
+      setAgentStatus(`That patch was already applied to ${basename(resolvedFile)}. No second Apply is needed.`);
+      return;
+    }
+
     setApplyMode(parsed.mode);
     setApplySearchContent(parsed.search);
     setApplyNewContent(parsed.replacement);
@@ -3013,12 +3092,7 @@ SIZE: ${item.size || 0} bytes`;
           setDiffOldContent(data.oldContent || "");
           setDiffNewContent(data.newContent || "");
           setApplyPreviewKey(
-            makeApplyPreviewKey({
-              file: resolvedFile,
-              mode: parsed.mode,
-              search: parsed.search,
-              content: parsed.replacement,
-            }),
+            resolvedApplyKey,
           );
           setAgentStatus("Preview loaded. Review before applying.");
         } else {
@@ -3396,6 +3470,7 @@ ${submittedComputerSearchResults}`,
       "Investigate the connected project.";
 
     resetApplyModal();
+    setAppliedPatchNotice(null);
     setAgentSessionOpen(true);
     setAgentSessionMessages([]);
     setAgentSessionUploads(submittedUploadedFiles);

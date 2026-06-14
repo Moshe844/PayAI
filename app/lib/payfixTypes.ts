@@ -7,6 +7,7 @@ export type ChatMessage = {
   generatedFiles?: GeneratedFile[];
   isAgentSessionSummary?: boolean;
   agentSessionMessages?: ChatMessage[];
+  patchAlreadyApplied?: boolean;
 };
 
 export type UploadedFile = {

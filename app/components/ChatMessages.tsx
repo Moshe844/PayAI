@@ -277,6 +277,11 @@ function ChatMessages({
             const longMessage = !activityMessage && isLongMessage(message.content);
             const isExpanded = expandedMessages.has(messageIndex);
             const renderedContent = longMessage && !isExpanded ? previewMessage(message.content) : message.content;
+            const canApplyCodeBlocks =
+              message.role === "assistant" &&
+              !message.isAgentSessionSummary &&
+              !message.patchAlreadyApplied &&
+              !/PATCH ALREADY APPLIED/i.test(message.content);
             const markdownComponents: Components = {
               p: ({ children }) => (
                 <div className="mb-2.5 last:mb-0">
@@ -417,18 +422,20 @@ function ChatMessages({
                           Run
                         </button>
 
-                        <button
-                          onClick={() =>
-                            openApplyModalWithContent(
-                              codeString,
-                              message.content
-                            )
-                          }
-                          className="flex h-8 items-center gap-2 rounded-lg bg-blue-600 px-3 text-xs font-bold text-white shadow-sm transition hover:bg-blue-500"
-                        >
-                          <FileText size={14} />
-                          Apply
-                        </button>
+                        {canApplyCodeBlocks && (
+                          <button
+                            onClick={() =>
+                              openApplyModalWithContent(
+                                codeString,
+                                message.content
+                              )
+                            }
+                            className="flex h-8 items-center gap-2 rounded-lg bg-blue-600 px-3 text-xs font-bold text-white shadow-sm transition hover:bg-blue-500"
+                          >
+                            <FileText size={14} />
+                            Apply
+                          </button>
+                        )}
 
                         <button
                           type="button"
