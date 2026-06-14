@@ -191,7 +191,7 @@ export default function ApplyChangesModal({
     numberedLines(diffNewContent).filter((line, index) => line !== numberedLines(diffOldContent)[index]).length;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/65 p-5 backdrop-blur-sm">
+    <div className="fixed inset-0 z-[360] flex items-center justify-center bg-slate-950/65 p-5 backdrop-blur-sm">
       <div className="flex h-[92vh] w-full max-w-7xl flex-col overflow-hidden rounded-2xl bg-white shadow-2xl">
         <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
           <div>

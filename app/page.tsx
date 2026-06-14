@@ -916,6 +916,68 @@ export default function Home() {
     return "txt";
   }
 
+  function basename(file: string) {
+    return file.split(/[\\/]/).pop() || file || "selected file";
+  }
+
+  function validationLabelForFile(file: string) {
+    const clean = file.toLowerCase();
+    if (/\.(ts|tsx)$/i.test(clean)) return "TypeScript type check + lint";
+    if (/\.(js|jsx|mjs|cjs)$/i.test(clean)) return "JavaScript linting";
+    if (/\.(cs|csproj|sln)$/i.test(clean)) return "C# build + code analysis";
+    if (/\.(java|gradle|kt|kts)$/i.test(clean)) return /\.java$/i.test(clean) ? "Java compile + static analysis" : "Kotlin/Java build + lint";
+    if (/\.(cc|cpp|cxx|hpp|hh|hxx)$/i.test(clean)) return "C++ compile + static analysis";
+    if (/\.(c|h)$/i.test(clean)) return "C compile + static analysis";
+    if (/\.py$/i.test(clean)) return "Python type checking + linting";
+    if (/\.go$/i.test(clean)) return "Go build + vet + lint";
+    if (/\.rs$/i.test(clean)) return "Rust check + Clippy";
+    if (/\.swift$/i.test(clean)) return "Swift build + lint";
+    if (/\.(php|phtml)$/i.test(clean)) return "PHP static analysis + lint";
+    if (/\.(rb|rake)$/i.test(clean)) return "Ruby linting + static analysis";
+    if (/\.dart$/i.test(clean)) return "Dart/Flutter analyze";
+    if (/\.scala$/i.test(clean)) return "Scala compile + static analysis";
+    if (/\.mm$/i.test(clean)) return "Objective-C build + static analysis";
+    if (/\.(ex|exs)$/i.test(clean)) return "Elixir compile + Dialyzer";
+    if (/\.(hs|lhs)$/i.test(clean)) return "Haskell build + lint";
+    if (/\.lua$/i.test(clean)) return "Lua linting";
+    if (/\.(pl|pm|t)$/i.test(clean)) return "Perl syntax check + lint";
+    if (/\.r$/i.test(clean)) return "R package check / lint";
+    if (/\.m$/i.test(clean)) return "Objective-C or MATLAB static analysis";
+    if (/\.(css|scss|sass|less)$/i.test(clean)) return "style lint + project checks";
+    if (/\.(html|htm)$/i.test(clean)) return "HTML validation + project checks";
+    return "project diagnostics";
+  }
+
+  function applyStatusForFiles(files: string[]) {
+    const uniqueLabels = [...new Set(files.filter(Boolean).map(validationLabelForFile))];
+    const fileLabel = files.length === 1 ? basename(files[0]) : `${files.length} files`;
+    return `Applying patch to ${fileLabel} and running ${uniqueLabels.slice(0, 3).join(", ") || "project diagnostics"}...`;
+  }
+
+  function agentWorkingMessageForPrompt(prompt: string, hasProject: boolean) {
+    if (/apply|patch|change|update|fix/i.test(prompt)) {
+      return hasProject
+        ? "PayFix Agent is preparing the requested code change, checking exact files, and building a reviewable patch..."
+        : "PayFix Agent is reviewing the requested change against attached evidence...";
+    }
+
+    if (/validate|lint|type|build|compile|test|check|error|warning/i.test(prompt)) {
+      return "PayFix Agent is running validation-focused investigation and collecting warnings, errors, and next steps...";
+    }
+
+    if (/audit|deeper|inspect|why|wrong|bug|risk/i.test(prompt)) {
+      return "PayFix Agent is auditing behavior, reading relevant files, and separating proven issues from guesses...";
+    }
+
+    if (/install|dependency|package/i.test(prompt)) {
+      return "PayFix Agent is checking dependency usage, package files, and validation requirements...";
+    }
+
+    return hasProject
+      ? "PayFix Agent is investigating: indexing the project, selecting files, reading evidence, and preparing a reviewable result..."
+      : "PayFix Agent is investigating evidence: reading uploads, logs, screenshots, and pasted context...";
+  }
+
   function textFromBytes(bytes: Uint8Array) {
     return new TextDecoder("utf-8", { fatal: false }).decode(bytes);
   }
@@ -2518,6 +2580,7 @@ SIZE: ${item.size || 0} bytes`;
         return;
       }
 
+      setAgentStatus(applyStatusForFiles([applyFilePath]));
       const data = await requestFileChange(true);
       if (!data.ok) {
         setAgentStatus(data.error || "Failed applying changes.");
@@ -2528,8 +2591,12 @@ SIZE: ${item.size || 0} bytes`;
         setLastRollback(data.rollback as RollbackSnapshot);
       }
       setShowApplyModal(false);
-      setAgentStatus("Changes applied. Re-reading file and validating fix...");
-      appendAssistantStatusMessage(`PATCH APPLIED\n\nUpdated ${applyFilePath}. PayFix is re-reading and validating the change.`);
+      setAgentStatus(`Patch applied to ${basename(applyFilePath)}. Running ${validationLabelForFile(applyFilePath)} checks...`);
+      appendAssistantStatusMessage(
+        `PATCH APPLIED\n\nUpdated ${applyFilePath}.\n\nVALIDATION NOW RUNNING\n${validationLabelForFile(
+          applyFilePath,
+        )} checks plus project diagnostics where available.`,
+      );
       await validateAppliedFileChange();
     } catch (err: unknown) {
       setAgentStatus(errorMessage(err, "Apply failed."));
@@ -2616,7 +2683,7 @@ SIZE: ${item.size || 0} bytes`;
     }
 
     setApplyAllLoading(true);
-    setAgentStatus(`Previewing ${uniquePatchSet.length} file changes...`);
+    setAgentStatus(`Previewing ${uniquePatchSet.length} file changes before apply...`);
 
     try {
       const previews = await Promise.all(
@@ -2636,6 +2703,8 @@ SIZE: ${item.size || 0} bytes`;
           return data;
         }),
       );
+
+      setAgentStatus(applyStatusForFiles(uniquePatchSet.map((item) => item.resolvedFile)));
 
       for (const item of uniquePatchSet) {
         const applyResult = await requestFileChangeWithValues({
@@ -2657,7 +2726,7 @@ SIZE: ${item.size || 0} bytes`;
       setDiffOldContent(previews.map((preview) => `FILE: ${preview.file}\n\n${preview.oldContent || ""}`).join("\n\n---\n\n"));
       setDiffNewContent(previews.map((preview) => `FILE: ${preview.file}\n\n${preview.newContent || ""}`).join("\n\n---\n\n"));
       setShowApplyModal(false);
-      setAgentStatus(`Applied ${uniquePatchSet.length} file changes. Re-reading and validating...`);
+      setAgentStatus(`Applied ${uniquePatchSet.length} file changes. Running language checks and project diagnostics...`);
       const rereadResults = await rereadAppliedFiles(uniquePatchSet.map((item) => item.resolvedFile));
       const sandboxSummary = await runPostApplySandboxChecks();
       appendAssistantStatusMessage(
@@ -2677,6 +2746,7 @@ SIZE: ${item.size || 0} bytes`;
 
   async function validateAppliedFileChange() {
     try {
+      setAgentStatus(`Re-reading ${basename(applyFilePath)} and running ${validationLabelForFile(applyFilePath)} checks...`);
       const readRes = await fetch("/api/local-agent/project/read-file-ai", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -2703,10 +2773,11 @@ SIZE: ${item.size || 0} bytes`;
       const validateData = await validateRes.json();
       if (!validateData.ok) throw new Error(validateData.error || "Validation failed.");
 
+      setAgentStatus(`Patch reasoning complete. Running project sandbox checks after ${validationLabelForFile(applyFilePath)}...`);
       const sandboxSummary = await runPostApplySandboxChecks();
 
       appendAssistantStatusMessage(`PATCH VALIDATION\n\n${validateData.result}\n\nSANDBOX CHECKS\n\n${sandboxSummary}`);
-      setAgentStatus("Changes applied and validated.");
+      setAgentStatus(`Changes applied and validated with ${validationLabelForFile(applyFilePath)} checks.`);
     } catch (err: unknown) {
       setAgentStatus(`Changes applied, but validation failed: ${errorMessage(err)}`);
     }
@@ -3226,16 +3297,14 @@ ${submittedComputerSearchResults}`,
       ...baseSessionMessages,
       {
         role: "assistant",
-        content: connectedProjectPath
-          ? "PayFix Agent is investigating: indexing the project, selecting files, reading evidence, and preparing a reviewable fix..."
-          : "PayFix Agent is investigating evidence: reading uploads, logs, screenshots, and pasted context...",
+        content: agentWorkingMessageForPrompt(userContent, Boolean(connectedProjectPath)),
       },
     ]);
 
     try {
       let projectFileList = "";
       if (connectedProjectPath) {
-        setAgentStatus("PayFix Agent is connecting to the selected project...");
+        setAgentStatus("PayFix Agent is connecting to the selected project and loading file inventory...");
         await ensureLocalAgentRoot(connectedProjectPath);
 
         projectFileList = await loadFileList();
@@ -3243,9 +3312,9 @@ ${submittedComputerSearchResults}`,
           throw new Error("Could not load the project file list from the local agent.");
         }
 
-        setAgentStatus("PayFix Agent is choosing exact files to inspect...");
+        setAgentStatus(agentWorkingMessageForPrompt(userContent, true));
       } else {
-        setAgentStatus("PayFix Agent is investigating attached evidence without project file access...");
+        setAgentStatus(agentWorkingMessageForPrompt(userContent, false));
       }
 
       const response = await fetch("/api/agent", {
@@ -3360,7 +3429,7 @@ ${submittedComputerSearchResults}`,
 
   async function runAgentSessionFollowUp(prompt: string) {
     setAgentLoading(true);
-    setAgentStatus(connectedProjectPath ? "PayFix Agent is continuing the project investigation..." : "PayFix Agent is continuing the evidence investigation...");
+    setAgentStatus(agentWorkingMessageForPrompt(prompt, Boolean(connectedProjectPath)));
 
     try {
       await runAgentPromptInSession({
@@ -3406,8 +3475,8 @@ ${prompt}`;
     const baseMessages = [...messages, userMessage];
 
     setApplyAgentFollowUpLoading(true);
-    setAgentStatus("PayFix Agent is revising the patch investigation with your follow-up...");
-    setMessages([...baseMessages, { role: "assistant", content: "PayFix Agent is revising the current patch investigation..." }]);
+    setAgentStatus(agentWorkingMessageForPrompt(prompt, true));
+    setMessages([...baseMessages, { role: "assistant", content: agentWorkingMessageForPrompt(prompt, true) }]);
 
     try {
       await ensureLocalAgentRoot(connectedProjectPath);

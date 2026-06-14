@@ -1106,6 +1106,209 @@ async function runProjectCommand(command: string, args: string[]) {
   }
 }
 
+async function commandExists(command: string) {
+  if (path.isAbsolute(command)) {
+    return fileExists(command);
+  }
+
+  const lookupCommand = process.platform === "win32" ? "where.exe" : "which";
+  const lookupName = command.replace(/\.(cmd|bat|exe)$/i, "");
+
+  try {
+    await execFileAsync(lookupCommand, [lookupName], {
+      cwd: allowedRoot || process.cwd(),
+      timeout: 5000,
+      windowsHide: true,
+      maxBuffer: 1024 * 64,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function runProjectCommandIfAvailable(
+  command: string,
+  args: string[],
+  skipped: string[],
+  label: string
+) {
+  if (!(await commandExists(command))) {
+    skipped.push(`${label} skipped: ${command} was not found on PATH.`);
+    return null;
+  }
+
+  return runProjectCommand(command, args);
+}
+
+function windowsCommand(command: string) {
+  return process.platform === "win32" ? `${command}.cmd` : command;
+}
+
+async function findGradleCommand() {
+  const localGradle = process.platform === "win32"
+    ? path.join(allowedRoot, "gradlew.bat")
+    : path.join(allowedRoot, "gradlew");
+  if (await fileExists(localGradle)) return localGradle;
+  return windowsCommand("gradle");
+}
+
+async function addLanguageValidationCommands(
+  file: string,
+  commands: Awaited<ReturnType<typeof runProjectCommand>>[],
+  skipped: string[]
+) {
+  const relativeFile = path.relative(allowedRoot, file);
+  const ext = path.extname(file).toLowerCase();
+  const hasPackageJson = await fileExists(path.join(allowedRoot, "package.json"));
+  const hasTsConfig = await fileExists(path.join(allowedRoot, "tsconfig.json"));
+  const npxCommand = process.platform === "win32" ? "npx.cmd" : "npx";
+
+  if (hasPackageJson && hasTsConfig && /\.(ts|tsx|js|jsx|mjs|cjs|css|scss|sass|less|html|htm)$/i.test(file)) {
+    commands.push(await runProjectCommand(npxCommand, ["tsc", "--noEmit"]));
+  } else if (/\.(ts|tsx)$/i.test(file)) {
+    skipped.push("TypeScript type check skipped: package.json or tsconfig.json was not found.");
+  }
+
+  if (hasPackageJson && /\.(ts|tsx|js|jsx|mjs|cjs)$/i.test(file)) {
+    commands.push(await runProjectCommand(npxCommand, ["eslint", relativeFile]));
+  }
+
+  const dotnetTarget = await findDotnetTarget();
+  if (dotnetTarget && /\.(cs|csproj|config|json|xml)$/i.test(file)) {
+    commands.push(await runProjectCommand("dotnet", ["build", dotnetTarget, "--nologo"]));
+  } else if (/\.(cs|csproj)$/i.test(file)) {
+    skipped.push("C# build skipped: no .sln or .csproj file found.");
+  }
+
+  if (ext === ".py") {
+    const pyCompile = await runProjectCommandIfAvailable("python", ["-m", "py_compile", relativeFile], skipped, "Python syntax check");
+    if (pyCompile) commands.push(pyCompile);
+    const mypy = await runProjectCommandIfAvailable("mypy", [relativeFile], skipped, "Python type checking");
+    if (mypy) commands.push(mypy);
+    const ruff = await runProjectCommandIfAvailable("ruff", ["check", relativeFile], skipped, "Python linting");
+    if (ruff) commands.push(ruff);
+  }
+
+  if (ext === ".go") {
+    const goMod = await fileExists(path.join(allowedRoot, "go.mod"));
+    const goCheckArgs = goMod ? ["test", "./..."] : ["test", relativeFile];
+    const goTest = await runProjectCommandIfAvailable("go", goCheckArgs, skipped, "Go build/test");
+    if (goTest) commands.push(goTest);
+    if (goMod) {
+      const goVet = await runProjectCommandIfAvailable("go", ["vet", "./..."], skipped, "Go vet");
+      if (goVet) commands.push(goVet);
+    }
+  }
+
+  if (ext === ".rs") {
+    const cargoToml = await fileExists(path.join(allowedRoot, "Cargo.toml"));
+    if (cargoToml) {
+      const cargoCheck = await runProjectCommandIfAvailable("cargo", ["check"], skipped, "Rust check");
+      if (cargoCheck) commands.push(cargoCheck);
+      const clippy = await runProjectCommandIfAvailable("cargo", ["clippy", "--", "-D", "warnings"], skipped, "Rust Clippy");
+      if (clippy) commands.push(clippy);
+    } else {
+      skipped.push("Rust check skipped: Cargo.toml was not found.");
+    }
+  }
+
+  if (ext === ".java" || ext === ".kt" || ext === ".kts" || /gradle$/i.test(file)) {
+    const gradleCommand = await findGradleCommand();
+    if (await fileExists(path.join(allowedRoot, "pom.xml"))) {
+      const mvn = await runProjectCommandIfAvailable(windowsCommand("mvn"), ["-q", "-DskipTests", "compile"], skipped, "Java compile");
+      if (mvn) commands.push(mvn);
+    } else if (await fileExists(path.join(allowedRoot, "build.gradle")) || await fileExists(path.join(allowedRoot, "build.gradle.kts"))) {
+      const gradleBuild = await runProjectCommandIfAvailable(gradleCommand, ["build"], skipped, "Java/Kotlin build");
+      if (gradleBuild) commands.push(gradleBuild);
+    } else if (ext === ".java") {
+      const javac = await runProjectCommandIfAvailable("javac", [relativeFile], skipped, "Java compile");
+      if (javac) commands.push(javac);
+    } else {
+      skipped.push("Kotlin/Java build skipped: no Gradle, Maven, or javac validation target was found.");
+    }
+  }
+
+  if ([".c", ".cc", ".cpp", ".cxx", ".m", ".mm"].includes(ext)) {
+    const compiler = ext === ".cpp" || ext === ".cc" || ext === ".cxx" ? "g++" : "clang";
+    const compile = await runProjectCommandIfAvailable(compiler, ["-fsyntax-only", relativeFile], skipped, "C/C++/Objective-C syntax check");
+    if (compile) commands.push(compile);
+  }
+
+  if (ext === ".php" || ext === ".phtml") {
+    const php = await runProjectCommandIfAvailable("php", ["-l", relativeFile], skipped, "PHP lint");
+    if (php) commands.push(php);
+  }
+
+  if (ext === ".rb") {
+    const ruby = await runProjectCommandIfAvailable("ruby", ["-c", relativeFile], skipped, "Ruby syntax check");
+    if (ruby) commands.push(ruby);
+    const rubocop = await runProjectCommandIfAvailable("rubocop", [relativeFile], skipped, "Ruby static analysis");
+    if (rubocop) commands.push(rubocop);
+  }
+
+  if (ext === ".dart") {
+    const analyzer = await commandExists("flutter") ? "flutter" : "dart";
+    const args = analyzer === "flutter" ? ["analyze"] : ["analyze"];
+    const dart = await runProjectCommandIfAvailable(analyzer, args, skipped, "Dart/Flutter analyze");
+    if (dart) commands.push(dart);
+  }
+
+  if (ext === ".swift") {
+    if (await fileExists(path.join(allowedRoot, "Package.swift"))) {
+      const swift = await runProjectCommandIfAvailable("swift", ["build"], skipped, "Swift build");
+      if (swift) commands.push(swift);
+    } else {
+      skipped.push("Swift build skipped: Package.swift was not found.");
+    }
+  }
+
+  if (ext === ".scala") {
+    if (await fileExists(path.join(allowedRoot, "build.sbt"))) {
+      const sbt = await runProjectCommandIfAvailable(process.platform === "win32" ? "sbt.bat" : "sbt", ["compile"], skipped, "Scala compile");
+      if (sbt) commands.push(sbt);
+    } else {
+      skipped.push("Scala compile skipped: build.sbt was not found.");
+    }
+  }
+
+  if (ext === ".ex" || ext === ".exs") {
+    if (await fileExists(path.join(allowedRoot, "mix.exs"))) {
+      const mixCompile = await runProjectCommandIfAvailable(process.platform === "win32" ? "mix.bat" : "mix", ["compile"], skipped, "Elixir compile");
+      if (mixCompile) commands.push(mixCompile);
+      const mixDialyzer = await runProjectCommandIfAvailable(process.platform === "win32" ? "mix.bat" : "mix", ["dialyzer"], skipped, "Elixir Dialyzer");
+      if (mixDialyzer) commands.push(mixDialyzer);
+    } else {
+      skipped.push("Elixir compile skipped: mix.exs was not found.");
+    }
+  }
+
+  if (ext === ".hs" || ext === ".lhs") {
+    if (await fileExists(path.join(allowedRoot, "stack.yaml"))) {
+      const stack = await runProjectCommandIfAvailable("stack", ["build"], skipped, "Haskell stack build");
+      if (stack) commands.push(stack);
+    } else {
+      const cabal = await runProjectCommandIfAvailable("cabal", ["build"], skipped, "Haskell cabal build");
+      if (cabal) commands.push(cabal);
+    }
+  }
+
+  if (ext === ".lua") {
+    const lua = await runProjectCommandIfAvailable("luac", ["-p", relativeFile], skipped, "Lua linting");
+    if (lua) commands.push(lua);
+  }
+
+  if (ext === ".pl" || ext === ".pm" || ext === ".t") {
+    const perl = await runProjectCommandIfAvailable("perl", ["-c", relativeFile], skipped, "Perl syntax check");
+    if (perl) commands.push(perl);
+  }
+
+  if (ext === ".r") {
+    const r = await runProjectCommandIfAvailable("Rscript", ["-e", `parse(file='${relativeFile.replace(/\\/g, "/").replace(/'/g, "\\'")}')`], skipped, "R parse check");
+    if (r) commands.push(r);
+  }
+}
+
 async function runGitCommand(args: string[]) {
   if (!allowedRoot) throw new Error("No project folder selected.");
   return runProjectCommand("git", args);
@@ -2592,23 +2795,8 @@ app.post("/project/validate-file-change", async (req, res) => {
     await fs.writeFile(file, updatedContent, "utf8");
 
     const commands: Awaited<ReturnType<typeof runProjectCommand>>[] = [];
-    const packageJson = path.join(allowedRoot, "package.json");
-    const hasPackageJson = await fileExists(packageJson);
-    const npxCommand = process.platform === "win32" ? "npx.cmd" : "npx";
-
-    if (hasPackageJson) {
-      commands.push(await runProjectCommand(npxCommand, ["tsc", "--noEmit"]));
-
-      const relativeFile = path.relative(allowedRoot, file);
-      if (/\.(ts|tsx|js|jsx)$/i.test(file)) {
-        commands.push(await runProjectCommand(npxCommand, ["eslint", relativeFile]));
-      }
-    }
-
-    const dotnetTarget = await findDotnetTarget();
-    if (dotnetTarget && /\.(cs|csproj|config|json|xml)$/i.test(file)) {
-      commands.push(await runProjectCommand("dotnet", ["build", dotnetTarget, "--nologo"]));
-    }
+    const skipped: string[] = [];
+    await addLanguageValidationCommands(file, commands, skipped);
 
     if (fileExisted) {
       await fs.writeFile(file, oldContent, "utf8");
@@ -2623,7 +2811,7 @@ app.post("/project/validate-file-change", async (req, res) => {
       ok: failed.length === 0,
       file,
       restored,
-      skipped: !hasPackageJson,
+      skipped,
       commands,
       error: failed.length
         ? `Validation failed: ${failed.map((command) => command.command).join(", ")}`

@@ -81,6 +81,73 @@ function contextPreview(value: string) {
   return preview.length > 1200 ? `${preview.slice(0, 1200)}...` : preview;
 }
 
+function workingCopyForPrompt(prompt: string, hasProject: boolean) {
+  if (/apply|patch|change|update|fix/i.test(prompt)) {
+    return hasProject
+      ? {
+          message: "PayFix Agent is preparing the requested code change, checking the target files, and building a reviewable patch...",
+          steps: ["Understand change", "Read target files", "Prepare patch"],
+        }
+      : {
+          message: "PayFix Agent is reviewing the requested change against the attached evidence...",
+          steps: ["Read request", "Check evidence", "Prepare answer"],
+        };
+  }
+
+  if (/validate|lint|type|build|compile|test|check|error|warning/i.test(prompt)) {
+    return {
+      message: "PayFix Agent is running validation-focused investigation and collecting warnings, errors, and next steps...",
+      steps: ["Choose checks", "Read diagnostics", "Report result"],
+    };
+  }
+
+  if (/audit|deeper|inspect|why|wrong|bug|risk/i.test(prompt)) {
+    return {
+      message: "PayFix Agent is auditing behavior, reading relevant files, and separating proven issues from guesses...",
+      steps: ["Map workflow", "Read evidence", "List proven issues"],
+    };
+  }
+
+  if (/install|dependency|package/i.test(prompt)) {
+    return {
+      message: "PayFix Agent is checking dependency usage, package files, and validation requirements...",
+      steps: ["Check imports", "Review package", "Validate need"],
+    };
+  }
+
+  return hasProject
+    ? {
+        message: "PayFix Agent is investigating: indexing the project, selecting files, reading evidence, and preparing a reviewable result...",
+        steps: ["Map context", "Read evidence", "Prepare review"],
+      }
+    : {
+        message: "PayFix Agent is investigating evidence: reading uploads, logs, screenshots, and pasted context...",
+        steps: ["Read evidence", "Correlate signals", "Prepare review"],
+      };
+}
+
+function workingCopyForMessage(content: string) {
+  const normalized = content.replace(/^PayFix Agent is\s+/i, "");
+
+  if (/applying|patch|change|update|fix/i.test(normalized)) {
+    return ["Understand change", "Read target files", "Prepare patch"];
+  }
+
+  if (/validation|diagnostic|warning|error|lint|type|build|compile|test|check/i.test(normalized)) {
+    return ["Choose checks", "Run diagnostics", "Report result"];
+  }
+
+  if (/audit|behavior|wrong|bug|risk/i.test(normalized)) {
+    return ["Map workflow", "Inspect behavior", "List proven issues"];
+  }
+
+  if (/dependency|install|package/i.test(normalized)) {
+    return ["Check imports", "Review package", "Validate need"];
+  }
+
+  return ["Map context", "Read evidence", "Prepare review"];
+}
+
 export default function AgentSessionModal({
   messages,
   loading,
@@ -94,6 +161,7 @@ export default function AgentSessionModal({
 }: AgentSessionModalProps) {
   const [draft, setDraft] = useState("");
   const [expandedContexts, setExpandedContexts] = useState<Set<string>>(new Set());
+  const [pendingActionPrompt, setPendingActionPrompt] = useState("");
   const hasProject = Boolean(connectedProjectPath);
   const modeLabel = hasProject ? "Engineering mode" : "Evidence-only mode";
   const title = hasProject ? "Project Investigation" : "Evidence Investigation";
@@ -102,6 +170,7 @@ export default function AgentSessionModal({
     const prompt = draft.trim();
     if (!prompt || loading) return;
     setDraft("");
+    setPendingActionPrompt(prompt);
     onSend(prompt);
   }
 
@@ -179,16 +248,16 @@ export default function AgentSessionModal({
                     </span>
                   )}
                 </div>
-                {message.role === "assistant" && /^(Agent is running|PayFix Agent is investigating)/i.test(message.content) ? (
+                {message.role === "assistant" && /^(Agent is running|PayFix Agent is|PayFix Agent)/i.test(message.content) && loading && index === messages.length - 1 ? (
                   <div className="rounded-2xl bg-slate-950 p-4 text-slate-100">
                     <div className="flex items-center gap-3 text-sm font-black">
                       <Loader2 size={16} className="animate-spin text-blue-300" />
                       {message.content}
                     </div>
                     <div className="mt-3 grid grid-cols-1 gap-2 text-xs text-slate-300 sm:grid-cols-3">
-                      <span className="rounded-xl bg-white/5 px-3 py-2">Map context</span>
-                      <span className="rounded-xl bg-white/5 px-3 py-2">Read evidence</span>
-                      <span className="rounded-xl bg-white/5 px-3 py-2">Prepare review</span>
+                      {workingCopyForMessage(message.content).map((step) => (
+                        <span key={step} className="rounded-xl bg-white/5 px-3 py-2">{step}</span>
+                      ))}
                     </div>
                   </div>
                 ) : (
@@ -264,18 +333,31 @@ export default function AgentSessionModal({
                   <div className="mt-4 rounded-2xl border border-blue-100 bg-blue-50 p-3">
                     <div className="mb-2 text-xs font-black uppercase tracking-wide text-blue-700">Next actions</div>
                     <div className="flex flex-wrap gap-2">
-                      {agentActionPrompts(message.content).map((action) => (
+                      {agentActionPrompts(message.content).map((action) => {
+                        const isPendingAction = loading && pendingActionPrompt === action.prompt;
+
+                        return (
                         <button
                           key={action.prompt}
-                          onClick={() => onSend(action.prompt)}
+                          onClick={() => {
+                            setPendingActionPrompt(action.prompt);
+                            onSend(action.prompt);
+                          }}
                           disabled={loading}
-                          className="rounded-xl bg-white px-3 py-2 text-left text-xs font-black text-blue-700 shadow-sm ring-1 ring-blue-100 transition hover:bg-blue-600 hover:text-white disabled:cursor-not-allowed disabled:opacity-60"
+                          className="inline-flex items-center gap-2 rounded-xl bg-white px-3 py-2 text-left text-xs font-black text-blue-700 shadow-sm ring-1 ring-blue-100 transition hover:bg-blue-600 hover:text-white disabled:cursor-not-allowed disabled:opacity-60"
                           title={`Continue investigation: ${action.prompt}`}
                         >
+                          {isPendingAction && <Loader2 size={13} className="animate-spin" />}
                           {action.label}
                         </button>
-                      ))}
+                        );
+                      })}
                     </div>
+                    {loading && pendingActionPrompt && (
+                      <div className="mt-3 rounded-xl bg-white/70 px-3 py-2 text-xs font-bold leading-5 text-blue-950">
+                        {workingCopyForPrompt(pendingActionPrompt, hasProject).message}
+                      </div>
+                    )}
                   </div>
                 )}
               </article>
