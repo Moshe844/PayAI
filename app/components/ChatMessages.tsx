@@ -1,5 +1,5 @@
 
-import { memo, useState, type CSSProperties, type RefObject } from "react";
+import { memo, useEffect, useRef, useState, type CSSProperties, type RefObject } from "react";
 
 import {
   ChevronDown,
@@ -13,6 +13,7 @@ import {
   Minimize2,
   Pencil,
   Play,
+  RotateCcw,
   Sparkles,
   X,
 } from "lucide-react";
@@ -34,6 +35,7 @@ import remarkGfm from "remark-gfm";
 import { extractFirstUrl } from "../lib/payfixHelpers";
 
 import type {
+  GeneratedFile,
   ChatMessage,
   UploadedFile,
 } from "../lib/payfixTypes";
@@ -42,7 +44,7 @@ type FileReference = {
   key: string;
   label: string;
   file: string;
-  line: string;
+  line?: string;
 };
 
 type ChatMessagesProps = {
@@ -74,6 +76,13 @@ type ChatMessagesProps = {
 
   code: string;
 
+  rollbackTarget?: {
+    file: string;
+    relative: string;
+  } | null;
+
+  rollbackLoading?: boolean;
+
   chatEndRef: RefObject<HTMLDivElement | null>;
 
   onOpenCodeLog: (
@@ -99,8 +108,20 @@ type ChatMessagesProps = {
   ) => void;
 
   onOpenAgentSession: (
-    messages: ChatMessage[]
+    messages: ChatMessage[],
+    summary?: ChatMessage
   ) => void;
+
+  onStartAgentPrompt?: (
+    prompt: string
+  ) => void;
+
+  onCreateCodeFromGeneratedFile?: (
+    file: GeneratedFile,
+    sourceMessage: string
+  ) => void;
+
+  onRollbackLastApply?: () => void;
 };
 
 function extractFileReferences(content: string) {
@@ -111,12 +132,14 @@ function extractFileReferences(content: string) {
   for (const match of content.matchAll(pattern)) {
     const file = match[1];
     const line = match[2];
-    const key = `${file}:${line}`;
+    const uploadedMatch = file.match(/^uploaded-file[-_](.+)$/i);
+    const key = uploadedMatch ? file.toLowerCase() : `${file}:${line}`;
+    const labelName = uploadedMatch?.[1] || file.split(/[\\/]/).pop() || file;
     references.set(key, {
       key,
-      label: `${file.split(/[\\/]/).pop()}:${line}`,
+      label: uploadedMatch ? labelName : `${labelName}:${line}`,
       file,
-      line,
+      line: uploadedMatch ? undefined : line,
     });
   }
 
@@ -183,6 +206,188 @@ function previewMessage(content: string) {
   return `${previewText}\n\n...`;
 }
 
+function normalizeOrderedStepMarkers(content: string) {
+  const lines = content.split(/\r?\n/);
+  let inFence = false;
+  let step = 0;
+  let changed = false;
+
+  const normalized = lines.map((line) => {
+    if (/^\s*```/.test(line)) {
+      inFence = !inFence;
+      return line;
+    }
+
+    if (inFence) return line;
+
+    const match = line.match(/^(\s{0,3})(\d+)\.\s+(.+)$/);
+    if (!match) return line;
+
+    step += 1;
+    if (Number(match[2]) !== step) changed = true;
+    return `${match[1]}${step}. ${match[3]}`;
+  });
+
+  return changed ? normalized.join("\n") : content;
+}
+
+function isGeneratedImageFile(file: GeneratedFile) {
+  return Boolean(file.content?.trim()) && (file.type.startsWith("image/") || /^data:image\//i.test(file.content) || /\.svg$/i.test(file.name));
+}
+
+function hasRenderableImageContent(file: { content?: string; isImage?: boolean; type?: string; name?: string }) {
+  const content = file.content?.trim() || "";
+  if (!content) return false;
+  return Boolean(file.isImage || file.type?.startsWith("image/") || /^data:image\//i.test(content) || /\.svg$/i.test(file.name || ""));
+}
+
+function generatedFilesFromSvgCode(content: string): GeneratedFile[] {
+  const explicitName = content.match(/Filename:\s*([^\s`"'<>]+\.svg)/i)?.[1] || "generated-logo.svg";
+  const files: GeneratedFile[] = [];
+
+  for (const match of content.matchAll(/```(?:svg|xml)?\s*(<svg[\s\S]*?<\/svg>)\s*```/gi)) {
+    const svg = match[1].trim();
+    files.push({
+      name: files.length ? explicitName.replace(/\.svg$/i, `-${files.length + 1}.svg`) : explicitName,
+      type: "image/svg+xml",
+      size: new Blob([svg]).size,
+      content: `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`,
+    });
+  }
+
+  if (!files.length) {
+    const inline = content.match(/(<svg[\s\S]*?<\/svg>)/i)?.[1]?.trim();
+    if (inline) {
+      files.push({
+        name: explicitName,
+        type: "image/svg+xml",
+        size: new Blob([inline]).size,
+        content: `data:image/svg+xml;charset=utf-8,${encodeURIComponent(inline)}`,
+      });
+    }
+  }
+
+  return files.slice(0, 4);
+}
+
+function stripVisibleSvgSource(content: string) {
+  return content
+    .replace(/```(?:svg|xml)?\s*<svg[\s\S]*?<\/svg>\s*```/gi, "\n\nSVG source hidden. Use the preview/download card below.\n\n")
+    .replace(/<svg[\s\S]*?<\/svg>/gi, "\n\nSVG source hidden. Use the preview/download card below.\n\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function isNoiseUrl(href?: string) {
+  const clean = (href || "").trim().replace(/["')>]+$/g, "");
+  return !clean || /^https?:\/\/www\.w3\.org\/2000\/svg$/i.test(clean);
+}
+
+function messageActionPrompts(content: string) {
+  const actions: Array<{ label: string; prompt: string }> = [];
+  const hasBuiltPaxAndroidApp = /PAX ANDROID APP BUILT|PayFix created\/updated the connected Android project/i.test(content);
+  const hasValidationFailure =
+    /Sandbox checks found failures|SANDBOX CHECKS[\s\S]*\bFAIL\b|PROJECT VALIDATION[\s\S]*\bFAIL\b|VALIDATION[\s\S]*\bFAIL\b|Build failed with an exception|Plugin \[id:/i.test(
+      content,
+    );
+
+  if (
+    !hasBuiltPaxAndroidApp &&
+    /Here is the exact path I would take|Android Studio|app\/src\/main|AndroidManifest|build\.gradle|Official downloads\/docs|PAX|BroadPOS|PosLink|CardPointe/i.test(
+      content,
+    ) &&
+    /\b(build|implementation|POS|Android|MainActivity|token|SDK|project)\b/i.test(content)
+  ) {
+    actions.push({
+      label: "Build full app with Agent",
+      prompt:
+        "Create the full runnable project from the previous build guide. If no project is connected, ask me for the target parent path, folder name, app stack/language, and any vendor SDK files or portal downloads I have access to. Then create the folder/files, add the required dependencies/placeholders, wire the Android app structure, include README setup steps, and run validation/build checks where possible.",
+    });
+    actions.push({
+      label: "Prepare project checklist",
+      prompt:
+        "Turn the previous build guide into an Agent-ready implementation checklist: exact files to create, dependencies to install, vendor SDK artifacts needed, secrets/config values needed, and validation commands.",
+    });
+  }
+
+  if (hasBuiltPaxAndroidApp) {
+    if (hasValidationFailure) {
+      actions.push({
+        label: "Fix build failure",
+        prompt:
+          "Continue this saved Agent investigation and fix the current build failure. Use the latest Gradle/IDE validation output, inspect the exact affected files, prepare a safe patch, and rerun validation.",
+      });
+    }
+    actions.push({
+      label: "Exact next steps",
+      prompt:
+        "Continue this saved Agent investigation and tell me exactly what to do next in my IDE. Include exact menu clicks, files to open, commands to run, expected result, and what error to send back if it fails.",
+    });
+    actions.push({
+      label: "Check for more errors",
+      prompt:
+        "Continue this saved Agent investigation, run project validation, check for remaining build/dependency/source errors, and prepare the next safe patch if one is proven.",
+    });
+    return actions;
+  }
+
+  if (hasValidationFailure) {
+    const failedCommand =
+      content.match(/FAIL\s+([^\n]+)/i)?.[1]?.trim() ||
+      content.match(/failures(?: in)? ([^:\n]+)/i)?.[1]?.trim() ||
+      "the failing validation command";
+
+    actions.push({
+      label: /build/i.test(failedCommand) ? "Fix build failure" : "Fix validation failure",
+      prompt: `Investigate and fix ${failedCommand}. Use the failure output from the previous message, inspect exact files, prepare a safe patch if needed, and run validation again.`,
+    });
+    actions.push({
+      label: "Explain failure",
+      prompt: `Explain why ${failedCommand} failed, whether it is related to the latest change, and what exact files need attention.`,
+    });
+  }
+
+  if (/Dependency installed/i.test(content)) {
+    actions.push({
+      label: "Run validation",
+      prompt:
+        "Run the right validation checks after the dependency install. If anything fails, summarize the exact failure and prepare a fix.",
+    });
+  }
+
+  if (/Missing package|Missing packages|Cannot find module|ModuleNotFoundError|unresolved crate|no required module provides package/i.test(content)) {
+    actions.push({
+      label: "Fix dependencies",
+      prompt:
+        "Inspect project imports and package metadata, detect all missing dependencies for this project, offer the safe install action, then run validation.",
+    });
+  }
+
+  if (/Dependency install failed/i.test(content)) {
+    actions.push({
+      label: "Fix install failure",
+      prompt:
+        "Investigate the dependency install failure, inspect package metadata and imports, then propose the correct install or project metadata fix.",
+    });
+  }
+
+  if (/Local agent is not reachable|running payfix-agent may be old|missing this endpoint|Connection error/i.test(content)) {
+    actions.push({
+      label: "Diagnose local agent",
+      prompt:
+        "Diagnose why the local PayFix agent is unreachable or outdated. Check the expected endpoints, connected project, and exact restart steps.",
+    });
+  }
+
+  const seen = new Set<string>();
+  return actions.filter((action) => {
+    const key = action.prompt.toLowerCase();
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  }).slice(0, 3);
+}
+
 function compactContextPreview(value: string) {
   const trimmed = value.trim();
   if (!trimmed) return "";
@@ -212,6 +417,8 @@ function ChatMessages({
   uploadedFiles,
   log,
   code,
+  rollbackTarget,
+  rollbackLoading = false,
   chatEndRef,
   onOpenCodeLog,
   onEditMessage,
@@ -219,6 +426,9 @@ function ChatMessages({
   onOpenProjectPreview,
   onOpenFileReference,
   onOpenAgentSession,
+  onStartAgentPrompt,
+  onCreateCodeFromGeneratedFile,
+  onRollbackLastApply,
 }: ChatMessagesProps) {
   const [previewImage, setPreviewImage] = useState<UploadedFile | null>(null);
   const [previewFile, setPreviewFile] = useState<UploadedFile | null>(null);
@@ -226,8 +436,25 @@ function ChatMessages({
   const [expandedContexts, setExpandedContexts] = useState<Set<string>>(new Set());
   const [expandedCodeBlocks, setExpandedCodeBlocks] = useState<Set<string>>(new Set());
   const [showAllMessages, setShowAllMessages] = useState(false);
+  const [showJumpToBottom, setShowJumpToBottom] = useState(false);
+  const scrollContainerRef = useRef<HTMLDivElement | null>(null);
   const hiddenMessageCount = showAllMessages ? 0 : Math.max(0, messages.length - 12);
   const visibleMessages = hiddenMessageCount ? messages.slice(hiddenMessageCount) : messages;
+
+  function updateJumpToBottomVisibility() {
+    const container = scrollContainerRef.current;
+    if (!container) return;
+    const distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
+    setShowJumpToBottom(container.scrollTop > 120 && distanceFromBottom > 80);
+  }
+
+  function jumpToBottom() {
+    chatEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+  }
+
+  useEffect(() => {
+    updateJumpToBottomVisibility();
+  }, [messages.length, showAllMessages]);
 
   function openUploadedFile(file: UploadedFile) {
     if (file.isImage) {
@@ -240,20 +467,24 @@ function ChatMessages({
 
   return (
     <>
-      <div className="allow-scroll min-h-0 flex-1 bg-[linear-gradient(180deg,#edf4fb_0%,#e7eef6_100%)] px-5 py-2.5">
-        <div className="mx-auto max-w-[1200px] space-y-2">
+      <div
+        ref={scrollContainerRef}
+        onScroll={updateJumpToBottomVisibility}
+        className="allow-scroll relative min-h-0 flex-1 px-5 py-3"
+      >
+        <div className="mx-auto max-w-[1200px] space-y-3">
           {messages.length === 0 && (
-            <div className="rounded-2xl border border-dashed border-blue-200 bg-white/80 p-8 text-center text-slate-500 shadow-sm">
-              <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-2xl bg-blue-50 text-blue-600">
+            <div className="rounded-[var(--pf-radius)] border border-dashed border-[var(--pf-border)] bg-white/[0.02] p-10 text-center">
+              <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-xl bg-sky-500/10 text-sky-400">
                 <FileText size={22} />
               </div>
 
-              <div className="text-base font-semibold text-slate-800">
+              <div className="text-base font-semibold text-[var(--pf-text)]">
                 Ready for context
               </div>
 
-              <div className="mt-1 text-sm">
-                Attach files/search results or ask a question to begin.
+              <div className="mt-1 text-sm text-[var(--pf-text-muted)]">
+                Attach files, connect a project, or ask a question to begin.
               </div>
             </div>
           )}
@@ -262,7 +493,7 @@ function ChatMessages({
             <button
               type="button"
               onClick={() => setShowAllMessages(true)}
-              className="mx-auto flex items-center gap-2 rounded-full border border-slate-300 bg-white px-4 py-2 text-xs font-bold text-slate-700 shadow-sm transition hover:border-blue-300 hover:bg-blue-50 hover:text-blue-700"
+              className="mx-auto flex items-center gap-2 rounded-full border border-[var(--pf-border)] bg-white/[0.04] px-4 py-2 text-xs font-semibold text-[var(--pf-text-muted)] transition hover:border-sky-500/30 hover:bg-sky-500/10 hover:text-sky-300"
             >
               <ChevronDown size={14} />
               Show {hiddenMessageCount} older message(s)
@@ -274,47 +505,72 @@ function ChatMessages({
             const agentStats = message.role === "assistant" ? extractAgentRunStats(message.content) : null;
             const activityMessage = message.role === "assistant" && isActivityMessage(message.content);
             const tone = message.role === "assistant" ? responseTone(message.content) : "neutral";
-            const longMessage = !activityMessage && isLongMessage(message.content);
+            const generatedDisplayFiles =
+              message.role === "assistant"
+                ? [...(message.generatedFiles || []), ...generatedFilesFromSvgCode(message.content)]
+                : message.generatedFiles || [];
+            const visibleMessageContent =
+              message.role === "assistant" && generatedDisplayFiles.length
+                ? stripVisibleSvgSource(message.content)
+                : message.content;
+            const longMessage = !activityMessage && isLongMessage(visibleMessageContent);
             const isExpanded = expandedMessages.has(messageIndex);
-            const renderedContent = longMessage && !isExpanded ? previewMessage(message.content) : message.content;
+            const renderedContent = longMessage && !isExpanded ? previewMessage(visibleMessageContent) : visibleMessageContent;
+            const markdownContent = message.role === "assistant" ? normalizeOrderedStepMarkers(renderedContent) : renderedContent;
+            const firstSafeUrl = (() => {
+              const url = extractFirstUrl(message.content);
+              if (!url || isNoiseUrl(url) || generatedDisplayFiles.length) return "";
+              return url;
+            })();
             const canApplyCodeBlocks =
               message.role === "assistant" &&
               !message.isAgentSessionSummary &&
               !message.patchAlreadyApplied &&
               !/PATCH ALREADY APPLIED/i.test(message.content);
+            const canRollbackFromMessage =
+              message.role === "assistant" &&
+              Boolean(rollbackTarget && onRollbackLastApply) &&
+              /PATCH APPLIED|PATCH VALIDATION/i.test(message.content) &&
+              !/PATCH ROLLED BACK/i.test(message.content);
             const markdownComponents: Components = {
               p: ({ children }) => (
-                <div className="mb-2.5 last:mb-0">
+                <p className="my-2 first:mt-0 last:mb-0">
                   {children}
-                </div>
+                </p>
               ),
 
               h1: ({ children }) => (
-                <div className="mb-3 mt-4 border-b border-slate-200 pb-2 text-lg font-black tracking-tight text-slate-950 first:mt-0">
+                <div className="mb-3 mt-4 border-b border-[var(--pf-border)] pb-2 text-lg font-black tracking-tight text-[var(--pf-text)] first:mt-0">
                   {children}
                 </div>
               ),
 
               h2: ({ children }) => (
-                <div className="mb-2 mt-4 rounded-xl bg-slate-100 px-3 py-2 text-sm font-black uppercase tracking-wide text-slate-800 first:mt-0">
+                <div className="mb-2 mt-4 rounded-[var(--pf-radius-sm)] bg-white/[0.04] px-3 py-2 text-sm font-black uppercase tracking-wide text-[var(--pf-text)] first:mt-0">
                   {children}
                 </div>
               ),
 
               h3: ({ children }) => (
-                <div className="mb-2 mt-3 text-sm font-black uppercase tracking-wide text-slate-700 first:mt-0">
+                <div className="mb-2 mt-3 text-sm font-black uppercase tracking-wide text-[var(--pf-text-muted)] first:mt-0">
                   {children}
                 </div>
               ),
 
               hr: () => (
-                <div className="my-4 border-t border-slate-200" />
+                <div className="my-4 border-t border-[var(--pf-border)]" />
               ),
 
               ul: ({ children }) => (
-                <ul className="my-2 space-y-1.5 rounded-xl bg-slate-50/80 px-5 py-3">
+                <ul className="my-3 space-y-2 rounded-[var(--pf-radius-sm)] bg-black/20 px-5 py-3 text-[15px] leading-7">
                   {children}
                 </ul>
+              ),
+
+              ol: ({ children, start }) => (
+                <ol start={start} className="pf-step-list my-4">
+                  {children}
+                </ol>
               ),
 
               li: ({ children }) => (
@@ -327,16 +583,19 @@ function ChatMessages({
                 <>{children}</>
               ),
 
-              a: ({ href, children }) => (
-                <a
-                  href={href}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="font-semibold text-blue-600 underline"
-                >
-                  {children}
-                </a>
-              ),
+              a: ({ href, children }) =>
+                isNoiseUrl(href) ? (
+                  <span>{children}</span>
+                ) : (
+                  <a
+                    href={href}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="font-semibold text-sky-400 underline decoration-sky-500/40 underline-offset-2 hover:text-sky-300"
+                  >
+                    {children}
+                  </a>
+                ),
 
               code({
                 className,
@@ -357,21 +616,35 @@ function ChatMessages({
                 );
 
               const copyKey = `${messageIndex}-${language}-${codeString.length}`;
+              const isCodeBlock = Boolean(className) || codeString.includes("\n");
 
               // MULTILINE CODE BLOCK
-              if (className) {
+              if (isCodeBlock) {
+                const isSvgSource = /<svg[\s\S]*<\/svg>/i.test(codeString);
+                if (isSvgSource) {
+                  return (
+                    <details className="mt-3 rounded-2xl border border-slate-200 bg-slate-50 p-3">
+                      <summary className="cursor-pointer text-xs font-black uppercase tracking-wide text-slate-600">
+                        Show SVG source
+                      </summary>
+                      <pre className="mt-3 max-h-80 overflow-auto whitespace-pre-wrap break-words rounded-xl bg-slate-950 p-3 text-xs leading-5 text-emerald-100">
+                        {codeString}
+                      </pre>
+                    </details>
+                  );
+                }
                 const codeIsLarge = codeString.length > 12000 || codeString.split(/\r?\n/).length > 240;
                 const codeBlockKey = `${messageIndex}-${language}-${codeString.length}`;
                 const codeExpanded = expandedCodeBlocks.has(codeBlockKey);
 
                 return (
-                  <div className="group relative overflow-hidden rounded-2xl border border-[#3c3c3c] bg-[#1e1e1e] shadow-lg shadow-slate-950/15">
-                    <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[#3c3c3c] bg-[#252526] px-4 py-2.5">
+                  <div className="group relative my-4 overflow-hidden rounded-2xl border border-[var(--pf-code-border)] bg-[var(--pf-code-bg)] shadow-lg shadow-black/20">
+                    <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[var(--pf-code-border)] bg-white/[0.035] px-4 py-2.5">
                       <div>
-                        <div className="text-xs font-black uppercase tracking-wide text-[#9cdcfe]">
+                        <div className="text-xs font-black uppercase tracking-wide text-sky-300">
                           {language}
                         </div>
-                        <div className="mt-0.5 text-[11px] font-semibold text-slate-400">
+                        <div className="mt-0.5 text-[11px] font-semibold text-[var(--pf-text-faint)]">
                           {codeString.split(/\r?\n/).length} lines
                         </div>
                       </div>
@@ -393,7 +666,7 @@ function ChatMessages({
                               );
                             }, 2000);
                           }}
-                          className="flex h-8 items-center gap-2 rounded-lg border border-slate-600 bg-slate-800 px-3 text-xs font-bold text-white transition hover:bg-slate-700"
+                          className="flex h-8 items-center gap-2 rounded-lg border border-[var(--pf-border)] bg-white/[0.055] px-3 text-xs font-bold text-[var(--pf-text)] transition hover:bg-white/[0.1]"
                         >
                           {copiedKey ===
                           copyKey ? (
@@ -450,7 +723,7 @@ function ChatMessages({
                               return next;
                             });
                           }}
-                          className="flex h-8 items-center gap-2 rounded-lg border border-slate-600 bg-[#1e1e1e] px-3 text-xs font-bold text-slate-100 transition hover:bg-slate-800"
+                          className="flex h-8 items-center gap-2 rounded-lg border border-[var(--pf-border)] bg-white/[0.035] px-3 text-xs font-bold text-[var(--pf-text)] transition hover:bg-white/[0.08]"
                         >
                           {codeExpanded ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
                           {codeExpanded ? "Collapse" : "Expand"}
@@ -460,7 +733,7 @@ function ChatMessages({
 
                     {codeIsLarge ? (
                       <pre
-                        className={`overflow-auto whitespace-pre-wrap break-words bg-[#1e1e1e] p-5 font-mono text-[14px] leading-6 text-[#d4d4d4] ${
+                        className={`overflow-auto whitespace-pre-wrap break-words bg-[var(--pf-code-bg)] p-5 font-mono text-[14px] leading-7 text-[#e8eef8] ${
                           codeExpanded ? "max-h-[78vh]" : "max-h-[520px]"
                         }`}
                       >
@@ -485,9 +758,9 @@ function ChatMessages({
                           margin: 0,
                           borderRadius: 0,
                           padding: "20px",
-                          background: "#1e1e1e",
+                          background: "var(--pf-code-bg)",
                           fontSize: "14px",
-                          lineHeight: 1.65,
+                          lineHeight: 1.75,
                           maxHeight: codeExpanded ? "78vh" : "520px",
                           overflow: "auto",
                         }}
@@ -507,7 +780,7 @@ function ChatMessages({
 
               // INLINE CODE
               return (
-                <code className="rounded bg-slate-100 px-1.5 py-0.5 text-[0.9em] text-pink-600">
+                <code className="rounded-md bg-white/10 px-1.5 py-0.5 font-mono text-[0.9em] font-semibold text-sky-200">
                   {children}
                 </code>
               );
@@ -517,30 +790,29 @@ function ChatMessages({
           return (
             <div
               key={messageIndex}
-              className={`rounded-2xl p-3.5 leading-6 shadow-sm ring-1 transition ${
-                message.role ===
-                "user"
-                  ? "bg-blue-50/95 text-blue-950 shadow-blue-100/60 ring-blue-200"
+              className={`rounded-[var(--pf-radius)] border leading-6 transition ${
+                message.role === "user"
+                  ? "ml-auto max-w-[920px] border-sky-500/20 bg-sky-500/[0.07] p-4 text-[var(--pf-text)]"
                   : tone === "success"
-                  ? "bg-white/95 text-slate-900 ring-emerald-200"
+                  ? "mx-auto max-w-[980px] border-emerald-500/25 bg-emerald-500/[0.045] p-5 text-[var(--pf-text)]"
                   : tone === "warning"
-                  ? "bg-white/95 text-slate-900 ring-amber-200"
-                  : "bg-white/95 text-slate-900 ring-slate-200"
+                  ? "mx-auto max-w-[980px] border-amber-500/25 bg-amber-500/[0.045] p-5 text-[var(--pf-text)]"
+                  : "mx-auto max-w-[980px] border-[var(--pf-border)] bg-white/[0.025] p-5 text-[var(--pf-text)]"
               }`}
             >
               {/* HEADER */}
-              <div className="mb-2 flex items-center justify-between gap-3 text-xs font-bold uppercase tracking-wide text-slate-500">
+              <div className="mb-4 flex items-center justify-between gap-3 text-xs font-bold uppercase tracking-wide text-[var(--pf-text-faint)]">
                 <span className="inline-flex items-center gap-2">
                   {message.role === "assistant" && (
                     <span
                       className={`flex h-6 w-6 items-center justify-center rounded-full ${
                         activityMessage
-                          ? "bg-blue-50 text-blue-600"
+                          ? "bg-sky-500/15 text-sky-400"
                           : tone === "success"
-                          ? "bg-emerald-50 text-emerald-600"
+                          ? "bg-emerald-500/15 text-emerald-400"
                           : tone === "warning"
-                          ? "bg-amber-50 text-amber-700"
-                          : "bg-slate-100 text-slate-600"
+                          ? "bg-amber-500/15 text-amber-400"
+                          : "bg-white/5 text-[var(--pf-text-muted)]"
                       }`}
                     >
                       {activityMessage ? <Loader2 size={14} className="animate-spin" /> : <Sparkles size={14} />}
@@ -556,7 +828,7 @@ function ChatMessages({
                   <button
                     type="button"
                     onClick={() => onEditMessage(messageIndex)}
-                    className="inline-flex h-8 items-center gap-1.5 rounded-full border border-blue-200 bg-white px-2.5 text-xs font-semibold normal-case tracking-normal text-blue-700 transition hover:bg-blue-50"
+                    className="pf-btn-ghost h-8 rounded-full px-2.5 text-xs normal-case tracking-normal text-sky-300"
                   >
                     <Pencil size={13} />
                     Edit
@@ -569,7 +841,7 @@ function ChatMessages({
                       setCopiedKey(`${messageIndex}-response`);
                       setTimeout(() => setCopiedKey(null), 2000);
                     }}
-                    className="inline-flex h-8 items-center gap-1.5 rounded-full border border-slate-300 bg-white px-2.5 text-xs font-semibold normal-case tracking-normal text-slate-700 transition hover:bg-slate-50"
+                    className="pf-btn-ghost h-8 rounded-full px-2.5 text-xs normal-case tracking-normal"
                     title="Copy full AI response"
                   >
                     {copiedKey === `${messageIndex}-response` ? <Check size={13} /> : <Copy size={13} />}
@@ -579,20 +851,20 @@ function ChatMessages({
               </div>
 
               {activityMessage && (
-                <div className="mb-3 rounded-2xl border border-blue-100 bg-blue-50/75 p-4">
-                  <div className="flex items-center gap-3 text-sm font-semibold text-blue-900">
+                <div className="mb-3 rounded-[var(--pf-radius-sm)] border border-sky-500/20 bg-sky-500/10 p-4">
+                  <div className="flex items-center gap-3 text-sm font-semibold text-sky-200">
                     <Loader2 size={17} className="animate-spin" />
                     {message.content}
                   </div>
-                  <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-blue-100">
-                    <div className="h-full w-1/2 animate-pulse rounded-full bg-blue-500" />
+                  <div className="mt-2 h-1 overflow-hidden rounded-full bg-sky-500/15">
+                    <div className="h-full w-1/2 animate-pulse rounded-full bg-sky-400" />
                   </div>
                 </div>
               )}
 
               {agentStats && !activityMessage && (
-                <div className="mb-3 flex flex-wrap gap-1.5 rounded-2xl bg-slate-50/90 p-2 ring-1 ring-slate-200">
-                  <span className="rounded-full bg-white px-2.5 py-1 text-[11px] font-black uppercase tracking-wide text-slate-700 shadow-sm ring-1 ring-slate-100">
+                <div className="mb-3 flex flex-wrap gap-1.5 rounded-[var(--pf-radius-sm)] border border-[var(--pf-border)] bg-black/20 p-2">
+                  <span className="rounded-full border border-[var(--pf-border)] bg-white/[0.04] px-2.5 py-1 text-[11px] font-black uppercase tracking-wide text-[var(--pf-text-muted)]">
                     {agentStats.mode}
                   </span>
                   <span className="rounded-full bg-blue-50 px-2.5 py-1 text-[11px] font-bold text-blue-700 ring-1 ring-blue-100">
@@ -645,11 +917,11 @@ function ChatMessages({
               )}
 
               {/* CONTENT */}
-              <div className="prose prose-slate max-w-none text-[14px] leading-6 prose-pre:p-0 prose-table:text-sm">
+              <div className="pf-chat-prose prose prose-slate max-w-none text-[15.5px] leading-[1.62] prose-pre:p-0 prose-table:text-sm">
                 <div
                   className={`relative ${
                     longMessage && !isExpanded
-                      ? "max-h-[420px] overflow-hidden after:pointer-events-none after:absolute after:inset-x-0 after:bottom-0 after:h-24 after:bg-gradient-to-t after:from-white after:to-transparent"
+                      ? "max-h-[420px] overflow-hidden after:pointer-events-none after:absolute after:inset-x-0 after:bottom-0 after:h-24 after:bg-gradient-to-t after:from-[var(--pf-bg)] after:to-transparent"
                       : ""
                   }`}
                 >
@@ -662,13 +934,13 @@ function ChatMessages({
                         markdownComponents
                       }
                     >
-                      {renderedContent}
+                      {markdownContent}
                     </ReactMarkdown>
                   )}
 
                 {message.role === "assistant" &&
                 extractFileReferences(renderedContent).length ? (
-                  <div className="mt-4 flex flex-wrap gap-2 border-t border-slate-200 pt-3">
+                  <div className="mt-4 flex flex-wrap gap-2 border-t border-[var(--pf-border)] pt-3">
                     {extractFileReferences(renderedContent).map((reference) => (
                       <button
                         key={reference.key}
@@ -676,11 +948,15 @@ function ChatMessages({
                         onClick={() =>
                           onOpenFileReference({
                             file: reference.file,
-                            line: Number(reference.line),
+                            line: Number(reference.line || 1),
                           })
                         }
-                        className="inline-flex items-center gap-2 rounded-full border border-slate-300 bg-slate-50 px-3 py-1.5 text-xs font-bold text-slate-700 no-underline transition hover:border-blue-300 hover:bg-blue-50 hover:text-blue-700"
-                        title={`Open project preview near ${reference.file}:${reference.line}`}
+                        className="inline-flex items-center gap-2 rounded-full border border-[var(--pf-border)] bg-white/[0.045] px-3 py-1.5 text-xs font-bold text-[var(--pf-text-muted)] no-underline transition hover:border-sky-400/40 hover:bg-sky-500/10 hover:text-sky-200"
+                        title={
+                          reference.line
+                            ? `Open project preview near ${reference.file}:${reference.line}`
+                            : `Open evidence source ${reference.file}`
+                        }
                       >
                         <FileText size={13} />
                         {reference.label}
@@ -689,22 +965,103 @@ function ChatMessages({
                   </div>
                 ) : null}
 
-                {message.generatedFiles?.length ? (
-                  <div className="mt-3 flex flex-wrap gap-1.5">
-                    {message.generatedFiles.map((file, fileIndex) => (
-                      <a
-                        key={`${file.name}-${fileIndex}`}
-                        href={file.content}
-                        download={file.name}
-                        className="inline-flex items-center gap-2 rounded-full border border-emerald-200 bg-emerald-50 px-3 py-1.5 text-xs font-semibold text-emerald-700 no-underline transition hover:bg-emerald-100"
+                {generatedDisplayFiles.length ? (
+                  <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2">
+                    {generatedDisplayFiles.map((file, fileIndex) =>
+                      isGeneratedImageFile(file) ? (
+                        <div
+                          key={`${file.name}-${fileIndex}`}
+                          className="overflow-hidden rounded-2xl border border-emerald-200 bg-white shadow-sm"
+                        >
+                          <div className="relative flex aspect-square items-center justify-center bg-[linear-gradient(45deg,#f8fafc_25%,transparent_25%),linear-gradient(-45deg,#f8fafc_25%,transparent_25%),linear-gradient(45deg,transparent_75%,#f8fafc_75%),linear-gradient(-45deg,transparent_75%,#f8fafc_75%)] bg-[length:20px_20px] bg-[position:0_0,0_10px,10px_-10px,-10px_0] p-4">
+                            {/* eslint-disable-next-line @next/next/no-img-element */}
+                            <img src={file.content} alt={file.name} className="max-h-full max-w-full object-contain" />
+                            <a
+                              href={file.content}
+                              download={file.name}
+                              className="absolute right-3 top-3 inline-flex h-10 w-10 items-center justify-center rounded-full bg-slate-950/85 text-white shadow-lg backdrop-blur transition hover:bg-blue-600"
+                              title={`Download ${file.name}`}
+                            >
+                              <Download size={17} />
+                            </a>
+                          </div>
+                          <div className="border-t border-emerald-100 px-3 py-2">
+                            <div className="flex items-center justify-between gap-3">
+                              <span className="truncate text-xs font-black text-emerald-900">{file.name}</span>
+                              <span className="shrink-0 rounded-full bg-emerald-50 px-2 py-0.5 text-[11px] font-bold text-emerald-800">
+                                {Math.max(1, Math.round(file.size / 1024))} KB
+                              </span>
+                            </div>
+                            {onCreateCodeFromGeneratedFile && /\b(ui|design|wireframe|mockup|prototype|diagram|sketch|blueprint|map)\b/i.test(file.name) ? (
+                              <button
+                                type="button"
+                                onClick={() => onCreateCodeFromGeneratedFile(file, message.content)}
+                                className="mt-2 inline-flex h-9 w-full items-center justify-center gap-2 rounded-xl bg-slate-950 px-3 text-xs font-black text-white shadow-sm transition hover:bg-blue-600"
+                                title="Open Agent workspace and turn this visual plan into a project"
+                              >
+                                <Sparkles size={14} />
+                                Create code script
+                              </button>
+                            ) : null}
+                          </div>
+                        </div>
+                      ) : (
+                        <a
+                          key={`${file.name}-${fileIndex}`}
+                          href={file.content}
+                          download={file.name}
+                          className="inline-flex items-center gap-2 rounded-full border border-emerald-200 bg-emerald-50 px-3 py-1.5 text-xs font-semibold text-emerald-700 no-underline transition hover:bg-emerald-100"
+                        >
+                          <Download size={14} />
+                          <span className="max-w-[220px] truncate">{file.name}</span>
+                          <span className="rounded-full bg-white/80 px-2 py-0.5 text-emerald-900">
+                            {Math.max(1, Math.round(file.size / 1024))} KB
+                          </span>
+                        </a>
+                      ),
+                    )}
+                  </div>
+                ) : null}
+
+                {message.role === "assistant" && !message.agentSessionMessages?.length && onStartAgentPrompt && messageActionPrompts(message.content).length ? (
+                  <div className="mt-4 rounded-2xl border border-blue-100 bg-blue-50 p-3">
+                    <div className="mb-2 text-xs font-black uppercase tracking-wide text-blue-700">Next actions</div>
+                    <div className="flex flex-wrap gap-2">
+                      {messageActionPrompts(message.content).map((action) => (
+                        <button
+                          key={action.prompt}
+                          type="button"
+                          onClick={() => onStartAgentPrompt(action.prompt)}
+                          className="inline-flex items-center gap-2 rounded-xl bg-white px-3 py-2 text-left text-xs font-black text-blue-700 shadow-sm ring-1 ring-blue-100 transition hover:bg-blue-600 hover:text-white"
+                          title={action.prompt}
+                        >
+                          <Sparkles size={13} />
+                          {action.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
+
+                {canRollbackFromMessage && rollbackTarget && onRollbackLastApply ? (
+                  <div className="mt-4 rounded-2xl border border-amber-200 bg-amber-50 p-4">
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div>
+                        <div className="text-sm font-black text-amber-950">Undo available</div>
+                        <div className="mt-1 break-all text-xs font-semibold text-amber-800">
+                          Latest snapshot: {rollbackTarget.relative || rollbackTarget.file}. Open options to choose one file or multiple snapshots.
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={onRollbackLastApply}
+                        disabled={rollbackLoading}
+                        className="inline-flex h-10 items-center gap-2 rounded-xl bg-amber-600 px-4 text-xs font-black text-white shadow-sm transition hover:bg-amber-500 disabled:cursor-not-allowed disabled:bg-slate-300"
                       >
-                        <Download size={14} />
-                        <span className="max-w-[220px] truncate">{file.name}</span>
-                        <span className="rounded-full bg-white/80 px-2 py-0.5 text-emerald-900">
-                          {Math.max(1, Math.round(file.size / 1024))} KB
-                        </span>
-                      </a>
-                    ))}
+                        {rollbackLoading ? <Loader2 size={15} className="animate-spin" /> : <RotateCcw size={15} />}
+                        {rollbackLoading ? "Loading..." : "Undo options"}
+                      </button>
+                    </div>
                   </div>
                 ) : null}
 
@@ -764,7 +1121,7 @@ function ChatMessages({
                           onClick={() => openUploadedFile(file)}
                           className="inline-flex h-7 items-center gap-1.5 rounded-full border border-blue-200 bg-white px-2 text-[11px] font-bold text-blue-700 transition hover:bg-blue-50"
                         >
-                          {file.isImage ? (
+                          {hasRenderableImageContent(file) ? (
                             <Image
                               src={file.content}
                               alt={file.name}
@@ -897,21 +1254,21 @@ function ChatMessages({
                   </>
                 )}
 
-                {message.role === "assistant" && message.isAgentSessionSummary && message.agentSessionMessages?.length ? (
+                {message.role === "assistant" && message.agentSessionMessages?.length ? (
                   <div className="mt-4 rounded-2xl border border-indigo-200 bg-indigo-50 p-4">
                     <div className="flex flex-wrap items-center justify-between gap-3">
                       <div>
                         <div className="flex items-center gap-2 text-sm font-black text-indigo-950">
                           <Sparkles size={16} className="text-indigo-600" />
-                          PayFix investigation saved
+                          {message.isAgentSessionSummary ? "PayFix investigation saved" : "Agent workspace saved"}
                         </div>
                         <div className="mt-1 text-xs font-semibold text-indigo-700">
-                          {message.agentSessionMessages.length} investigation message(s) saved with its evidence trail.
+                          {message.agentSessionMessages.length} investigation message(s) available with its evidence trail.
                         </div>
                       </div>
                       <button
                         type="button"
-                        onClick={() => onOpenAgentSession(message.agentSessionMessages || [])}
+                        onClick={() => onOpenAgentSession(message.agentSessionMessages || [], message)}
                         className="rounded-xl bg-indigo-600 px-3 py-2 text-xs font-black text-white shadow-sm transition hover:bg-indigo-500"
                       >
                         Reopen Investigation
@@ -921,15 +1278,9 @@ function ChatMessages({
                 ) : null}
 
                 {/* OPEN LINK BUTTON */}
-                {message.role ===
-                  "assistant" &&
-                  extractFirstUrl(
-                    message.content
-                  ) && (
+                {message.role === "assistant" && firstSafeUrl && (
                     <a
-                      href={extractFirstUrl(
-                        message.content
-                      )}
+                      href={firstSafeUrl}
                       target="_blank"
                       rel="noopener noreferrer"
                       className="mt-5 inline-flex items-center gap-2 rounded-xl bg-blue-600 px-4 py-2 font-semibold text-white transition hover:bg-blue-700"
@@ -970,6 +1321,18 @@ function ChatMessages({
         <div ref={chatEndRef} />
       </div>
     </div>
+
+      {showJumpToBottom ? (
+        <button
+          type="button"
+          onClick={jumpToBottom}
+          className="fixed bottom-[232px] right-8 z-[210] flex h-12 w-12 items-center justify-center rounded-full border border-sky-200/70 bg-white text-slate-950 shadow-2xl shadow-black/35 transition hover:-translate-y-0.5 hover:bg-sky-50 hover:text-sky-700"
+          title="Jump to latest message"
+          aria-label="Jump to latest message"
+        >
+          <ChevronDown size={24} strokeWidth={2.6} />
+        </button>
+      ) : null}
 
       {previewImage && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/75 p-6">
@@ -1045,6 +1408,8 @@ export default memo(ChatMessages, (prev, next) => {
     prev.computerSearchResults === next.computerSearchResults &&
     prev.uploadedFiles === next.uploadedFiles &&
     prev.log === next.log &&
-    prev.code === next.code
+    prev.code === next.code &&
+    prev.rollbackTarget === next.rollbackTarget &&
+    prev.rollbackLoading === next.rollbackLoading
   );
 });

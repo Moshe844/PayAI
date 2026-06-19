@@ -1,8 +1,31 @@
 @import "tailwindcss";
 
+/* ─── PayFix Dev Studio design tokens ─── */
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --pf-bg: #0b1220;
+  --pf-bg-elevated: #101827;
+  --pf-surface: #172033;
+  --pf-surface-2: #1f2b40;
+  --pf-surface-hover: #28384f;
+  --pf-border: rgba(154, 174, 202, 0.28);
+  --pf-border-strong: rgba(203, 213, 225, 0.44);
+  --pf-text: #f8fbff;
+  --pf-text-muted: #c7d2e2;
+  --pf-text-faint: #9eacc0;
+  --pf-accent: #38bdf8;
+  --pf-accent-strong: #0ea5e9;
+  --pf-accent-glow: rgba(56, 189, 248, 0.22);
+  --pf-success: #34d399;
+  --pf-warning: #fbbf24;
+  --pf-danger: #f87171;
+  --pf-code-bg: #0f1726;
+  --pf-code-border: rgba(148, 163, 184, 0.34);
+  --pf-sidebar-width: 288px;
+  --pf-radius: 14px;
+  --pf-radius-sm: 10px;
+  --pf-shadow: 0 22px 54px rgba(0, 0, 0, 0.34);
+  --background: var(--pf-bg);
+  --foreground: var(--pf-text);
 }
 
 @theme inline {
@@ -12,17 +35,7 @@
   --font-mono: var(--font-geist-mono);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
-}
-
-/* === Global page lock: prevent the document from scrolling ===
-   This keeps the composer fixed/visible and prevents the whole body
-   from moving. Internal areas (e.g. chat messages) should use
-   the .allow-scroll utility (see below) to enable internal scrolling. */
+/* ─── Base ─── */
 html,
 body,
 #__next {
@@ -32,82 +45,492 @@ body,
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: var(--font-geist-sans), Arial, Helvetica, sans-serif;
+  background: var(--pf-bg);
+  color: var(--pf-text);
+  font-family: var(--font-geist-sans), system-ui, sans-serif;
   font-size: 15px;
-  font-weight: 500;
-  line-height: 1.5;
+  font-weight: 450;
+  line-height: 1.55;
   font-feature-settings: "rlig" 1, "calt" 1;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   text-rendering: optimizeLegibility;
-  /* keep full width when locked */
   width: 100%;
 }
 
-/* Utility: apply this class to the chat/messages container so it scrolls internally */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  background:
+    radial-gradient(circle at 24% 0%, rgba(56, 189, 248, 0.1), transparent 32%),
+    linear-gradient(180deg, rgba(15, 23, 42, 0.18), transparent 340px),
+    linear-gradient(rgba(148, 163, 184, 0.018) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(148, 163, 184, 0.018) 1px, transparent 1px);
+  background-size: auto, auto, 40px 40px, 40px 40px;
+}
+
 .allow-scroll {
   height: 100%;
   overflow: auto;
   -webkit-overflow-scrolling: touch;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(148, 163, 184, 0.35) transparent;
 }
 
-/* Small helper if you need a fixed-height messages area:
-   .messages-area { height: calc(100vh - 96px); overflow: auto; } */
+.allow-scroll::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
 
-/* keep form controls accessible styling */
+.allow-scroll::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.28);
+  border-radius: 999px;
+}
+
+.allow-scroll::-webkit-scrollbar-thumb:hover {
+  background: rgba(148, 163, 184, 0.42);
+}
+
+/* ─── Form controls ─── */
 button,
 input,
 textarea,
 select {
-  outline-color: #2563eb;
+  outline-color: var(--pf-accent);
   font: inherit;
-  font-weight: 600;
 }
 
 textarea,
 input,
 select {
-  color: #0f172a;
+  color: var(--pf-text);
 }
 
 textarea::placeholder,
 input::placeholder {
-  color: #64748b;
+  color: var(--pf-text-faint);
   opacity: 1;
 }
 
-button {
-  letter-spacing: 0;
-}
-
-/* selection color */
 ::selection {
-  background: #bfdbfe;
-  color: #0f172a;
+  background: rgba(56, 189, 248, 0.28);
+  color: #fff;
 }
 
-
-/* Ensure long strings wrap and break inside chat messages */
+/* ─── Prose / messages ─── */
 .prose {
   word-wrap: break-word;
   overflow-wrap: break-word;
   word-break: break-word;
-  white-space: pre-wrap; /* preserve whitespace and wrap */
-  color: #0f172a;
+  white-space: normal;
+  color: var(--pf-text);
 }
 
 .prose p,
 .prose li {
-  font-size: 15px;
+  font-size: 14px;
   line-height: 1.65;
 }
 
-/* Add this class to message containers to ensure wrapping */
 .message {
   word-wrap: break-word;
   overflow-wrap: break-word;
   word-break: break-word;
   white-space: pre-wrap;
+}
+
+button:not([disabled]),
+input[type="button"]:not([disabled]),
+input[type="submit"]:not([disabled]),
+input[type="reset"]:not([disabled]),
+[role="button"]:not([disabled]),
+a[role="button"]:not([disabled]) {
+  cursor: pointer;
+}
+
+/* ─── Shared UI primitives ─── */
+.pf-shell {
+  position: relative;
+  z-index: 1;
+}
+
+.pf-panel {
+  border: 1px solid var(--pf-border);
+  background: linear-gradient(180deg, rgba(31, 43, 64, 0.98), rgba(18, 28, 45, 0.98));
+  backdrop-filter: blur(18px);
+  border-radius: var(--pf-radius);
+  box-shadow: var(--pf-shadow);
+}
+
+.pf-glass {
+  border: 1px solid var(--pf-border);
+  background: rgba(16, 24, 39, 0.96);
+  backdrop-filter: blur(20px);
+}
+
+.pf-kbd {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px 7px;
+  border-radius: 6px;
+  border: 1px solid var(--pf-border-strong);
+  background: rgba(255, 255, 255, 0.07);
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--pf-text-muted);
+  line-height: 1.4;
+}
+
+.pf-btn-primary {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  border-radius: var(--pf-radius-sm);
+  background: linear-gradient(135deg, var(--pf-accent-strong), #6366f1);
+  color: #fff;
+  font-weight: 750;
+  box-shadow: 0 8px 24px var(--pf-accent-glow);
+  transition: transform 0.15s ease, box-shadow 0.15s ease, filter 0.15s ease;
+}
+
+.pf-btn-primary:hover:not(:disabled) {
+  filter: brightness(1.08);
+  transform: translateY(-1px);
+}
+
+.pf-btn-primary:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  box-shadow: none;
+}
+
+.pf-btn-ghost {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  border-radius: var(--pf-radius-sm);
+  border: 1px solid var(--pf-border);
+  background: rgba(255, 255, 255, 0.055);
+  color: var(--pf-text);
+  font-weight: 700;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+
+.pf-btn-ghost:hover:not(:disabled) {
+  background: rgba(56, 189, 248, 0.1);
+  border-color: var(--pf-border-strong);
+  color: var(--pf-text);
+}
+
+.pf-input {
+  width: 100%;
+  border-radius: var(--pf-radius-sm);
+  border: 1px solid var(--pf-border-strong);
+  background: rgba(15, 23, 38, 0.86);
+  padding: 10px 12px;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--pf-text);
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.pf-input:focus {
+  border-color: rgba(56, 189, 248, 0.55);
+  box-shadow: 0 0 0 3px var(--pf-accent-glow);
+}
+
+.pf-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border-radius: 999px;
+  border: 1px solid var(--pf-border);
+  background: rgba(255, 255, 255, 0.07);
+  padding: 4px 10px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  color: var(--pf-text);
+}
+
+.pf-badge-live {
+  border-color: rgba(52, 211, 153, 0.35);
+  background: rgba(52, 211, 153, 0.1);
+  color: var(--pf-success);
+}
+
+.pf-badge-live::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--pf-success);
+  box-shadow: 0 0 8px var(--pf-success);
+  animation: pf-pulse 2s ease-in-out infinite;
+}
+
+@keyframes pf-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+
+.pf-section-label {
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: #a9bad0;
+}
+
+/* Theme bridge: Cursor left many light utility classes across the app. */
+.pf-shell .bg-white,
+.pf-shell [class~="bg-white/60"],
+.pf-shell [class~="bg-white/70"],
+.pf-shell [class~="bg-white/75"],
+.pf-shell [class~="bg-white/80"],
+.pf-shell [class~="bg-white/90"] {
+  background-color: rgba(23, 32, 51, 0.96) !important;
+  color: var(--pf-text) !important;
+}
+
+.pf-shell .bg-slate-50,
+.pf-shell .bg-slate-100,
+.pf-shell [class~="bg-slate-50/80"],
+.pf-shell [class~="bg-blue-50/80"] {
+  background-color: rgba(31, 43, 64, 0.92) !important;
+  color: var(--pf-text) !important;
+}
+
+.pf-shell .bg-blue-50,
+.pf-shell .bg-sky-50 {
+  background-color: rgba(14, 165, 233, 0.16) !important;
+  color: #e8f8ff !important;
+}
+
+.pf-shell .bg-emerald-50 {
+  background-color: rgba(16, 185, 129, 0.16) !important;
+  color: #e5fff1 !important;
+}
+
+.pf-shell .bg-amber-50 {
+  background-color: rgba(245, 158, 11, 0.17) !important;
+  color: #fff6d6 !important;
+}
+
+.pf-shell .bg-rose-50,
+.pf-shell .bg-red-50 {
+  background-color: rgba(244, 63, 94, 0.14) !important;
+  color: #ffe4e6 !important;
+}
+
+.pf-shell .bg-indigo-50,
+.pf-shell .bg-purple-50,
+.pf-shell .bg-violet-50 {
+  background-color: rgba(99, 102, 241, 0.17) !important;
+  color: #e7e9ff !important;
+}
+
+.pf-shell .border-slate-200,
+.pf-shell .border-slate-300,
+.pf-shell .ring-slate-200,
+.pf-shell .ring-blue-100,
+.pf-shell .ring-indigo-100,
+.pf-shell .ring-emerald-100,
+.pf-shell .ring-amber-100,
+.pf-shell .ring-rose-100 {
+  border-color: var(--pf-border) !important;
+  --tw-ring-color: var(--pf-border) !important;
+}
+
+.pf-shell .text-slate-950,
+.pf-shell .text-slate-900,
+.pf-shell .text-slate-800,
+.pf-shell .text-blue-950,
+.pf-shell .text-emerald-950,
+.pf-shell .text-amber-950,
+.pf-shell .text-rose-950,
+.pf-shell .text-indigo-950 {
+  color: var(--pf-text) !important;
+}
+
+.pf-shell .text-slate-700,
+.pf-shell .text-slate-600,
+.pf-shell .text-blue-700,
+.pf-shell .text-emerald-700,
+.pf-shell .text-amber-700,
+.pf-shell .text-rose-700,
+.pf-shell .text-indigo-700,
+.pf-shell .text-purple-700 {
+  color: #d2dceb !important;
+}
+
+.pf-shell .text-slate-500,
+.pf-shell .text-slate-400 {
+  color: #aebdd0 !important;
+}
+
+.pf-shell .shadow-sm,
+.pf-shell .shadow-md {
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.26) !important;
+}
+
+.pf-shell button {
+  letter-spacing: 0;
+}
+
+.pf-shell button:focus-visible,
+.pf-shell a:focus-visible,
+.pf-shell [role="button"]:focus-visible {
+  outline: 2px solid rgba(56, 189, 248, 0.8);
+  outline-offset: 2px;
+}
+
+.pf-shell .rounded-full {
+  border-color: var(--pf-border-strong);
+}
+
+.pf-shell [class*="text-"][class*="-300"],
+.pf-shell [class*="text-"][class*="-200"] {
+  text-shadow: none;
+}
+
+.pf-shell input:not([type="file"]),
+.pf-shell textarea,
+.pf-shell select {
+  background-color: rgba(15, 23, 38, 0.88);
+  color: var(--pf-text);
+  border-color: var(--pf-border-strong);
+}
+
+.pf-shell input:not([type="file"]):focus,
+.pf-shell textarea:focus,
+.pf-shell select:focus {
+  border-color: rgba(56, 189, 248, 0.62);
+  box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.18);
+}
+
+.pf-shell table {
+  color: var(--pf-text);
+}
+
+.pf-shell thead {
+  background-color: rgba(23, 34, 49, 0.92);
+}
+
+.pf-shell ::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+
+.pf-shell ::-webkit-scrollbar-track {
+  background: rgba(15, 23, 42, 0.28);
+}
+
+.pf-shell ::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.42);
+  border-radius: 999px;
+}
+
+.pf-shell ::-webkit-scrollbar-thumb:hover {
+  background: rgba(203, 213, 225, 0.55);
+}
+
+.pf-shell pre {
+  border-color: var(--pf-code-border);
+  background-color: var(--pf-code-bg);
+  color: #e8eef8;
+}
+
+.pf-raw-agent-log {
+  background: #111a2a !important;
+  color: #eef6ff !important;
+  font-size: 13.5px;
+  font-weight: 600;
+  line-height: 1.8;
+  letter-spacing: 0;
+  text-rendering: geometricPrecision;
+  box-shadow: inset 0 0 0 1px rgba(148, 163, 184, 0.28);
+}
+
+.pf-chat-prose {
+  font-size: 15.5px;
+  line-height: 1.62;
+}
+
+.pf-chat-prose p,
+.pf-chat-prose li {
+  font-size: 15.5px;
+  line-height: 1.62;
+}
+
+.pf-chat-prose p {
+  margin: 0.45rem 0;
+}
+
+.pf-chat-prose .pf-step-list {
+  list-style: decimal;
+  padding-left: 1.5rem;
+}
+
+.pf-chat-prose .pf-step-list > li {
+  position: relative;
+  margin-top: 0.45rem;
+  padding: 0.05rem 0 0.45rem 0.35rem;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.1);
+  color: var(--pf-text);
+  font-size: 15.5px;
+  line-height: 1.62;
+}
+
+.pf-chat-prose .pf-step-list > li:last-child {
+  border-bottom: 0;
+}
+
+.pf-chat-prose .pf-step-list > li::marker {
+  color: #bae6fd;
+  font-weight: 900;
+  font-size: 1rem;
+}
+
+.pf-chat-prose .pf-step-list > li > :first-child {
+  margin-top: 0;
+}
+
+.pf-chat-prose .pf-step-list > li > :first-child strong:first-child,
+.pf-chat-prose .pf-step-list > li > p:first-child strong:first-child {
+  color: #e0f2fe;
+  font-size: 1rem;
+}
+
+.pf-chat-prose .pf-step-list ul,
+.pf-chat-prose .pf-step-list ol {
+  margin-top: 0.25rem;
+  margin-bottom: 0;
+  border-radius: 0.75rem;
+  background: rgba(15, 23, 42, 0.18);
+}
+
+.pf-chat-prose ul:not(.pf-step-list),
+.pf-chat-prose ol:not(.pf-step-list) {
+  margin-top: 0.45rem;
+  margin-bottom: 0.45rem;
+}
+
+.pf-chat-prose strong {
+  color: #ffffff;
+  font-weight: 800;
+}
+
+.pf-chat-prose a {
+  text-underline-offset: 3px;
 }

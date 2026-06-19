@@ -7,7 +7,7 @@ import path from "path";
 import os from "os";
 import net from "net";
 import crypto from "crypto";
-import { execFile } from "child_process";
+import { execFile, spawn } from "child_process";
 import { promisify } from "util";
 import { pathToFileURL } from "url";
 
@@ -31,6 +31,17 @@ app.use(
 );
 
 app.use(express.json({ limit: "50mb" }));
+app.use((err: unknown, _req: express.Request, res: express.Response, next: express.NextFunction) => {
+  if (!err) {
+    next();
+    return;
+  }
+
+  res.status(400).json({
+    ok: false,
+    error: errorMessage(err),
+  });
+});
 
 let allowedRoot = "";
 const activeWatchers = new Map<string, { file: string; watcher: FSWatcher; startedAt: string }>();
@@ -48,10 +59,10 @@ const watchEvents: Array<{
   removedLines: number;
   changed: boolean;
   preview: string;
-  issues: Array<{ severity: "error" | "warning" | "info"; message: string; line?: number }>;
+  issues: Array<{ severity: "error" | "warning" | "info"; message: string; line?: number; source?: "parser" | "compiler" | "lightweight" }>;
   analysis?: WatchAnalysis;
 }> = [];
-type WatchIssue = { severity: "error" | "warning" | "info"; message: string; line?: number };
+type WatchIssue = { severity: "error" | "warning" | "info"; message: string; line?: number; source?: "parser" | "compiler" | "lightweight" };
 type WatchAnalysis = {
   title: string;
   confidence: number;
@@ -60,6 +71,16 @@ type WatchAnalysis = {
   probableCause: string;
   suggestedFix: string;
   validation: string[];
+};
+
+type BrowserChoice = "chrome" | "edge" | "firefox";
+type SdkInspectionFile = {
+  file: string;
+  relative: string;
+  size: number;
+  mime: string;
+  role: string;
+  content?: string;
 };
 
 function clearWatchState() {
@@ -74,6 +95,531 @@ function clearWatchState() {
   }
   watchTimers.clear();
   watchEvents.splice(0, watchEvents.length);
+}
+
+async function firstAccessiblePath(candidates: string[]) {
+  for (const candidate of candidates) {
+    try {
+      await fs.access(candidate);
+      return candidate;
+    } catch {
+      // Try the next known install location.
+    }
+  }
+
+  return "";
+}
+
+async function browserLaunchCommand(browser: BrowserChoice) {
+  if (process.platform === "darwin") {
+    const appName =
+      browser === "chrome" ? "Google Chrome" : browser === "edge" ? "Microsoft Edge" : "Firefox";
+    return { command: "open", args: ["-a", appName] };
+  }
+
+  if (process.platform === "win32") {
+    const programFiles = [process.env.PROGRAMFILES, process.env["PROGRAMFILES(X86)"], process.env.LOCALAPPDATA].filter(
+      Boolean,
+    ) as string[];
+    const candidates =
+      browser === "chrome"
+        ? [
+            path.join(programFiles[0] || "", "Google", "Chrome", "Application", "chrome.exe"),
+            path.join(programFiles[1] || "", "Google", "Chrome", "Application", "chrome.exe"),
+            path.join(programFiles[2] || "", "Google", "Chrome", "Application", "chrome.exe"),
+          ]
+        : browser === "edge"
+          ? [
+              path.join(programFiles[0] || "", "Microsoft", "Edge", "Application", "msedge.exe"),
+              path.join(programFiles[1] || "", "Microsoft", "Edge", "Application", "msedge.exe"),
+              path.join(programFiles[2] || "", "Microsoft", "Edge", "Application", "msedge.exe"),
+            ]
+          : [
+              path.join(programFiles[0] || "", "Mozilla Firefox", "firefox.exe"),
+              path.join(programFiles[1] || "", "Mozilla Firefox", "firefox.exe"),
+              path.join(programFiles[2] || "", "Mozilla Firefox", "firefox.exe"),
+            ];
+    const command = await firstAccessiblePath(candidates);
+    if (!command) {
+      throw new Error(`Could not find ${browser} in the standard Windows install locations.`);
+    }
+
+    return { command, args: [] as string[] };
+  }
+
+  const command =
+    browser === "chrome"
+      ? "google-chrome"
+      : browser === "edge"
+        ? "microsoft-edge"
+        : "firefox";
+  return { command, args: [] as string[] };
+}
+
+async function openUrlInBrowser(rawUrl: string, browser: BrowserChoice) {
+  const url = new URL(rawUrl);
+  if (!["http:", "https:"].includes(url.protocol)) {
+    throw new Error("Only http and https URLs can be opened.");
+  }
+
+  const launch = await browserLaunchCommand(browser);
+  const child = spawn(launch.command, [...launch.args, url.toString()], {
+    detached: true,
+    stdio: "ignore",
+    windowsHide: true,
+  });
+  child.unref();
+
+  return {
+    ok: true,
+    browser,
+    url: url.toString(),
+    command: launch.command,
+    processId: child.pid,
+  };
+}
+
+async function pickFolderWithNativeDialog(title = "Select folder") {
+  if (process.platform === "win32") {
+    const script = `
+Add-Type -AssemblyName System.Windows.Forms
+$dialog = New-Object System.Windows.Forms.FolderBrowserDialog
+$dialog.Description = ${JSON.stringify(title)}
+$dialog.ShowNewFolderButton = $true
+if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+  [Console]::Out.Write($dialog.SelectedPath)
+}
+`;
+    const { stdout } = await execFileAsync("powershell.exe", ["-NoProfile", "-STA", "-Command", script], {
+      timeout: 120000,
+      windowsHide: false,
+      maxBuffer: 1024 * 1024,
+    });
+    return stdout.trim();
+  }
+
+  if (process.platform === "darwin") {
+    const { stdout } = await execFileAsync("osascript", ["-e", `POSIX path of (choose folder with prompt ${JSON.stringify(title)})`], {
+      timeout: 120000,
+      maxBuffer: 1024 * 1024,
+    });
+    return stdout.trim();
+  }
+
+  try {
+    const { stdout } = await execFileAsync("zenity", ["--file-selection", "--directory", "--title", title], {
+      timeout: 120000,
+      maxBuffer: 1024 * 1024,
+    });
+    return stdout.trim();
+  } catch {
+    const { stdout } = await execFileAsync("kdialog", ["--getexistingdirectory", os.homedir(), "--title", title], {
+      timeout: 120000,
+      maxBuffer: 1024 * 1024,
+    });
+    return stdout.trim();
+  }
+}
+
+async function browseLocalFolders(rawPath?: string) {
+  const home = os.homedir();
+  const requestedPath = String(rawPath || "").trim();
+  const currentPath = path.resolve(requestedPath || home);
+  const stat = await fs.stat(currentPath).catch(() => null);
+  if (!stat?.isDirectory()) throw new Error("Folder does not exist or is not accessible.");
+
+  const entries = await fs.readdir(currentPath, { withFileTypes: true });
+  const folders = await Promise.all(
+    entries
+      .filter((entry) => entry.isDirectory() && !entry.name.startsWith("$RECYCLE.BIN") && entry.name !== "System Volume Information")
+      .slice(0, 500)
+      .map(async (entry) => {
+        const folderPath = path.join(currentPath, entry.name);
+        const folderStat = await fs.stat(folderPath).catch(() => null);
+        return {
+          name: entry.name,
+          path: folderPath,
+          modifiedAt: folderStat?.mtime?.toISOString() || "",
+        };
+      })
+  );
+
+  const roots = [
+    home,
+    path.join(home, "Desktop"),
+    path.join(home, "Documents"),
+    path.join(home, "Downloads"),
+    process.cwd(),
+  ];
+
+  return {
+    ok: true,
+    currentPath,
+    parentPath: path.dirname(currentPath) !== currentPath ? path.dirname(currentPath) : "",
+    roots: [...new Set(roots)].filter(Boolean),
+    folders: folders.sort((left, right) => left.name.localeCompare(right.name)),
+  };
+}
+
+function sdkFileRole(file: string) {
+  const normalized = file.replace(/\\/g, "/").toLowerCase();
+  if (/\.(aar|jar)$/i.test(file)) return "android-library";
+  if (/\.apk$/i.test(file)) return "sample-apk";
+  if (/\.aidl$/i.test(file)) return "aidl-interface";
+  if (/(\breadme\b|setup|integration|guide|manual|docs?|sample|example).*\.(md|txt|pdf|html?)$/i.test(normalized)) return "documentation";
+  if (/build\.gradle(?:\.kts)?|settings\.gradle(?:\.kts)?|pom\.xml|androidmanifest\.xml$/i.test(normalized)) return "build-config";
+  if (/\.(kt|java|cs|xml|json|properties|gradle|md|txt|html?)$/i.test(file)) return "source-or-text";
+  return "artifact";
+}
+
+function sdkInspectionScore(file: string) {
+  const normalized = file.replace(/\\/g, "/").toLowerCase();
+  let score = 0;
+  if (/poslink|posdk|broadpos|paxstore|pax|android|a920|a80|aidl|intent|sample|demo|integration|setup|readme|guide|manual/.test(normalized)) {
+    score += 20;
+  }
+  if (/\.(aar|jar|aidl|apk)$/i.test(file)) score += 18;
+  if (/readme|setup|integration|guide|sample|example|androidmanifest|build\.gradle|settings\.gradle/i.test(normalized)) score += 14;
+  if (/(^|\/)(docs?|samples?|examples?|libs?|aar|jar)(\/|$)/i.test(normalized)) score += 8;
+  return score;
+}
+
+async function inspectSdkFolder(rawRoot: string) {
+  const root = path.resolve(String(rawRoot || "").trim());
+  if (!root) throw new Error("SDK folder path is required.");
+  const stat = await fs.stat(root);
+  if (!stat.isDirectory()) throw new Error("SDK path must be an extracted folder, not a zip file.");
+
+  const entries = await fg(["**/*"], {
+    cwd: root,
+    absolute: true,
+    onlyFiles: true,
+    dot: false,
+    followSymbolicLinks: false,
+    ignore: ["**/node_modules/**", "**/.git/**", "**/build/**", "**/dist/**", "**/.gradle/**"],
+  });
+
+  const scored = await Promise.all(
+    entries.slice(0, 2500).map(async (file) => {
+      const fileStat = await fs.stat(file);
+      return {
+        file,
+        relative: path.relative(root, file),
+        size: fileStat.size,
+        mime: fileMime(file),
+        role: sdkFileRole(file),
+        score: sdkInspectionScore(file),
+      };
+    }),
+  );
+
+  const important = scored
+    .filter((item) => item.score > 0)
+    .sort((left, right) => right.score - left.score || left.relative.localeCompare(right.relative))
+    .slice(0, 80);
+
+  const readable = await Promise.all(
+    important
+      .filter((item) => /source-or-text|build-config|documentation|aidl-interface/.test(item.role) && item.size <= 220000 && !/\.pdf$/i.test(item.file))
+      .slice(0, 24)
+      .map(async (item): Promise<SdkInspectionFile> => {
+        try {
+          const content = await fs.readFile(item.file, "utf8");
+          return {
+            file: item.file,
+            relative: item.relative,
+            size: item.size,
+            mime: item.mime,
+            role: item.role,
+            content: content.slice(0, 18000),
+          };
+        } catch {
+          return {
+            file: item.file,
+            relative: item.relative,
+            size: item.size,
+            mime: item.mime,
+            role: item.role,
+          };
+        }
+      }),
+  );
+
+  return {
+    ok: true,
+    root,
+    totalFiles: entries.length,
+    importantFiles: important.map((item) => ({
+      file: item.file,
+      relative: item.relative,
+      size: item.size,
+      mime: item.mime,
+      role: item.role,
+    })),
+    readableFiles: readable,
+  };
+}
+
+async function findFilesUnderRoots(rawRoots: string[], extensions: string[], limit = 80) {
+  const files: string[] = [];
+  for (const rawRoot of rawRoots) {
+    const root = path.resolve(String(rawRoot || "").trim());
+    const stat = await fs.stat(root).catch(() => null);
+    if (!stat?.isDirectory()) continue;
+    const matches = await fg(extensions.map((extension) => `**/*${extension}`), {
+      cwd: root,
+      absolute: true,
+      onlyFiles: true,
+      dot: false,
+      ignore: ["**/node_modules/**", "**/.git/**", "**/build/**", "**/.gradle/**"],
+      suppressErrors: true,
+    });
+    files.push(...matches);
+    if (files.length >= limit) break;
+  }
+  return [...new Set(files)].slice(0, limit);
+}
+
+function androidPackageFromManifest(content: string) {
+  return content.match(/\bpackage\s*=\s*["']([^"']+)["']/i)?.[1] || "";
+}
+
+function androidNamespaceFromGradle(content: string) {
+  return content.match(/\bnamespace\s*[= ]\s*["']([^"']+)["']/i)?.[1] || "";
+}
+
+async function detectAndroidProjectInfo() {
+  if (!allowedRoot) throw new Error("No project folder selected.");
+  const settingsFile =
+    (await fileExists(path.join(allowedRoot, "settings.gradle.kts"))) ? path.join(allowedRoot, "settings.gradle.kts") :
+    (await fileExists(path.join(allowedRoot, "settings.gradle"))) ? path.join(allowedRoot, "settings.gradle") : "";
+  const appGradle =
+    (await fileExists(path.join(allowedRoot, "app", "build.gradle.kts"))) ? path.join(allowedRoot, "app", "build.gradle.kts") :
+    (await fileExists(path.join(allowedRoot, "app", "build.gradle"))) ? path.join(allowedRoot, "app", "build.gradle") : "";
+  const manifest = path.join(allowedRoot, "app", "src", "main", "AndroidManifest.xml");
+  const appGradleContent = appGradle ? await fs.readFile(appGradle, "utf8").catch(() => "") : "";
+  const manifestContent = await fs.readFile(manifest, "utf8").catch(() => "");
+  const namespace = androidNamespaceFromGradle(appGradleContent) || androidPackageFromManifest(manifestContent) || "com.payfix.paxregister";
+
+  return {
+    settingsFile,
+    appGradle,
+    manifest,
+    namespace,
+    packagePath: namespace.replace(/\./g, path.sep),
+    kotlin: /\.(kts|kt)$/i.test(appGradle) || /kotlin|org\.jetbrains\.kotlin/i.test(appGradleContent),
+    appGradleContent,
+    manifestContent,
+  };
+}
+
+function ensureAndroidGradleVendorDeps(content: string, isKts: boolean) {
+  const fileTreeLine = isKts
+    ? `implementation(fileTree(mapOf("dir" to "libs", "include" to listOf("*.jar", "*.aar"))))`
+    : `implementation fileTree(dir: 'libs', include: ['*.jar', '*.aar'])`;
+  let next = content || "";
+  if (!next.trim()) {
+    next = isKts
+      ? `plugins {\n    id("com.android.application")\n}\n\nandroid {\n    namespace = "com.payfix.paxregister"\n    compileSdk = 35\n\n    defaultConfig {\n        applicationId = "com.payfix.paxregister"\n        minSdk = 23\n        targetSdk = 35\n        versionCode = 1\n        versionName = "1.0"\n    }\n}\n\ndependencies {\n}\n`
+      : `plugins {\n    id 'com.android.application'\n}\n\nandroid {\n    namespace 'com.payfix.paxregister'\n    compileSdk 35\n\n    defaultConfig {\n        applicationId 'com.payfix.paxregister'\n        minSdk 23\n        targetSdk 35\n        versionCode 1\n        versionName '1.0'\n    }\n}\n\ndependencies {\n}\n`;
+  }
+  if (/fileTree\([\s\S]+libs[\s\S]+\*\.(jar|aar)/i.test(next)) return next;
+  if (/dependencies\s*\{/i.test(next)) {
+    return next.replace(/dependencies\s*\{/, (match) => `${match}\n    ${fileTreeLine}`);
+  }
+  return `${next.trim()}\n\ndependencies {\n    ${fileTreeLine}\n}\n`;
+}
+
+function paxMainActivitySource(packageName: string, kotlin: boolean) {
+  if (kotlin) {
+    return `package ${packageName}
+
+import android.app.Activity
+import android.os.Bundle
+import android.widget.Button
+import android.widget.LinearLayout
+import android.widget.TextView
+import android.widget.Toast
+
+class MainActivity : Activity() {
+    private lateinit var status: TextView
+    private val paymentBridge = PaymentServiceBridge()
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        title = "PAX Register"
+
+        status = TextView(this).apply {
+            text = "Ready for barcode checkout"
+            textSize = 18f
+            setPadding(24, 24, 24, 24)
+        }
+
+        val scanButton = Button(this).apply {
+            text = "Start checkout"
+            setOnClickListener { startCheckout() }
+        }
+
+        val layout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(24, 24, 24, 24)
+            addView(status)
+            addView(scanButton)
+        }
+
+        setContentView(layout)
+    }
+
+    private fun startCheckout() {
+        status.text = "Checkout started. Wire barcode scanner and POSLink payment call next."
+        Toast.makeText(this, paymentBridge.describeIntegration(), Toast.LENGTH_LONG).show()
+    }
+}
+`;
+  }
+
+  return `package ${packageName};
+
+import android.app.Activity;
+import android.os.Bundle;
+import android.widget.Button;
+import android.widget.LinearLayout;
+import android.widget.TextView;
+import android.widget.Toast;
+
+public class MainActivity extends Activity {
+    private TextView status;
+    private final PaymentServiceBridge paymentBridge = new PaymentServiceBridge();
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        setTitle("PAX Register");
+
+        status = new TextView(this);
+        status.setText("Ready for barcode checkout");
+        status.setTextSize(18);
+        status.setPadding(24, 24, 24, 24);
+
+        Button scanButton = new Button(this);
+        scanButton.setText("Start checkout");
+        scanButton.setOnClickListener(v -> startCheckout());
+
+        LinearLayout layout = new LinearLayout(this);
+        layout.setOrientation(LinearLayout.VERTICAL);
+        layout.setPadding(24, 24, 24, 24);
+        layout.addView(status);
+        layout.addView(scanButton);
+        setContentView(layout);
+    }
+
+    private void startCheckout() {
+        status.setText("Checkout started. Wire barcode scanner and POSLink payment call next.");
+        Toast.makeText(this, paymentBridge.describeIntegration(), Toast.LENGTH_LONG).show();
+    }
+}
+`;
+}
+
+function paxPaymentBridgeSource(packageName: string, kotlin: boolean, copiedArtifacts: string[]) {
+  const artifactList = copiedArtifacts.length ? copiedArtifacts.map((item) => `- ${path.basename(item)}`).join("\\n") : "No vendor libraries copied yet.";
+  if (kotlin) {
+    return `package ${packageName}
+
+class PaymentServiceBridge {
+    fun describeIntegration(): String {
+        return "Vendor SDK artifacts detected:\\n${artifactList}\\nNext: replace this bridge with the POSLink/BroadPOS Intent or AIDL call from the vendor sample included in your SDK."
+    }
+}
+`;
+  }
+  return `package ${packageName};
+
+public class PaymentServiceBridge {
+    public String describeIntegration() {
+        return "Vendor SDK artifacts detected:\\n${artifactList}\\nNext: replace this bridge with the POSLink/BroadPOS Intent or AIDL call from the vendor sample included in your SDK.";
+    }
+}
+`;
+}
+
+function ensurePaxMainActivityInManifest(content: string) {
+  if (!content.trim()) {
+    return `<?xml version="1.0" encoding="utf-8"?>\n<manifest xmlns:android="http://schemas.android.com/apk/res/android">\n    <uses-permission android:name="android.permission.INTERNET" />\n    <uses-permission android:name="android.permission.CAMERA" />\n    <application android:theme="@style/AppTheme" android:label="PAX Register">\n        <activity android:name=".MainActivity" android:exported="true">\n            <intent-filter>\n                <action android:name="android.intent.action.MAIN" />\n                <category android:name="android.intent.category.LAUNCHER" />\n            </intent-filter>\n        </activity>\n    </application>\n</manifest>\n`;
+  }
+
+  if (/android:name\s*=\s*["'](?:\.MainActivity|[^"']*\.MainActivity)["']/i.test(content)) return content;
+
+  const activity = `\n        <activity android:name=".MainActivity" android:exported="true">\n            <intent-filter>\n                <action android:name="android.intent.action.MAIN" />\n                <category android:name="android.intent.category.LAUNCHER" />\n            </intent-filter>\n        </activity>`;
+
+  if (/<application\b[^>]*>/i.test(content)) {
+    return content.replace(/(<application\b[^>]*>)/i, `$1${activity}`);
+  }
+
+  return content.replace(
+    /<\/manifest>/i,
+    `    <application android:theme="@style/AppTheme" android:label="PAX Register">${activity}\n    </application>\n</manifest>`,
+  );
+}
+
+async function buildPaxAndroidApp(rawSdkRoots: string[], prompt: string) {
+  if (!allowedRoot) throw new Error("No project folder selected.");
+  const info = await detectAndroidProjectInfo();
+  if (!info.settingsFile && !info.appGradle) {
+    throw new Error("Connected folder does not look like an Android/Gradle project. Select the Android Studio project root first.");
+  }
+
+  const libsDir = path.join(allowedRoot, "app", "libs");
+  await fs.mkdir(libsDir, { recursive: true });
+  const vendorArtifacts = await findFilesUnderRoots(rawSdkRoots, [".aar", ".jar"], 40);
+  const copiedArtifacts: string[] = [];
+  for (const artifact of vendorArtifacts) {
+    const target = path.join(libsDir, path.basename(artifact));
+    await fs.copyFile(artifact, target);
+    copiedArtifacts.push(relativeProjectPath(target));
+  }
+
+  const sourceExt = info.kotlin ? "kt" : "java";
+  const sourceRoot = path.join(allowedRoot, "app", "src", "main", info.kotlin ? "java" : "java", info.packagePath);
+  await fs.mkdir(sourceRoot, { recursive: true });
+  const mainActivity = path.join(sourceRoot, `MainActivity.${sourceExt}`);
+  const bridge = path.join(sourceRoot, `PaymentServiceBridge.${sourceExt}`);
+  await fs.writeFile(mainActivity, paxMainActivitySource(info.namespace, info.kotlin), "utf8");
+  await fs.writeFile(bridge, paxPaymentBridgeSource(info.namespace, info.kotlin, copiedArtifacts), "utf8");
+
+  if (info.appGradle) {
+    const updatedGradle = ensureAndroidGradleVendorDeps(info.appGradleContent, info.appGradle.endsWith(".kts"));
+    await fs.writeFile(info.appGradle, updatedGradle, "utf8");
+  }
+
+  const manifestContent = ensurePaxMainActivityInManifest(info.manifestContent);
+  await fs.mkdir(path.dirname(info.manifest), { recursive: true });
+  await fs.writeFile(info.manifest, manifestContent, "utf8");
+
+  const filesChanged = [
+    relativeProjectPath(mainActivity),
+    relativeProjectPath(bridge),
+    info.appGradle ? relativeProjectPath(info.appGradle) : "",
+    relativeProjectPath(info.manifest),
+    ...copiedArtifacts,
+  ].filter(Boolean);
+
+  return {
+    ok: true,
+    prompt,
+    projectRoot: allowedRoot,
+    namespace: info.namespace,
+    kotlin: info.kotlin,
+    copiedArtifacts,
+    filesChanged,
+    nextSteps: [
+      "Open the project in Android Studio.",
+      "Sync Gradle.",
+      "Build the app module.",
+      "Run on a PAX A-series device.",
+      "Replace PaymentServiceBridge with the exact POSLink/BroadPOS Intent or AIDL call from the copied vendor sample/docs.",
+    ],
+  };
 }
 const rollbackSnapshots = new Map<
   string,
@@ -254,6 +800,37 @@ type ProjectMatch = {
 
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : "Unexpected local agent error.";
+}
+
+async function forceRemoveDirectoryFromDisk(root: string) {
+  if (process.platform !== "win32") {
+    await fs.rm(root, { recursive: true, force: true });
+    return;
+  }
+
+  try {
+    await execFileAsync(
+      "powershell.exe",
+      [
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        "$TargetPath = $env:PAYFIX_DELETE_TARGET; if ([string]::IsNullOrWhiteSpace($TargetPath)) { throw 'PAYFIX_DELETE_TARGET was empty.' }; Remove-Item -LiteralPath $TargetPath -Recurse -Force -ErrorAction Stop",
+      ],
+      { env: { ...process.env, PAYFIX_DELETE_TARGET: root }, windowsHide: true, timeout: 15000 },
+    );
+  } catch (err: unknown) {
+    const details = [
+      errorMessage(err),
+      typeof (err as { stderr?: unknown }).stderr === "string" ? (err as { stderr: string }).stderr.trim() : "",
+      typeof (err as { stdout?: unknown }).stdout === "string" ? (err as { stdout: string }).stdout.trim() : "",
+    ]
+      .filter(Boolean)
+      .join("\n");
+    throw new Error(details || "PowerShell Remove-Item failed.");
+  }
 }
 
 const projectFileGlobs = [
@@ -502,6 +1079,7 @@ function diagnoseDelimiterBalance(content: string, languageLabel: string): Watch
             severity: "error",
             line: lineNumberForIndex(content, index),
             message: `Unexpected "${pair.close}" in ${languageLabel}; no matching "${pair.open}" was found.`,
+            source: "lightweight",
           });
           break;
         }
@@ -515,6 +1093,7 @@ function diagnoseDelimiterBalance(content: string, languageLabel: string): Watch
         severity: "error",
         line: lineNumberForIndex(content, index),
         message: `Missing "${pair.close}" for "${pair.open}" opened in ${languageLabel}.`,
+        source: "lightweight",
       });
     }
   }
@@ -552,6 +1131,7 @@ function diagnoseCStyleControlStatementParens(content: string, languageLabel: st
         severity: "error",
         line: index + 1,
         message: `Line ${index + 1}: missing closing ")" after \`${condition || "condition"}\` in ${languageLabel} ${match[1]} statement. Expected \`${expected}\` before the block starts.`,
+        source: "lightweight",
       });
     }
   }
@@ -567,6 +1147,39 @@ function dedupeWatchIssues(issues: WatchIssue[]) {
     seen.add(key);
     return true;
   });
+}
+
+async function diagnoseNodeSyntax(file: string): Promise<WatchIssue[]> {
+  try {
+    await execFileAsync(process.execPath, ["--check", file], {
+      cwd: path.dirname(file),
+      timeout: 10000,
+      windowsHide: true,
+    });
+    return [];
+  } catch (error: unknown) {
+    const output =
+      error && typeof error === "object" && "stderr" in error
+        ? String((error as { stderr?: unknown }).stderr || "")
+        : error instanceof Error
+          ? error.message
+          : "Node syntax check failed.";
+    const lineMatch = output.match(/:(\d+)(?::\d+)?\)?\s*$/m) || output.match(/\n\s*(\d+)\s*\|/);
+    const message =
+      output
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .find((line) => /SyntaxError|Unexpected|missing|Invalid/i.test(line)) || "Node reported a JavaScript syntax error.";
+
+    return [
+      {
+        severity: "error",
+        line: lineMatch ? Number(lineMatch[1]) : undefined,
+        message,
+        source: "parser",
+      },
+    ];
+  }
 }
 
 const htmlVoidTags = new Set([
@@ -637,6 +1250,7 @@ function diagnoseHtmlSelfClosingNonVoidTags(content: string): WatchIssue[] {
       severity: "warning",
       line,
       message: `Line ${line}: suspicious self-closing <${tag} /> tag. HTML treats ${snippet} as an opening <${tag}> tag; use <${tag}></${tag}> instead.`,
+      source: "lightweight",
     });
   }
 
@@ -658,19 +1272,19 @@ async function diagnoseWatchedFile(file: string, content: string): Promise<Watch
       idCounts.set(match[1], (idCounts.get(match[1]) || 0) + 1);
     }
     for (const [id, count] of idCounts) {
-      if (count > 1) issues.push({ severity: "error", message: `Duplicate id "${id}" appears ${count} times.` });
+      if (count > 1) issues.push({ severity: "error", message: `Duplicate id "${id}" appears ${count} times.`, source: "lightweight" });
     }
 
     const appearsToBeFullHtmlDocument = /<html[\s>]/i.test(content) || /<body[\s>]/i.test(content) || /<!doctype/i.test(content);
 
     if (appearsToBeFullHtmlDocument && !/<!doctype\s+html>/i.test(content)) {
-      issues.push({ severity: "warning", message: "Missing <!DOCTYPE html>." });
+      issues.push({ severity: "warning", message: "Missing <!DOCTYPE html>.", source: "lightweight" });
     }
     if (appearsToBeFullHtmlDocument && !/<html[\s>]/i.test(content)) {
-      issues.push({ severity: "warning", message: "Missing <html> element." });
+      issues.push({ severity: "warning", message: "Missing <html> element.", source: "lightweight" });
     }
     if (appearsToBeFullHtmlDocument && !/<body[\s>]/i.test(content)) {
-      issues.push({ severity: "warning", message: "Missing <body> element." });
+      issues.push({ severity: "warning", message: "Missing <body> element.", source: "lightweight" });
     }
 
     for (const match of content.matchAll(/<p\b[^>]*>([\s\S]*?)(?=<\/?(?:form|label|input|button|section|div|main|h[1-6])\b)/gi)) {
@@ -682,6 +1296,7 @@ async function diagnoseWatchedFile(file: string, content: string): Promise<Watch
           severity: "error",
           line,
           message: `Line ${line}: <p> starts before another form/layout element but is not closed with </p>.`,
+          source: "lightweight",
         });
         break;
       }
@@ -700,12 +1315,12 @@ async function diagnoseWatchedFile(file: string, content: string): Promise<Watch
       }
       const last = stack.pop();
       if (last !== tag) {
-        issues.push({ severity: "error", message: `Possible tag mismatch: expected </${last || "none"}> but found </${tag}>.` });
+        issues.push({ severity: "error", message: `Possible tag mismatch: expected </${last || "none"}> but found </${tag}>.`, source: "lightweight" });
         break;
       }
     }
     if (stack.length) {
-      issues.push({ severity: "error", message: `Possible unclosed tag: <${stack[stack.length - 1]}>.` });
+      issues.push({ severity: "error", message: `Possible unclosed tag: <${stack[stack.length - 1]}>.`, source: "lightweight" });
     }
 
     for (const match of content.matchAll(/<link[^>]+href=["']([^"']+\.css(?:\?[^"']*)?)["'][^>]*>/gi)) {
@@ -713,7 +1328,7 @@ async function diagnoseWatchedFile(file: string, content: string): Promise<Watch
       if (/^(https?:)?\/\//i.test(href) || href.startsWith("/") || href.startsWith("#")) continue;
       const cssPath = path.resolve(path.dirname(file), href);
       if (!(await fileExists(cssPath))) {
-        issues.push({ severity: "error", message: `Linked stylesheet was not found: ${href}.` });
+        issues.push({ severity: "error", message: `Linked stylesheet was not found: ${href}.`, source: "lightweight" });
       }
     }
   }
@@ -722,11 +1337,15 @@ async function diagnoseWatchedFile(file: string, content: string): Promise<Watch
     const openCount = (content.match(/\{/g) || []).length;
     const closeCount = (content.match(/\}/g) || []).length;
     if (openCount !== closeCount) {
-      issues.push({ severity: "error", message: `CSS brace mismatch: ${openCount} "{" and ${closeCount} "}".` });
+      issues.push({ severity: "error", message: `CSS brace mismatch: ${openCount} "{" and ${closeCount} "}".`, source: "lightweight" });
     }
   }
 
-  if ([".ts", ".tsx", ".js", ".jsx", ".cjs", ".mjs", ".cs", ".java", ".php", ".go", ".rs", ".cpp", ".c", ".h"].includes(extension)) {
+  if ([".js", ".cjs", ".mjs"].includes(extension)) {
+    issues.push(...(await diagnoseNodeSyntax(file)));
+  }
+
+  if ([".ts", ".tsx", ".jsx", ".cs", ".java", ".php", ".go", ".rs", ".cpp", ".c", ".h"].includes(extension)) {
     const languageLabel =
       extension === ".cs"
         ? "C#"
@@ -790,6 +1409,7 @@ async function scanProjectStructuralIssues(limit = 80) {
     severity: WatchIssue["severity"];
     line?: number;
     message: string;
+    source?: "parser" | "compiler" | "lightweight";
     code?: string;
   }> = [];
 
@@ -807,6 +1427,7 @@ async function scanProjectStructuralIssues(limit = 80) {
         severity: issue.severity,
         line: issue.line,
         message: issue.message,
+        source: issue.source || "lightweight",
         code: lineText(content, issue.line),
       });
       if (issues.length >= limit) break;
@@ -915,7 +1536,7 @@ function classifyProjectFile(file: string) {
 
   if (/^(app|pages|src|components)\//.test(relative) && /\.(tsx|jsx|ts|js|html)$/i.test(file)) return "frontend";
   if (/api|route\.(ts|js)|server\.(ts|js)|controller|webhook/i.test(relative)) return "api";
-  if (/payfix-agent|agent|server\.(ts|js)/i.test(relative)) return "agent";
+  if (/(^|\/)(agents?|ai|copilot|assistant)(\/|$)|server\.(ts|js)/i.test(relative)) return "agent";
   if ([".css", ".scss", ".sass"].includes(ext) || /tailwind|globals/i.test(relative)) return "styles";
   if (/test|spec|__tests__/i.test(relative)) return "tests";
   if (/package\.json|tsconfig|next\.config|vite\.config|eslint|\.env|lock/i.test(relative)) return "config";
@@ -1071,11 +1692,55 @@ function buildUpdatedContent({
   return `${oldContent.trimEnd()}\n\n${newContent.trim()}\n`;
 }
 
+async function findLocalJavaHome() {
+  const candidates = [
+    process.env.JAVA_HOME || "",
+    "C:\\Program Files\\Android\\Android Studio\\jbr",
+    "C:\\Program Files\\Android\\Android Studio\\jre",
+    "C:\\Program Files\\Java\\jdk-21",
+    "C:\\Program Files\\Java\\jdk-17",
+  ].filter(Boolean);
+
+  for (const candidate of candidates) {
+    const javaExe = process.platform === "win32"
+      ? path.join(candidate, "bin", "java.exe")
+      : path.join(candidate, "bin", "java");
+    if (await fileExists(javaExe)) return candidate;
+  }
+
+  if (process.platform === "win32") {
+    const discovered = await fg(
+      ["Android/Android Studio*/jbr/bin/java.exe", "Android/Android Studio*/jre/bin/java.exe", "Java/jdk*/bin/java.exe"],
+      {
+        cwd: "C:/Program Files",
+        absolute: true,
+        onlyFiles: true,
+        suppressErrors: true,
+        deep: 5,
+      },
+    );
+    const javaExe = discovered[0];
+    if (javaExe) return path.dirname(path.dirname(javaExe));
+  }
+
+  return "";
+}
+
 async function runProjectCommand(command: string, args: string[]) {
   const displayCommand = [command, ...args]
     .map((part) => (/[\s"]/g.test(part) ? `"${part.replace(/"/g, '\\"')}"` : part))
     .join(" ");
   const needsWindowsCommandShell = process.platform === "win32" && /\.(cmd|bat)$/i.test(command);
+  const env = { ...process.env };
+  const isGradleCommand = /(?:^|[\\/])gradlew(?:\.bat)?$/i.test(command) || /(?:^|[\\/])gradle(?:\.cmd)?$/i.test(command) || /^gradle(?:\.cmd)?$/i.test(command);
+  if (isGradleCommand && !env.JAVA_HOME) {
+    const javaHome = await findLocalJavaHome();
+    if (javaHome) {
+      env.JAVA_HOME = javaHome;
+      env.PATH = `${path.join(javaHome, "bin")}${path.delimiter}${env.PATH || ""}`;
+    }
+  }
+  const environmentNote = isGradleCommand && env.JAVA_HOME ? `PayFix using JAVA_HOME=${env.JAVA_HOME}` : "";
 
   try {
     const result = await execFileAsync(command, args, {
@@ -1084,12 +1749,13 @@ async function runProjectCommand(command: string, args: string[]) {
       windowsHide: true,
       maxBuffer: 1024 * 1024,
       shell: needsWindowsCommandShell,
+      env,
     });
 
     return {
       ok: true,
       command: displayCommand,
-      output: `${result.stdout || ""}${result.stderr || ""}`.trim(),
+      output: `${environmentNote ? `${environmentNote}\n` : ""}${result.stdout || ""}${result.stderr || ""}`.trim(),
     };
   } catch (err: unknown) {
     const maybe = err as {
@@ -1101,7 +1767,7 @@ async function runProjectCommand(command: string, args: string[]) {
     return {
       ok: false,
       command: displayCommand,
-      output: `${maybe.stdout || ""}${maybe.stderr || ""}${maybe.message || ""}`.trim(),
+      output: `${environmentNote ? `${environmentNote}\n` : ""}${maybe.stdout || ""}${maybe.stderr || ""}${maybe.message || ""}`.trim(),
     };
   }
 }
@@ -1109,6 +1775,12 @@ async function runProjectCommand(command: string, args: string[]) {
 async function commandExists(command: string) {
   if (path.isAbsolute(command)) {
     return fileExists(command);
+  }
+
+  if (/^java(?:\.exe)?$/i.test(command) || /^javac(?:\.exe)?$/i.test(command)) {
+    const javaHome = await findLocalJavaHome();
+    const exeName = /^javac/i.test(command) ? (process.platform === "win32" ? "javac.exe" : "javac") : (process.platform === "win32" ? "java.exe" : "java");
+    if (javaHome && (await fileExists(path.join(javaHome, "bin", exeName)))) return true;
   }
 
   const lookupCommand = process.platform === "win32" ? "where.exe" : "which";
@@ -1127,6 +1799,36 @@ async function commandExists(command: string) {
   }
 }
 
+async function commandVersion(command: string, args = ["--version"]) {
+  if (!(await commandExists(command))) return "";
+
+  try {
+    let executable = command;
+    const env = { ...process.env };
+    if (/^java(?:\.exe)?$/i.test(command) || /^javac(?:\.exe)?$/i.test(command)) {
+      const javaHome = await findLocalJavaHome();
+      const exeName = /^javac/i.test(command) ? (process.platform === "win32" ? "javac.exe" : "javac") : (process.platform === "win32" ? "java.exe" : "java");
+      if (javaHome) {
+        executable = path.join(javaHome, "bin", exeName);
+        env.JAVA_HOME = javaHome;
+        env.PATH = `${path.join(javaHome, "bin")}${path.delimiter}${env.PATH || ""}`;
+      }
+    }
+    const result = await execFileAsync(executable, args, {
+      cwd: allowedRoot || process.cwd(),
+      timeout: 6000,
+      windowsHide: true,
+      maxBuffer: 1024 * 64,
+      shell: process.platform === "win32" && /\.(cmd|bat)$/i.test(executable),
+      env,
+    });
+
+    return `${result.stdout || ""}${result.stderr || ""}`.trim().split(/\r?\n/)[0] || "available";
+  } catch {
+    return "available";
+  }
+}
+
 async function runProjectCommandIfAvailable(
   command: string,
   args: string[],
@@ -1139,6 +1841,202 @@ async function runProjectCommandIfAvailable(
   }
 
   return runProjectCommand(command, args);
+}
+
+function splitSimpleProjectCommand(command: string) {
+  const trimmed = command.trim();
+  if (!trimmed || /[;&|<>]/.test(trimmed)) return null;
+  const parts = trimmed.match(/"[^"]+"|'[^']+'|\S+/g)?.map((part) => part.replace(/^["']|["']$/g, "")) || [];
+  return parts.length ? parts : null;
+}
+
+async function readPayfixPyprojectCommand(name: "start" | "check") {
+  const pyprojectPath = path.join(allowedRoot, "pyproject.toml");
+  if (!(await fileExists(pyprojectPath))) return "";
+
+  const content = await fs.readFile(pyprojectPath, "utf8");
+  return content.match(new RegExp(`^\\s*${name}\\s*=\\s*["']([^"']+)["']`, "m"))?.[1] || "";
+}
+
+async function hasPythonProject() {
+  if (
+    (await fileExists(path.join(allowedRoot, "pyproject.toml"))) ||
+    (await fileExists(path.join(allowedRoot, "requirements.txt"))) ||
+    (await fileExists(path.join(allowedRoot, "setup.py")))
+  ) {
+    return true;
+  }
+
+  const files = await fg(["**/*.py", ...projectIgnoreGlobs], {
+    cwd: allowedRoot,
+    absolute: false,
+    onlyFiles: true,
+    suppressErrors: true,
+  });
+  return files.length > 0;
+}
+
+async function runPythonProjectChecks(
+  checks: string[],
+  commands: Awaited<ReturnType<typeof runProjectCommand>>[],
+  skipped: string[],
+) {
+  if (!(await hasPythonProject())) return;
+
+  const pythonCommand = process.platform === "win32" ? "python.exe" : "python";
+
+  if (checks.includes("check") || checks.includes("python")) {
+    const compile = await runProjectCommandIfAvailable(
+      pythonCommand,
+      ["-m", "compileall", "-q", "."],
+      skipped,
+      "Python compile check",
+    );
+    if (compile) commands.push(compile);
+
+    const configuredCheck = await readPayfixPyprojectCommand("check");
+    const smokeCheck = await fileExists(path.join(allowedRoot, "scripts", "smoke_check.py"))
+      ? "python scripts/smoke_check.py"
+      : "";
+    const checkCommand = configuredCheck || smokeCheck;
+    const parts = checkCommand ? splitSimpleProjectCommand(checkCommand) : null;
+    if (parts) {
+      const [command, ...args] = parts;
+      const runnable = /^python(?:\.exe|3)?$/i.test(command) ? pythonCommand : command;
+      const result = await runProjectCommandIfAvailable(runnable, args, skipped, "Python project check");
+      if (result) commands.push(result);
+    } else if (checkCommand) {
+      skipped.push("Python project check skipped: check command uses shell syntax PayFix will not run automatically.");
+    } else {
+      skipped.push("Python project check skipped: no [tool.payfix] check command or scripts/smoke_check.py found.");
+    }
+  }
+
+  if (checks.includes("test")) {
+    const hasTests = (await fg(["tests/**/*.py", "test_*.py", ...projectIgnoreGlobs], {
+      cwd: allowedRoot,
+      absolute: false,
+      onlyFiles: true,
+      suppressErrors: true,
+    })).length > 0;
+    if (hasTests) {
+      const pytest = await runProjectCommandIfAvailable(pythonCommand, ["-m", "pytest"], skipped, "Python tests");
+      if (pytest) commands.push(pytest);
+    } else {
+      skipped.push("Python tests skipped: no obvious Python tests found.");
+    }
+  }
+
+  if (checks.includes("lint")) {
+    const ruff = await runProjectCommandIfAvailable("ruff", ["check", "."], skipped, "Python linting");
+    if (ruff) commands.push(ruff);
+  }
+}
+
+async function runCrossLanguageProjectChecks(
+  checks: string[],
+  commands: Awaited<ReturnType<typeof runProjectCommand>>[],
+  skipped: string[],
+) {
+  if (await fileExists(path.join(allowedRoot, "go.mod"))) {
+    if (checks.includes("test") || checks.includes("check") || checks.includes("go")) {
+      const goTest = await runProjectCommandIfAvailable("go", ["test", "./..."], skipped, "Go tests");
+      if (goTest) commands.push(goTest);
+    }
+    if (checks.includes("lint") || checks.includes("go")) {
+      const goVet = await runProjectCommandIfAvailable("go", ["vet", "./..."], skipped, "Go vet");
+      if (goVet) commands.push(goVet);
+    }
+  }
+
+  if (await fileExists(path.join(allowedRoot, "Cargo.toml"))) {
+    if (checks.includes("check") || checks.includes("build") || checks.includes("rust")) {
+      const cargoCheck = await runProjectCommandIfAvailable("cargo", ["check"], skipped, "Rust check");
+      if (cargoCheck) commands.push(cargoCheck);
+    }
+    if (checks.includes("test") || checks.includes("rust")) {
+      const cargoTest = await runProjectCommandIfAvailable("cargo", ["test"], skipped, "Rust tests");
+      if (cargoTest) commands.push(cargoTest);
+    }
+    if (checks.includes("lint") || checks.includes("rust")) {
+      const clippy = await runProjectCommandIfAvailable("cargo", ["clippy", "--", "-D", "warnings"], skipped, "Rust Clippy");
+      if (clippy) commands.push(clippy);
+    }
+  }
+
+  if (await fileExists(path.join(allowedRoot, "pom.xml"))) {
+    const mvn = windowsCommand("mvn");
+    if (checks.includes("build") || checks.includes("check") || checks.includes("java")) {
+      const compile = await runProjectCommandIfAvailable(mvn, ["-q", "-DskipTests", "compile"], skipped, "Maven compile");
+      if (compile) commands.push(compile);
+    }
+    if (checks.includes("test") || checks.includes("java")) {
+      const test = await runProjectCommandIfAvailable(mvn, ["-q", "test"], skipped, "Maven tests");
+      if (test) commands.push(test);
+    }
+  } else if (
+    (await fileExists(path.join(allowedRoot, "build.gradle"))) ||
+    (await fileExists(path.join(allowedRoot, "build.gradle.kts"))) ||
+    (await fileExists(path.join(allowedRoot, "settings.gradle"))) ||
+    (await fileExists(path.join(allowedRoot, "settings.gradle.kts"))) ||
+    (await fileExists(path.join(allowedRoot, "app", "build.gradle"))) ||
+    (await fileExists(path.join(allowedRoot, "app", "build.gradle.kts")))
+  ) {
+    const gradle = await findGradleCommand();
+    if (checks.includes("build") || checks.includes("check") || checks.includes("java")) {
+      const build = await runProjectCommandIfAvailable(gradle, ["build"], skipped, "Gradle build");
+      if (build) commands.push(build);
+    }
+    if (checks.includes("test") || checks.includes("java")) {
+      const test = await runProjectCommandIfAvailable(gradle, ["test"], skipped, "Gradle tests");
+      if (test) commands.push(test);
+    }
+  }
+
+  if (await fileExists(path.join(allowedRoot, "composer.json"))) {
+    if (checks.includes("check") || checks.includes("php")) {
+      const validate = await runProjectCommandIfAvailable("composer", ["validate", "--no-check-publish"], skipped, "Composer validate");
+      if (validate) commands.push(validate);
+    }
+    if (checks.includes("test") || checks.includes("php")) {
+      const test = await runProjectCommandIfAvailable("composer", ["test"], skipped, "Composer tests");
+      if (test) commands.push(test);
+    }
+  }
+
+  if (await fileExists(path.join(allowedRoot, "Gemfile"))) {
+    if (checks.includes("test") || checks.includes("ruby")) {
+      const test = await runProjectCommandIfAvailable("bundle", ["exec", "rake", "test"], skipped, "Ruby tests");
+      if (test) commands.push(test);
+    }
+    if (checks.includes("lint") || checks.includes("ruby")) {
+      const rubocop = await runProjectCommandIfAvailable("bundle", ["exec", "rubocop"], skipped, "Ruby RuboCop");
+      if (rubocop) commands.push(rubocop);
+    }
+  }
+
+  if (await fileExists(path.join(allowedRoot, "pubspec.yaml"))) {
+    const runner = await commandExists("flutter") ? "flutter" : "dart";
+    if (checks.includes("lint") || checks.includes("check") || checks.includes("dart")) {
+      const analyze = await runProjectCommandIfAvailable(runner, ["analyze"], skipped, "Dart/Flutter analyze");
+      if (analyze) commands.push(analyze);
+    }
+    if (checks.includes("test") || checks.includes("dart")) {
+      const test = await runProjectCommandIfAvailable(runner, ["test"], skipped, "Dart/Flutter tests");
+      if (test) commands.push(test);
+    }
+  }
+
+  if (await fileExists(path.join(allowedRoot, "Package.swift"))) {
+    if (checks.includes("build") || checks.includes("check") || checks.includes("swift")) {
+      const build = await runProjectCommandIfAvailable("swift", ["build"], skipped, "Swift build");
+      if (build) commands.push(build);
+    }
+    if (checks.includes("test") || checks.includes("swift")) {
+      const test = await runProjectCommandIfAvailable("swift", ["test"], skipped, "Swift tests");
+      if (test) commands.push(test);
+    }
+  }
 }
 
 function windowsCommand(command: string) {
@@ -1168,6 +2066,10 @@ async function addLanguageValidationCommands(
     commands.push(await runProjectCommand(npxCommand, ["tsc", "--noEmit"]));
   } else if (/\.(ts|tsx)$/i.test(file)) {
     skipped.push("TypeScript type check skipped: package.json or tsconfig.json was not found.");
+  }
+
+  if (/\.(js|mjs|cjs)$/i.test(file)) {
+    commands.push(await runProjectCommand(process.execPath, ["--check", relativeFile]));
   }
 
   if (hasPackageJson && /\.(ts|tsx|js|jsx|mjs|cjs)$/i.test(file)) {
@@ -1323,6 +2225,238 @@ async function findDotnetTarget() {
   });
 
   return dotnetFiles.find((file) => /\.sln$/i.test(file)) || dotnetFiles[0] || "";
+}
+
+type ToolchainItem = {
+  id: string;
+  label: string;
+  detected: boolean;
+  available: boolean;
+  requiredCommands: string[];
+  availableCommands: string[];
+  missingCommands: string[];
+  version?: string;
+  installHint: string;
+  installCommand?: string;
+  installUrl?: string;
+};
+
+async function projectToolchainDoctor() {
+  if (!allowedRoot) throw new Error("No project folder selected.");
+
+  const files = (await listAllProjectFiles()).map((file) => relativeProjectPath(file).replace(/\\/g, "/"));
+  const has = (pattern: RegExp) => files.some((file) => pattern.test(file));
+  const packageJson = await readPackageJsonSafe();
+  const packageScripts = ((packageJson?.scripts as Record<string, string>) || {});
+  const hasPackageJson = Boolean(packageJson);
+  const toolchains: Array<{
+    id: string;
+    label: string;
+    detected: boolean;
+    commands: string[];
+    versionCommand?: string;
+    versionArgs?: string[];
+    installHint: string;
+    installCommand?: string;
+    installUrl?: string;
+  }> = [
+    {
+      id: "node",
+      label: "Node.js / JavaScript / TypeScript",
+      detected: hasPackageJson || has(/\.(js|jsx|ts|tsx|mjs|cjs)$/i),
+      commands: ["node", "npm"],
+      versionCommand: "node",
+      installHint: "Install Node.js LTS. PayFix uses node/npm/npx for JS and TS validation.",
+      installCommand: "winget install OpenJS.NodeJS.LTS",
+      installUrl: "https://nodejs.org/",
+    },
+    {
+      id: "python",
+      label: "Python",
+      detected: has(/(^|\/)(pyproject\.toml|requirements\.txt|setup\.py|Pipfile)$/i) || has(/\.py$/i),
+      commands: ["python"],
+      versionCommand: "python",
+      installHint: "Install Python and add it to PATH. Optional validators: ruff and mypy.",
+      installCommand: "winget install Python.Python.3.13",
+      installUrl: "https://www.python.org/downloads/",
+    },
+    {
+      id: "dotnet",
+      label: ".NET / C#",
+      detected: has(/\.(sln|csproj|cs)$/i),
+      commands: ["dotnet"],
+      versionCommand: "dotnet",
+      installHint: "Install the .NET SDK so PayFix can run dotnet build/test.",
+      installCommand: "winget install Microsoft.DotNet.SDK.9",
+      installUrl: "https://dotnet.microsoft.com/download",
+    },
+    {
+      id: "go",
+      label: "Go",
+      detected: has(/(^|\/)go\.mod$/i) || has(/\.go$/i),
+      commands: ["go"],
+      versionCommand: "go",
+      versionArgs: ["version"],
+      installHint: "Install Go so PayFix can run go test and go vet.",
+      installCommand: "winget install GoLang.Go",
+      installUrl: "https://go.dev/dl/",
+    },
+    {
+      id: "rust",
+      label: "Rust",
+      detected: has(/(^|\/)Cargo\.toml$/i) || has(/\.rs$/i),
+      commands: ["cargo", "rustc"],
+      versionCommand: "rustc",
+      installHint: "Install Rust via rustup so PayFix can run cargo check and clippy.",
+      installCommand: "winget install Rustlang.Rustup",
+      installUrl: "https://rustup.rs/",
+    },
+    {
+      id: "java",
+      label: "Java / Kotlin",
+      detected: has(/(^|\/)(pom\.xml|build\.gradle|build\.gradle\.kts)$/i) || has(/\.(java|kt|kts)$/i),
+      commands: ["java", "javac"],
+      versionCommand: "java",
+      installHint: "Install a JDK. Maven or Gradle are also needed if the project uses pom.xml or build.gradle.",
+      installCommand: "winget install EclipseAdoptium.Temurin.21.JDK",
+      installUrl: "https://adoptium.net/",
+    },
+    {
+      id: "php",
+      label: "PHP",
+      detected: has(/(^|\/)composer\.json$/i) || has(/\.(php|phtml)$/i),
+      commands: ["php"],
+      versionCommand: "php",
+      installHint: "Install PHP. Install Composer too for composer.json projects.",
+      installCommand: "winget install PHP.PHP",
+      installUrl: "https://www.php.net/downloads.php",
+    },
+    {
+      id: "ruby",
+      label: "Ruby",
+      detected: has(/(^|\/)(Gemfile|\.ruby-version)$/i) || has(/\.(rb|rake)$/i),
+      commands: ["ruby"],
+      versionCommand: "ruby",
+      installHint: "Install Ruby. Bundler is needed for Gemfile projects.",
+      installCommand: "winget install RubyInstallerTeam.RubyWithDevKit.3.3",
+      installUrl: "https://rubyinstaller.org/",
+    },
+    {
+      id: "cpp",
+      label: "C / C++ / Objective-C",
+      detected: has(/\.(c|cc|cpp|cxx|h|hpp|m|mm)$/i),
+      commands: ["clang"],
+      versionCommand: "clang",
+      installHint: "Install LLVM/Clang or Visual Studio Build Tools so PayFix can run syntax checks.",
+      installCommand: "winget install LLVM.LLVM",
+      installUrl: "https://visualstudio.microsoft.com/visual-cpp-build-tools/",
+    },
+    {
+      id: "dart",
+      label: "Dart / Flutter",
+      detected: has(/(^|\/)pubspec\.yaml$/i) || has(/\.dart$/i),
+      commands: ["dart"],
+      versionCommand: "dart",
+      installHint: "Install Dart or Flutter so PayFix can run analyze.",
+      installCommand: "winget install Dart.Dart",
+      installUrl: "https://dart.dev/get-dart",
+    },
+  ];
+
+  const detected = toolchains.filter((toolchain) => toolchain.detected);
+  const items: ToolchainItem[] = [];
+
+  for (const toolchain of detected) {
+    const commandStatuses = await Promise.all(toolchain.commands.map(async (command) => ({
+      command,
+      available: await commandExists(command),
+    })));
+    const availableCommands = commandStatuses.filter((item) => item.available).map((item) => item.command);
+    const missingCommands = commandStatuses.filter((item) => !item.available).map((item) => item.command);
+    const version = toolchain.versionCommand && availableCommands.includes(toolchain.versionCommand)
+      ? await commandVersion(toolchain.versionCommand, toolchain.versionArgs || ["--version"])
+      : "";
+
+    items.push({
+      id: toolchain.id,
+      label: toolchain.label,
+      detected: true,
+      available: missingCommands.length === 0,
+      requiredCommands: toolchain.commands,
+      availableCommands,
+      missingCommands,
+      version,
+      installHint: toolchain.installHint,
+      installCommand: toolchain.installCommand,
+      installUrl: toolchain.installUrl,
+    });
+  }
+
+  if (has(/(^|\/)pom\.xml$/i)) {
+    const available = await commandExists(windowsCommand("mvn"));
+    items.push({
+      id: "maven",
+      label: "Maven",
+      detected: true,
+      available,
+      requiredCommands: ["mvn"],
+      availableCommands: available ? ["mvn"] : [],
+      missingCommands: available ? [] : ["mvn"],
+      version: available ? await commandVersion(windowsCommand("mvn"), ["-version"]) : "",
+      installHint: "Install Maven so PayFix can compile Maven Java projects.",
+      installCommand: "winget install Apache.Maven",
+      installUrl: "https://maven.apache.org/install.html",
+    });
+  }
+
+  if (has(/(^|\/)build\.gradle(\.kts)?$/i)) {
+    const localGradle = process.platform === "win32" ? "gradlew.bat" : "gradlew";
+    const hasWrapper = await fileExists(path.join(allowedRoot, localGradle));
+    const available = hasWrapper || await commandExists(windowsCommand("gradle"));
+    items.push({
+      id: "gradle",
+      label: "Gradle",
+      detected: true,
+      available,
+      requiredCommands: hasWrapper ? [localGradle] : ["gradle"],
+      availableCommands: available ? [hasWrapper ? localGradle : "gradle"] : [],
+      missingCommands: available ? [] : ["gradle"],
+      version: available && !hasWrapper ? await commandVersion(windowsCommand("gradle"), ["--version"]) : hasWrapper ? "Gradle wrapper present" : "",
+      installHint: "Install Gradle or add a Gradle wrapper so PayFix can build Gradle projects.",
+      installCommand: "winget install Gradle.Gradle",
+      installUrl: "https://gradle.org/install/",
+    });
+  }
+
+  if (has(/(^|\/)composer\.json$/i)) {
+    const available = await commandExists("composer");
+    items.push({
+      id: "composer",
+      label: "Composer",
+      detected: true,
+      available,
+      requiredCommands: ["composer"],
+      availableCommands: available ? ["composer"] : [],
+      missingCommands: available ? [] : ["composer"],
+      version: available ? await commandVersion("composer", ["--version"]) : "",
+      installHint: "Install Composer so PayFix can install and validate PHP dependencies.",
+      installCommand: "winget install Composer.Composer",
+      installUrl: "https://getcomposer.org/download/",
+    });
+  }
+
+  const missing = items.filter((item) => !item.available);
+  const unavailableValidation = missing.map((item) => `${item.label}: missing ${item.missingCommands.join(", ")}`);
+
+  return {
+    ok: true,
+    root: allowedRoot,
+    detectedLanguages: items.map((item) => item.label),
+    items,
+    missing,
+    unavailableValidation,
+    packageScripts,
+  };
 }
 
 async function runPowerShellJson(script: string) {
@@ -1727,10 +2861,110 @@ async function detectPackageManager(root: string) {
   return "npm";
 }
 
-function safePackageName(name: string) {
+function safeProjectPackageName(root: string) {
+  const fallback = path.basename(root || "payfix-project").toLowerCase();
+  const cleaned = fallback.replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
+  return cleaned || "payfix-project";
+}
+
+async function ensureInstallMetadata(ecosystem: string, packageManager: string) {
+  const commands: Awaited<ReturnType<typeof runProjectCommand>>[] = [];
+
+  if (ecosystem === "node") {
+    const packageJsonPath = path.join(allowedRoot, "package.json");
+    if (!(await fileExists(packageJsonPath))) {
+      const commandName = packageManager === "pnpm" ? "pnpm" : packageManager === "yarn" ? "yarn" : "npm";
+      const command = windowsCommand(commandName);
+      const args = packageManager === "yarn" ? ["init", "-y"] : ["init", "-y"];
+      commands.push(await runProjectCommand(command, args));
+    }
+  }
+
+  if (ecosystem === "go" && !(await fileExists(path.join(allowedRoot, "go.mod")))) {
+    commands.push(await runProjectCommand("go", ["mod", "init", safeProjectPackageName(allowedRoot)]));
+  }
+
+  if (ecosystem === "rust" && !(await fileExists(path.join(allowedRoot, "Cargo.toml")))) {
+    commands.push(await runProjectCommand("cargo", ["init", "--vcs", "none", "--name", safeProjectPackageName(allowedRoot)]));
+  }
+
+  if (ecosystem === "php" && !(await fileExists(path.join(allowedRoot, "composer.json")))) {
+    commands.push(await runProjectCommand("composer", ["init", "--no-interaction", "--name", `local/${safeProjectPackageName(allowedRoot)}`]));
+  }
+
+  if (ecosystem === "ruby" && !(await fileExists(path.join(allowedRoot, "Gemfile")))) {
+    commands.push(await runProjectCommand("bundle", ["init"]));
+  }
+
+  const failed = commands.find((command) => !command.ok);
+  return {
+    ok: !failed,
+    commands,
+    command: commands.map((command) => command.command).join(" && "),
+    output: commands.map((command) => command.output).filter(Boolean).join("\n\n"),
+  };
+}
+
+function dependencyNameKey(name: string) {
+  return name.trim().toLowerCase().replace(/_/g, "-");
+}
+
+function pythonDependencyNameFromLine(line: string) {
+  return dependencyNameKey(line.trim().replace(/^["']|["'],?$/g, "").match(/^([A-Za-z0-9_.-]+)/)?.[1] || "");
+}
+
+async function updatePythonDependencyMetadata(packageNames: string[]) {
+  const pyprojectPath = path.join(allowedRoot, "pyproject.toml");
+  const requirementsPath = path.join(allowedRoot, "requirements.txt");
+  const normalizedPackages = [...new Set(packageNames.map(dependencyNameKey).filter(Boolean))];
+
+  if (await fileExists(pyprojectPath)) {
+    const original = await fs.readFile(pyprojectPath, "utf8");
+    const declared = new Set(
+      [...original.matchAll(/^\s*["']([^"']+)["']\s*,?\s*$/gm)].map((match) =>
+        pythonDependencyNameFromLine(match[1] || ""),
+      ),
+    );
+    const missing = normalizedPackages.filter((packageName) => !declared.has(packageName));
+    if (!missing.length) {
+      return { updated: false, file: relativeProjectPath(pyprojectPath), added: [] as string[] };
+    }
+
+    let next = original;
+    const dependencyBlock = next.match(/(^dependencies\s*=\s*\[\s*$)([\s\S]*?)(^\]\s*$)/m);
+    if (dependencyBlock?.index !== undefined) {
+      const insert = missing.map((packageName) => `  "${packageName}",`).join("\n");
+      next = `${next.slice(0, dependencyBlock.index)}${dependencyBlock[1]}${dependencyBlock[2]}${dependencyBlock[2].trim() ? "\n" : ""}${insert}\n${dependencyBlock[3]}${next.slice(dependencyBlock.index + dependencyBlock[0].length)}`;
+    } else if (/^\[project\]\s*$/m.test(next)) {
+      const insert = `\ndependencies = [\n${missing.map((packageName) => `  "${packageName}",`).join("\n")}\n]`;
+      next = next.replace(/^\[project\]\s*$/m, `[project]${insert}`);
+    } else {
+      next = `[project]\ndependencies = [\n${missing.map((packageName) => `  "${packageName}",`).join("\n")}\n]\n\n${next}`;
+    }
+
+    await fs.writeFile(pyprojectPath, next, "utf8");
+    return { updated: true, file: relativeProjectPath(pyprojectPath), added: missing };
+  }
+
+  if (await fileExists(requirementsPath)) {
+    const original = await fs.readFile(requirementsPath, "utf8");
+    const declared = new Set(original.split(/\r?\n/).map(pythonDependencyNameFromLine).filter(Boolean));
+    const missing = normalizedPackages.filter((packageName) => !declared.has(packageName));
+    if (!missing.length) {
+      return { updated: false, file: relativeProjectPath(requirementsPath), added: [] as string[] };
+    }
+
+    await fs.writeFile(requirementsPath, `${original.trimEnd()}\n${missing.join("\n")}\n`, "utf8");
+    return { updated: true, file: relativeProjectPath(requirementsPath), added: missing };
+  }
+
+  return { updated: false, file: "", added: [] as string[] };
+}
+
+function safeInstallPackageName(name: string) {
   const trimmed = name.trim();
 
-  if (!/^(@[a-z0-9._-]+\/)?[a-z0-9._-]+$/i.test(trimmed)) {
+  if (!/^[A-Za-z0-9@._/-]+$/.test(trimmed) || trimmed.startsWith(".") || trimmed.includes("..")) {
     throw new Error("Invalid package name.");
   }
 
@@ -1822,6 +3056,10 @@ async function inferProjectRootsFromProcessClues(port: number, processes: { comm
       const matchedPath = match[0].trim();
       if (matchedPath.length > 3) pathMatches.add(matchedPath);
     }
+    for (const match of text.matchAll(/\/(?:Users|home|Volumes|opt|workspace|srv)\/[^"'<>|]+?(?=\s|$|")/g)) {
+      const matchedPath = match[0].trim();
+      if (matchedPath.length > 3) pathMatches.add(matchedPath);
+    }
   }
 
   const roots = new Map<string, Awaited<ReturnType<typeof packageRootInfo>>>();
@@ -1875,12 +3113,28 @@ async function scanLikelyProjectRoots(port: number) {
 }
 
 async function listeningProcessInfo(port: number) {
-  if (process.platform !== "win32") {
+  if (process.platform !== "win32" && process.platform !== "darwin" && process.platform !== "linux") {
     return {
       ok: false,
-      error: "Port to project resolver currently supports Windows process inspection only.",
+      error: "Port to project resolver is not supported on this operating system yet.",
       port,
       processes: [],
+    };
+  }
+
+  if (process.platform !== "win32") {
+    const { stdout } = await execFileAsync("lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-FpPc"], {
+      timeout: 10000,
+      maxBuffer: 1024 * 256,
+    });
+    const processes = parseLsofProcessRows(stdout);
+    const enriched = await enrichUnixProcesses(processes.map((item) => item.processId).filter(Boolean) as number[]);
+
+    return {
+      ok: true,
+      port,
+      connectionCount: processes.length,
+      processes: enriched.length ? enriched : processes,
     };
   }
 
@@ -1929,6 +3183,322 @@ foreach ($connection in $connections) {
   return runPowerShellJson(script);
 }
 
+function processLooksLikeDevServer(processInfo: { name?: string; commandLine?: string; executablePath?: string }) {
+  const text = `${processInfo.name || ""} ${processInfo.commandLine || ""} ${processInfo.executablePath || ""}`;
+  return /\b(node|npm|pnpm|yarn|next|vite|react-scripts|ng|astro|nuxt|remix|dotnet|python|uvicorn|flask|django|php|artisan|ruby|rails|cargo|tauri)\b/i.test(
+    text
+  );
+}
+
+function parseLsofProcessRows(output: string) {
+  const rows: Array<{ processId?: number; name?: string; commandLine?: string; executablePath?: string; port?: number; localAddress?: string }> = [];
+  let current: { processId?: number; name?: string; commandLine?: string; executablePath?: string; port?: number; localAddress?: string } | null = null;
+
+  for (const line of output.split(/\r?\n/)) {
+    if (!line) continue;
+    const type = line[0];
+    const value = line.slice(1);
+
+    if (type === "p") {
+      if (current?.processId && current.port) rows.push(current);
+      current = { processId: Number(value) || undefined };
+      continue;
+    }
+
+    if (!current) continue;
+    if (type === "c") current.name = value;
+    if (type === "n") {
+      const portMatch = value.match(/(?:^|:)(\d+)(?:\s|\(|$)/);
+      current.port = portMatch ? Number(portMatch[1]) : current.port;
+      current.localAddress = value.split("->")[0]?.trim();
+    }
+  }
+
+  if (current?.processId && current.port) rows.push(current);
+  return rows;
+}
+
+async function enrichUnixProcesses(pids: number[]) {
+  const uniquePids = [...new Set(pids.filter((pid) => Number.isInteger(pid) && pid > 0))];
+  if (!uniquePids.length) return [];
+
+  const { stdout } = await execFileAsync("ps", ["-o", "pid=,ppid=,comm=,command=", "-p", uniquePids.join(",")], {
+    timeout: 10000,
+    maxBuffer: 1024 * 512,
+  });
+
+  return stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const match = line.match(/^(\d+)\s+(\d+)\s+(\S+)\s+([\s\S]+)$/);
+      return {
+        processId: match ? Number(match[1]) : undefined,
+        parentProcessId: match ? Number(match[2]) : undefined,
+        name: match?.[3],
+        executablePath: match?.[3],
+        commandLine: match?.[4] || line,
+      };
+    });
+}
+
+async function listListeningPorts() {
+  if (process.platform !== "win32" && process.platform !== "darwin" && process.platform !== "linux") {
+    return {
+      ok: false,
+      error: "Port manager is not supported on this operating system yet.",
+      ports: [],
+    };
+  }
+
+  if (process.platform !== "win32") {
+    const { stdout } = await execFileAsync("lsof", ["-nP", "-iTCP", "-sTCP:LISTEN", "-FpPcn"], {
+      timeout: 10000,
+      maxBuffer: 1024 * 1024,
+    });
+    const rows = parseLsofProcessRows(stdout);
+    const enriched = await enrichUnixProcesses(rows.map((row) => row.processId).filter(Boolean) as number[]);
+    const byPid = new Map(enriched.map((processInfo) => [processInfo.processId, processInfo]));
+    const byPort = new Map<number, {
+      port: number;
+      localAddresses: string[];
+      processes: Array<{ processId?: number; name?: string; executablePath?: string; commandLine?: string }>;
+      devServerLikely: boolean;
+      currentAgent: boolean;
+      projectCandidates: Awaited<ReturnType<typeof inferProjectRootsFromProcessClues>>;
+    }>();
+
+    for (const row of rows) {
+      const port = Number(row.port || 0);
+      if (!Number.isInteger(port) || port <= 0) continue;
+      const processInfo = byPid.get(row.processId || 0) || row;
+      const item =
+        byPort.get(port) ||
+        {
+          port,
+          localAddresses: row.localAddress ? [row.localAddress] : [],
+          processes: [],
+          devServerLikely: false,
+          currentAgent: port === PORT,
+          projectCandidates: [],
+        };
+
+      if (row.localAddress && !item.localAddresses.includes(row.localAddress)) item.localAddresses.push(row.localAddress);
+      if (!item.processes.some((existing) => existing.processId === processInfo.processId)) item.processes.push(processInfo);
+      item.devServerLikely = item.devServerLikely || processLooksLikeDevServer(processInfo);
+      byPort.set(port, item);
+    }
+
+    const ports = await Promise.all(
+      [...byPort.values()]
+        .sort((left, right) => left.port - right.port)
+        .slice(0, 120)
+        .map(async (item) => ({
+          ...item,
+          projectCandidates: item.devServerLikely
+            ? await inferProjectRootsFromProcessClues(item.port, item.processes).catch(() => [])
+            : [],
+        }))
+    );
+
+    return { ok: true, currentRoot: allowedRoot || null, ports };
+  }
+
+  const script = String.raw`
+$ErrorActionPreference = "SilentlyContinue"
+$connections = @(Get-NetTCPConnection -State Listen | Sort-Object LocalPort, OwningProcess)
+$items = @()
+foreach ($connection in $connections) {
+  $process = Get-CimInstance Win32_Process -Filter "ProcessId=$($connection.OwningProcess)"
+  $items += [pscustomobject]@{
+    port = [int]$connection.LocalPort
+    localAddress = $connection.LocalAddress
+    processId = [int]$connection.OwningProcess
+    name = $process.Name
+    executablePath = $process.ExecutablePath
+    commandLine = $process.CommandLine
+  }
+}
+$items | ConvertTo-Json -Depth 5
+`;
+
+  const raw = await runPowerShellJson(script);
+  const rows = (Array.isArray(raw) ? raw : raw ? [raw] : []) as Array<{
+    port?: number;
+    localAddress?: string;
+    processId?: number;
+    name?: string;
+    executablePath?: string;
+    commandLine?: string;
+  }>;
+  const byPort = new Map<number, {
+    port: number;
+    localAddresses: string[];
+    processes: Array<{ processId?: number; name?: string; executablePath?: string; commandLine?: string }>;
+    devServerLikely: boolean;
+    currentAgent: boolean;
+    projectCandidates: Awaited<ReturnType<typeof inferProjectRootsFromProcessClues>>;
+  }>();
+
+  for (const row of rows) {
+    const port = Number(row.port || 0);
+    if (!Number.isInteger(port) || port <= 0) continue;
+
+    const item =
+      byPort.get(port) ||
+      {
+        port,
+        localAddresses: [],
+        processes: [],
+        devServerLikely: false,
+        currentAgent: port === PORT,
+        projectCandidates: [],
+      };
+
+    if (row.localAddress && !item.localAddresses.includes(row.localAddress)) item.localAddresses.push(row.localAddress);
+    if (!item.processes.some((processInfo) => processInfo.processId === row.processId)) {
+      item.processes.push({
+        processId: row.processId,
+        name: row.name,
+        executablePath: row.executablePath,
+        commandLine: row.commandLine,
+      });
+    }
+    item.devServerLikely = item.devServerLikely || processLooksLikeDevServer(row);
+    byPort.set(port, item);
+  }
+
+  const ports = await Promise.all(
+    [...byPort.values()]
+      .sort((left, right) => left.port - right.port)
+      .slice(0, 120)
+      .map(async (item) => ({
+        ...item,
+        projectCandidates: item.devServerLikely
+          ? await inferProjectRootsFromProcessClues(item.port, item.processes).catch(() => [])
+          : [],
+      }))
+  );
+
+  return {
+    ok: true,
+    currentRoot: allowedRoot || null,
+    ports,
+  };
+}
+
+async function stopListeningPort(port: number) {
+  if (port === PORT) {
+    throw new Error("Refusing to stop PayFix Local Agent's own port 7777 from inside the app.");
+  }
+
+  const processInfo = await listeningProcessInfo(port);
+  if (!processInfo.ok) throw new Error(processInfo.error || "Could not inspect port.");
+  const processes = (processInfo.processes || []) as Array<{ processId?: number; name?: string; commandLine?: string; executablePath?: string }>;
+  const pids = [
+    ...new Set(
+      processes
+        .filter(processLooksLikeDevServer)
+        .map((item) => Number(item.processId || 0))
+        .filter((pid) => Number.isInteger(pid) && pid > 0 && pid !== process.pid)
+    ),
+  ];
+
+  if (!pids.length) {
+    throw new Error("No safe dev-server process was found for this port. PayFix will not stop system-looking processes automatically.");
+  }
+
+  for (const pid of pids) {
+    if (process.platform === "win32") {
+      await execFileAsync("taskkill.exe", ["/PID", String(pid), "/T", "/F"], {
+        windowsHide: true,
+        timeout: 10000,
+        maxBuffer: 1024 * 256,
+      }).catch(() => undefined);
+    } else {
+      process.kill(pid, "SIGTERM");
+    }
+  }
+
+  return { ok: true, port, stoppedProcessIds: pids };
+}
+
+async function startProjectServer(scriptName?: string, port?: number) {
+  if (!allowedRoot) throw new Error("No project folder selected.");
+  const packageJsonPath = path.join(allowedRoot, "package.json");
+  if (!(await fileExists(packageJsonPath))) {
+    throw new Error("Cannot restart a Node dev server because package.json was not found in the connected project.");
+  }
+
+  const packageJson = JSON.parse(await fs.readFile(packageJsonPath, "utf8")) as { scripts?: Record<string, string> };
+  const scripts = packageJson.scripts || {};
+  const chosenScript =
+    scriptName && scripts[scriptName]
+      ? scriptName
+      : ["dev", "start", "serve", "preview"].find((candidate) => scripts[candidate]);
+  if (!chosenScript) {
+    throw new Error("No dev/start/serve/preview script was found in package.json.");
+  }
+
+  const packageManager = await detectPackageManager(allowedRoot);
+  const commandName = packageManager === "pnpm" ? "pnpm" : packageManager === "yarn" ? "yarn" : "npm";
+  const command = windowsCommand(commandName);
+  const args = packageManager === "npm" ? ["run", chosenScript] : [chosenScript];
+  const child = spawn(command, args, {
+    cwd: allowedRoot,
+    detached: true,
+    stdio: "ignore",
+    windowsHide: true,
+    shell: process.platform === "win32" && /\.(cmd|bat)$/i.test(command),
+    env: {
+      ...process.env,
+      ...(port ? { PORT: String(port) } : {}),
+    },
+  });
+  child.unref();
+
+  return {
+    ok: true,
+    root: allowedRoot,
+    packageManager,
+    script: chosenScript,
+    command: [command, ...args].join(" "),
+    processId: child.pid,
+  };
+}
+
+app.get("/system/ports/list", async (_req, res) => {
+  try {
+    res.json(await listListeningPorts());
+  } catch (err: unknown) {
+    res.status(400).json({ ok: false, error: errorMessage(err), ports: [] });
+  }
+});
+
+app.post("/system/ports/stop", async (req, res) => {
+  try {
+    const port = Number(req.body.port);
+    if (!Number.isInteger(port) || port <= 0 || port > 65535) throw new Error("A valid port is required.");
+    res.json(await stopListeningPort(port));
+  } catch (err: unknown) {
+    res.status(400).json({ ok: false, error: errorMessage(err) });
+  }
+});
+
+app.post("/system/ports/restart", async (req, res) => {
+  try {
+    const port = Number(req.body.port);
+    if (!Number.isInteger(port) || port <= 0 || port > 65535) throw new Error("A valid port is required.");
+    const stopped = await stopListeningPort(port);
+    await new Promise((resolve) => setTimeout(resolve, 900));
+    const started = await startProjectServer(typeof req.body.script === "string" ? req.body.script : undefined, port);
+    res.json({ ok: true, port, stopped, started });
+  } catch (err: unknown) {
+    res.status(400).json({ ok: false, error: errorMessage(err) });
+  }
+});
+
 app.post("/set-root", async (req, res) => {
   try {
     const requestedRoot =
@@ -1957,6 +3527,65 @@ app.get("/status", (req, res) => {
     agent: "PayFix Local Agent",
     root: allowedRoot || null,
   });
+});
+
+app.post("/app/open-url", async (req, res) => {
+  try {
+    const rawUrl = typeof req.body.url === "string" ? req.body.url.trim() : "";
+    const browser = typeof req.body.browser === "string" ? req.body.browser.trim().toLowerCase() : "";
+
+    if (!rawUrl) throw new Error("URL is required.");
+    if (!["chrome", "edge", "firefox"].includes(browser)) {
+      throw new Error("Browser must be chrome, edge, or firefox.");
+    }
+
+    res.json(await openUrlInBrowser(rawUrl, browser as BrowserChoice));
+  } catch (err: unknown) {
+    res.status(400).json({ ok: false, error: errorMessage(err) });
+  }
+});
+
+app.post("/app/pick-folder", async (req, res) => {
+  try {
+    const title = typeof req.body.title === "string" ? req.body.title.trim().slice(0, 120) : "Select folder";
+    const folder = await pickFolderWithNativeDialog(title || "Select folder");
+    if (!folder) {
+      res.json({ ok: false, cancelled: true, error: "Folder selection was cancelled." });
+      return;
+    }
+
+    res.json({ ok: true, folder });
+  } catch (err: unknown) {
+    res.status(400).json({ ok: false, error: errorMessage(err) });
+  }
+});
+
+app.post("/app/browse-folders", async (req, res) => {
+  try {
+    const targetPath = typeof req.body.path === "string" ? req.body.path : "";
+    res.json(await browseLocalFolders(targetPath));
+  } catch (err: unknown) {
+    res.status(400).json({ ok: false, error: errorMessage(err) });
+  }
+});
+
+app.post("/sdk/inspect", async (req, res) => {
+  try {
+    const root = typeof req.body.root === "string" ? req.body.root.trim() : "";
+    res.json(await inspectSdkFolder(root));
+  } catch (err: unknown) {
+    res.status(400).json({ ok: false, error: errorMessage(err) });
+  }
+});
+
+app.post("/project/build-pax-android", async (req, res) => {
+  try {
+    const sdkRoots = Array.isArray(req.body.sdkRoots) ? req.body.sdkRoots.map(String) : [];
+    const prompt = typeof req.body.prompt === "string" ? req.body.prompt : "";
+    res.json(await buildPaxAndroidApp(sdkRoots, prompt));
+  } catch (err: unknown) {
+    res.status(400).json({ ok: false, error: errorMessage(err) });
+  }
 });
 
 app.post("/app/resolve-project", async (req, res) => {
@@ -2619,6 +4248,165 @@ app.post("/project/preview-write-file", async (req, res) => {
   }
 });
 
+app.post("/project/delete-file", async (req, res) => {
+  try {
+    const file = safePath(req.body.file);
+    const apply = Boolean(req.body.apply);
+    const fileExisted = await fileExists(file);
+
+    if (!fileExisted) {
+      throw new Error("File does not exist.");
+    }
+
+    const oldContent = await fs.readFile(file, "utf8");
+    let rollback = null;
+
+    if (apply) {
+      const rollbackId = crypto.randomUUID();
+      const snapshot = {
+        id: rollbackId,
+        file,
+        relative: relativeProjectPath(file),
+        previousContent: oldContent,
+        fileExisted: true,
+        createdAt: new Date().toISOString(),
+        reason: String(req.body.reason || "Delete file"),
+      };
+      rollbackSnapshots.set(rollbackId, snapshot);
+      if (rollbackSnapshots.size > 50) {
+        const oldest = [...rollbackSnapshots.values()].sort(
+          (a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()
+        )[0];
+        if (oldest) rollbackSnapshots.delete(oldest.id);
+      }
+
+      await fs.unlink(file);
+      rollback = {
+        id: snapshot.id,
+        file: snapshot.file,
+        relative: snapshot.relative,
+        fileExisted: snapshot.fileExisted,
+        createdAt: snapshot.createdAt,
+        reason: snapshot.reason,
+      };
+    }
+
+    res.json({
+      ok: true,
+      file,
+      relative: relativeProjectPath(file),
+      mode: "delete",
+      applied: apply,
+      oldContent,
+      newContent: "",
+      rollback,
+    });
+  } catch (err: unknown) {
+    res.status(400).json({ ok: false, error: errorMessage(err) });
+  }
+});
+
+app.post("/project/delete-root", async (req, res) => {
+  try {
+    if (!allowedRoot) throw new Error("No project folder selected.");
+
+    const apply = Boolean(req.body.apply);
+    const force = Boolean(req.body.force);
+    const root = allowedRoot;
+    const allEntries = await fg(["**/*"], {
+      cwd: root,
+      absolute: true,
+      onlyFiles: false,
+      dot: true,
+      suppressErrors: true,
+    });
+    const fileEntries = await fg(["**/*"], {
+      cwd: root,
+      absolute: true,
+      onlyFiles: true,
+      dot: true,
+      suppressErrors: true,
+    });
+    const directoryEntries = allEntries.filter((entry) => !fileEntries.includes(entry));
+
+    if (fileEntries.length > 0) {
+      res.status(409).json({
+        ok: false,
+        code: "not_empty",
+        root,
+        fileCount: fileEntries.length,
+        directoryCount: directoryEntries.length,
+        remaining: fileEntries.slice(0, 12).map(relativeProjectPath),
+        error: "The connected project folder still contains files. Delete the files first, then delete the folder.",
+      });
+      return;
+    }
+
+    if (apply) {
+      const maxAttempts = force ? 4 : 1;
+      let lastDeleteError: unknown = null;
+
+      try {
+        for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+          try {
+            await fs.rm(root, { recursive: true, force });
+            lastDeleteError = null;
+            break;
+          } catch (err: unknown) {
+            lastDeleteError = err;
+            if (!force || attempt === maxAttempts) break;
+            await new Promise((resolve) => setTimeout(resolve, 250 * attempt));
+          }
+        }
+
+        if (lastDeleteError && force) {
+          try {
+            await forceRemoveDirectoryFromDisk(root);
+            lastDeleteError = null;
+          } catch (err: unknown) {
+            lastDeleteError = err;
+          }
+        }
+
+        if (lastDeleteError) throw lastDeleteError;
+        allowedRoot = "";
+      } catch (err: unknown) {
+        const detail = errorMessage(err);
+        if (/EBUSY|EPERM|ENOTEMPTY|busy|locked|resource|being used by another process|cannot access the file|RemoveFileSystemItemIOError/i.test(detail)) {
+          res.status(409).json({
+            ok: false,
+            code: "busy",
+            root,
+            detail,
+            canForce: !force,
+            error: force
+              ? "The operating system still reports this folder as busy or locked. Close any file explorer, editor, terminal, or server process using it, then retry."
+              : "The connected project folder is busy or locked by another process.",
+          });
+          return;
+        }
+
+        throw err;
+      }
+    }
+
+    res.json({
+      ok: true,
+      root,
+      applied: apply,
+      forced: apply && force,
+      directoryCount: directoryEntries.length,
+      message: apply
+        ? "Deleted the empty connected project folder tree."
+        : directoryEntries.length
+          ? "The connected project contains only empty subfolders and can be deleted."
+          : "The connected project folder is empty and can be deleted.",
+    });
+  } catch (err: unknown) {
+    res.status(400).json({ ok: false, error: errorMessage(err) });
+  }
+});
+
 app.get("/project/rollback/list", (_req, res) => {
   res.json({
     ok: true,
@@ -2779,20 +4567,25 @@ app.post("/project/validate-file-change", async (req, res) => {
 
     fileExisted = await fileExists(file);
     oldContent = fileExisted ? await fs.readFile(file, "utf8") : "";
-    const updatedContent = buildUpdatedContent({
-      oldContent,
-      newContent,
-      searchContent,
-      mode,
-      allowOverwrite: Boolean(req.body.allowOverwrite),
-    });
+    if (mode === "delete") {
+      if (!fileExisted) throw new Error("Validation refused: file does not exist.");
+      await fs.unlink(file);
+    } else {
+      const updatedContent = buildUpdatedContent({
+        oldContent,
+        newContent,
+        searchContent,
+        mode,
+        allowOverwrite: Boolean(req.body.allowOverwrite),
+      });
 
-    if (updatedContent === oldContent) {
-      throw new Error("Validation refused: proposed change does not modify the file.");
+      if (updatedContent === oldContent) {
+        throw new Error("Validation refused: proposed change does not modify the file.");
+      }
+
+      await fs.mkdir(path.dirname(file), { recursive: true });
+      await fs.writeFile(file, updatedContent, "utf8");
     }
-
-    await fs.mkdir(path.dirname(file), { recursive: true });
-    await fs.writeFile(file, updatedContent, "utf8");
 
     const commands: Awaited<ReturnType<typeof runProjectCommand>>[] = [];
     const skipped: string[] = [];
@@ -2840,6 +4633,7 @@ app.get("/project/diagnostics", async (_req, res) => {
   try {
     if (!allowedRoot) throw new Error("No project folder selected.");
 
+    const toolchain = await projectToolchainDoctor();
     const packageJson = await readPackageJsonSafe();
     const scripts = ((packageJson?.scripts as Record<string, string>) || {});
     const hasPackageJson = Boolean(packageJson);
@@ -2870,8 +4664,23 @@ app.get("/project/diagnostics", async (_req, res) => {
       } else {
         skipped.push("Lint diagnostics skipped: package.json has no lint script.");
       }
+
+      if (scripts.check) {
+        commands.push(await runProjectCommand(pmCommand, ["run", "check"]));
+      } else if (scripts.smoke) {
+        commands.push(await runProjectCommand(pmCommand, ["run", "smoke"]));
+      } else {
+        skipped.push("Runtime check skipped: package.json has no check/smoke script.");
+      }
     } else {
       skipped.push("npm/yarn/pnpm diagnostics skipped: no package.json found.");
+    }
+
+    await runPythonProjectChecks(["check", "lint", "test"], commands, skipped);
+    await runCrossLanguageProjectChecks(["check", "lint", "test", "build"], commands, skipped);
+
+    for (const item of toolchain.missing || []) {
+      skipped.push(`Toolchain missing: ${item.label} cannot be fully validated until ${item.missingCommands.join(", ")} is installed.`);
     }
 
     if (dotnetTarget) {
@@ -2890,6 +4699,17 @@ app.get("/project/diagnostics", async (_req, res) => {
         ? `Diagnostics failed: ${failed.map((command) => command.command).join(", ")}`
         : "",
     });
+  } catch (err: unknown) {
+    res.status(400).json({
+      ok: false,
+      error: errorMessage(err),
+    });
+  }
+});
+
+app.get("/project/toolchain", async (_req, res) => {
+  try {
+    res.json(await projectToolchainDoctor());
   } catch (err: unknown) {
     res.status(400).json({
       ok: false,
@@ -3002,6 +4822,7 @@ app.post("/project/sandbox-runner", async (req, res) => {
   try {
     if (!allowedRoot) throw new Error("No project folder selected.");
 
+    const toolchain = await projectToolchainDoctor();
     const requested = Array.isArray(req.body?.checks) ? req.body.checks.map(String) : [];
     const packageJson = await readPackageJsonSafe();
     const scripts = ((packageJson?.scripts as Record<string, string>) || {});
@@ -3016,7 +4837,7 @@ app.post("/project/sandbox-runner", async (req, res) => {
           : packageManager === "yarn"
             ? "yarn"
             : "npm";
-    const checks = requested.length ? requested : ["typescript", "lint", "test", "build"];
+    const checks = requested.length ? requested : ["check", "typescript", "lint", "test", "build"];
     const commands: Awaited<ReturnType<typeof runProjectCommand>>[] = [];
     const skipped: string[] = [];
     const dotnetFiles = await fg(["*.sln", "**/*.csproj", ...projectIgnoreGlobs], {
@@ -3044,6 +4865,16 @@ app.post("/project/sandbox-runner", async (req, res) => {
         commands.push(await runProjectCommand(pmCommand, ["run", "lint"]));
       } else {
         skipped.push("Lint skipped: package.json has no lint script.");
+      }
+    }
+
+    if (hasPackageJson && checks.includes("check")) {
+      if (scripts.check) {
+        commands.push(await runProjectCommand(pmCommand, ["run", "check"]));
+      } else if (scripts.smoke) {
+        commands.push(await runProjectCommand(pmCommand, ["run", "smoke"]));
+      } else {
+        skipped.push("Runtime check skipped: package.json has no check/smoke script.");
       }
     }
 
@@ -3080,12 +4911,20 @@ app.post("/project/sandbox-runner", async (req, res) => {
       }
     }
 
+    await runPythonProjectChecks(checks, commands, skipped);
+    await runCrossLanguageProjectChecks(checks, commands, skipped);
+
+    for (const item of toolchain.missing || []) {
+      skipped.push(`Toolchain missing: ${item.label} cannot be fully validated until ${item.missingCommands.join(", ")} is installed.`);
+    }
+
     const failed = commands.filter((command) => !command.ok);
 
     res.json({
       ok: failed.length === 0,
       root: allowedRoot,
       packageManager,
+      toolchain,
       commands,
       skipped,
       error: failed.length ? `Sandbox runner failed: ${failed.map((command) => command.command).join(", ")}` : "",
@@ -3244,25 +5083,91 @@ app.post("/project/install-package", async (req, res) => {
   try {
     if (!allowedRoot) throw new Error("No project folder selected.");
 
-    const packageName = safePackageName(String(req.body.packageName || ""));
+    const requestedPackages: unknown[] = Array.isArray(req.body.packageNames)
+      ? req.body.packageNames
+      : [req.body.packageName];
+    const packageNames: string[] = [
+      ...new Set(
+        requestedPackages
+          .map((item: unknown) => safeInstallPackageName(String(item || "")))
+          .filter(Boolean),
+      ),
+    ];
+    if (!packageNames.length) throw new Error("No package name was provided.");
     const dev = Boolean(req.body.dev);
-    const packageManager = await detectPackageManager(allowedRoot);
+    const ecosystem = String(req.body.ecosystem || "node").toLowerCase();
+    const packageManager = ecosystem === "node" ? await detectPackageManager(allowedRoot) : ecosystem;
+    const bootstrap = await ensureInstallMetadata(ecosystem, packageManager);
+    if (!bootstrap.ok) {
+      throw new Error(`Could not initialize ${ecosystem} project metadata before install.\n${bootstrap.output}`);
+    }
 
-    const commandName = packageManager === "pnpm" ? "pnpm" : packageManager === "yarn" ? "yarn" : "npm";
-    const command = process.platform === "win32" ? `${commandName}.cmd` : commandName;
-    const args =
-      packageManager === "yarn"
-        ? ["add", ...(dev ? ["-D"] : []), packageName]
-        : ["install", ...(dev ? ["-D"] : []), packageName];
+    let command = "";
+    let args: string[] = [];
+    let result: Awaited<ReturnType<typeof runProjectCommand>>;
 
-    const result = await runProjectCommand(command, args);
+    if (ecosystem === "python") {
+      command = process.platform === "win32" ? "python.exe" : "python";
+      args = ["-m", "pip", "install", ...packageNames];
+    } else if (ecosystem === "dotnet") {
+      command = "dotnet";
+      args = ["add", "package", ...packageNames];
+    } else if (ecosystem === "rust") {
+      command = "cargo";
+      args = ["add", ...packageNames];
+    } else if (ecosystem === "go") {
+      command = "go";
+      args = ["get", ...packageNames];
+    } else if (ecosystem === "php") {
+      command = "composer";
+      args = ["require", ...packageNames];
+    } else if (ecosystem === "ruby") {
+      command = "bundle";
+      args = ["add", ...packageNames];
+    } else {
+      const commandName = packageManager === "pnpm" ? "pnpm" : packageManager === "yarn" ? "yarn" : "npm";
+      command = process.platform === "win32" ? `${commandName}.cmd` : commandName;
+      args =
+        packageManager === "yarn"
+          ? ["add", ...(dev ? ["-D"] : []), ...packageNames]
+          : ["install", ...(dev ? ["-D"] : []), ...packageNames];
+    }
+
+    if ((ecosystem === "dotnet" || ecosystem === "ruby") && packageNames.length > 1) {
+      const results = [];
+      for (const packageName of packageNames) {
+        const itemArgs = ecosystem === "dotnet" ? ["add", "package", packageName] : ["add", packageName];
+        results.push(await runProjectCommand(command, itemArgs));
+      }
+
+      const failed = results.find((item) => !item.ok);
+      result = {
+        ok: !failed,
+        command: results.map((item) => item.command).join(" && "),
+        output: results.map((item) => item.output).filter(Boolean).join("\n\n"),
+      };
+    } else {
+      result = await runProjectCommand(command, args);
+    }
+
+    const metadata =
+      result.ok && ecosystem === "python"
+        ? await updatePythonDependencyMetadata(packageNames)
+        : { updated: false, file: "", added: [] as string[] };
 
     res.json({
       ok: result.ok,
-      packageName,
+      packageName: packageNames[0],
+      packageNames,
+      ecosystem,
       packageManager,
-      command: result.command,
-      output: result.output,
+      metadataUpdated: metadata.updated,
+      metadataFile: metadata.file,
+      metadataAdded: metadata.added,
+      initialized: bootstrap.commands.length > 0,
+      bootstrapCommands: bootstrap.commands,
+      command: [bootstrap.command, result.command].filter(Boolean).join(" && "),
+      output: [bootstrap.output, result.output].filter(Boolean).join("\n\n"),
       error: result.ok ? "" : result.output || "Package install failed.",
     });
   } catch (err: unknown) {

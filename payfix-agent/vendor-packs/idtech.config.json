@@ -8,10 +8,14 @@
   "commands": {
     "start-card-read": {
       "hex": "",
+      "text": "",
+      "encoding": "utf8",
       "description": "Optional: exact ID TECH-approved command bytes for starting card read on your model/firmware."
     },
     "get-device-info": {
       "hex": "",
+      "text": "",
+      "encoding": "utf8",
       "description": "Optional: exact ID TECH-approved command bytes for querying device identity."
     }
   }

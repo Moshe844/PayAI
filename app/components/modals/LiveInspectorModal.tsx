@@ -55,7 +55,7 @@ export default function LiveInspectorModal({
     result?.consoleMessages.filter((entry) => ["error", "warning"].includes(entry.type)).slice(-40) || [];
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/70 p-5">
+    <div className="fixed inset-0 z-[360] flex items-center justify-center bg-slate-950/70 p-5">
       <div className="flex max-h-[92vh] w-full max-w-7xl flex-col overflow-hidden rounded-2xl bg-white shadow-2xl">
         <div className="flex items-start justify-between gap-4 border-b border-slate-200 px-6 py-5">
           <div>
@@ -347,7 +347,7 @@ export default function LiveInspectorModal({
                     Visual CSS Targets
                   </div>
                   <p className="mt-1 text-sm text-slate-500">
-                    Inspector identifies live elements and computed styles here. Applying CSS changes is still done through Color Tool or Agent patches.
+                    Inspector identifies live elements and computed styles here. Send a target to Visual Fix Agent to find the source and prepare a patch.
                   </p>
                   {result.dom?.visualTargets?.length ? (
                     <div className="mt-4 grid grid-cols-1 gap-3 lg:grid-cols-2">

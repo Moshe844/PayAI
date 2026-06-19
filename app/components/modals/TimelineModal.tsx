@@ -107,8 +107,53 @@ function downloadSource(name: string, type: string, content: string, isImage: bo
   if (!isImage) URL.revokeObjectURL(href);
 }
 
+const paymentPipeline = [
+  {
+    label: "Device read",
+    description: "Card reader, terminal, USB/HID/COM, or device output",
+    match: (event: PaymentTimelineEvent) => event.stage === "device" || /\b(reader|device|terminal|usb|hid|com|tap|swipe|insert)\b/i.test(`${event.action} ${event.evidence}`),
+  },
+  {
+    label: "EMV/TLV",
+    description: "Tags, cryptogram, TVR/TSI, card/kernel outcome",
+    match: (event: PaymentTimelineEvent) => /\b(emv|tlv|9f27|9f26|95|tvr|tsi|df8129|aac|arqc|cryptogram)\b/i.test(`${event.action} ${event.evidence}`),
+  },
+  {
+    label: "SDK event",
+    description: "SDK callback, parser, exception, card read event",
+    match: (event: PaymentTimelineEvent) => /\b(sdk|callback|event|exception|parser|parse|idtech|cardreader|card read)\b/i.test(`${event.action} ${event.evidence}`),
+  },
+  {
+    label: "App request",
+    description: "Backend/app authorization request sent to gateway",
+    match: (event: PaymentTimelineEvent) => event.stage === "backend" || /\b(request|authorize|auth request|http|api|post|executehttprequest)\b/i.test(`${event.action} ${event.evidence}`),
+  },
+  {
+    label: "Gateway response",
+    description: "Processor/gateway response, status, error code, auth code",
+    match: (event: PaymentTimelineEvent) => event.stage === "gateway" || /\b(gateway|processor|xresult|xstatus|xerror|response|authcode|refnum)\b/i.test(`${event.action} ${event.evidence}`),
+  },
+  {
+    label: "Final decision",
+    description: "Approved, declined, failed, stored final state",
+    match: (event: PaymentTimelineEvent) => /\b(approved|declined|failed|failure|success|final|settled|captured|void|rejected)\b/i.test(`${event.status} ${event.action} ${event.evidence}`),
+  },
+];
+
+function pipelineStatus(timeline: PaymentTimelineResult) {
+  return paymentPipeline.map((step) => {
+    const related = timeline.events.filter(step.match);
+    return {
+      ...step,
+      related,
+      present: related.length > 0,
+    };
+  });
+}
+
 export default function TimelineModal({ timeline, onClose }: TimelineModalProps) {
   const sourceEvidence = timeline.sourceEvidence || [];
+  const paymentStages = pipelineStatus(timeline);
 
   return (
     <div className="fixed inset-0 z-[260] flex items-start justify-center bg-black/55 p-6 backdrop-blur-sm">
@@ -116,7 +161,7 @@ export default function TimelineModal({ timeline, onClose }: TimelineModalProps)
         <div className="flex items-center justify-between border-b border-slate-200 px-6 py-5">
           <div>
             <div className="text-xs font-bold uppercase tracking-wide text-blue-600">Payment Trace</div>
-            <h3 className="mt-1 text-2xl font-bold">Timeline Reconstruction</h3>
+            <h3 className="mt-1 text-2xl font-bold">Payment Trace Reconstruction</h3>
           </div>
 
           <button
@@ -142,6 +187,35 @@ export default function TimelineModal({ timeline, onClose }: TimelineModalProps)
                 <CorrelationRow label="Transactions" values={timeline.correlation.transactionIds} />
                 <CorrelationRow label="Orders" values={timeline.correlation.orderIds} />
                 <CorrelationRow label="Gateways" values={timeline.correlation.gateways} />
+              </section>
+
+              <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="font-bold">Payment Pipeline</div>
+                  <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-bold text-slate-600">
+                    {paymentStages.filter((stage) => stage.present).length}/{paymentStages.length}
+                  </span>
+                </div>
+                <div className="mt-3 space-y-2">
+                  {paymentStages.map((stage) => (
+                    <div
+                      key={stage.label}
+                      className={`rounded-xl border p-3 ${
+                        stage.present
+                          ? "border-emerald-200 bg-emerald-50 text-emerald-950"
+                          : "border-amber-200 bg-amber-50 text-amber-950"
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-3">
+                        <div className="font-bold">{stage.label}</div>
+                        <span className="rounded-full bg-white/80 px-2 py-1 text-[11px] font-black">
+                          {stage.present ? `${stage.related.length} event(s)` : "Missing"}
+                        </span>
+                      </div>
+                      <p className="mt-1 text-xs font-semibold leading-5 opacity-80">{stage.description}</p>
+                    </div>
+                  ))}
+                </div>
               </section>
 
               <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">

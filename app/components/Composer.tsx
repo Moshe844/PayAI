@@ -1,18 +1,23 @@
-import { useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import {
   Bot,
+  ChevronDown,
   Clock3,
   Code2,
+  ExternalLink,
   MoreHorizontal,
   FileText,
   FolderOpen,
+  Globe2,
   Loader2,
+  MessageSquare,
   Paperclip,
   Plus,
   Search,
   Send,
   Upload,
   Wand2,
+  Zap,
   X,
 } from "lucide-react";
 import Image from "next/image";
@@ -30,6 +35,10 @@ type ComposerProps = {
 
   question: string;
   setQuestion: (value: string) => void;
+  quickReplyOptions: string[];
+  selectedQuickReplies: string[];
+  toggleQuickReply: (value: string) => void;
+  clearSelectedQuickReplies: () => void;
 
   log: string;
   setLog: (value: string) => void;
@@ -68,6 +77,7 @@ type ComposerProps = {
   clearAttachments: () => void;
   cancelEditMessage: () => void;
   loadProjectContext: () => void;
+  importBrowserCapture: () => void;
   analyze: () => void;
   runAgent: () => void;
   buildTimeline: () => void;
@@ -80,16 +90,40 @@ type ComposerProps = {
 };
 
 const uploadAccept =
-  ".txt,.log,.json,.har,.cs,.ts,.tsx,.js,.jsx,.md,.xml,.config,image/*";
+  ".txt,.log,.json,.har,.csv,.xls,.xlsx,.cs,.ts,.tsx,.js,.jsx,.md,.xml,.config,image/*";
 
 const inputClass =
-  "rounded-xl border border-slate-300 bg-white px-3 py-3 text-[15px] font-medium text-slate-950 shadow-sm transition placeholder:text-slate-400 focus:border-blue-500 focus:ring-4 focus:ring-blue-100";
+  "pf-input rounded-[var(--pf-radius-sm)] px-3 py-3 text-[15px] font-medium shadow-inner";
 
 const codeInputClass =
-  "rounded-xl border border-slate-300 bg-white px-3 py-3 font-mono text-[14px] font-medium leading-6 text-[#1f1f1f] shadow-inner outline-none transition placeholder:text-slate-400 selection:bg-[#add6ff] focus:border-[#007acc] focus:ring-4 focus:ring-[#007acc]/20";
+  "pf-input rounded-[var(--pf-radius-sm)] px-3 py-3 font-mono text-[14px] font-medium leading-6 caret-sky-400 selection:bg-sky-500/25";
 
 const panelClass =
-  "rounded-2xl bg-white/90 p-4 shadow-sm ring-1 ring-slate-200";
+  "rounded-[var(--pf-radius)] border border-[var(--pf-border)] bg-white/[0.03] p-4 backdrop-blur-sm";
+
+function extractComposerUrls(value: string) {
+  const matches = value.match(/https?:\/\/[^\s<>"')\]}]+/gi) || [];
+  return Array.from(new Set(matches.map((url) => url.replace(/[.,;:!?]+$/g, ""))));
+}
+
+type BrowserChoice = {
+  id: "chrome" | "edge" | "firefox";
+  label: string;
+};
+
+const browserChoices: BrowserChoice[] = [
+  { id: "chrome", label: "Chrome" },
+  { id: "edge", label: "Microsoft Edge" },
+  { id: "firefox", label: "Firefox" },
+];
+
+function shortHost(url: string) {
+  try {
+    return new URL(url).host;
+  } catch {
+    return url;
+  }
+}
 
 export default function Composer({
   hasConversation,
@@ -101,6 +135,10 @@ export default function Composer({
   agentLoading,
   question,
   setQuestion,
+  quickReplyOptions,
+  selectedQuickReplies,
+  toggleQuickReply,
+  clearSelectedQuickReplies,
   log,
   setLog,
   code,
@@ -127,6 +165,7 @@ export default function Composer({
   clearAttachments,
   cancelEditMessage,
   loadProjectContext,
+  importBrowserCapture,
   analyze,
   runAgent,
   buildTimeline,
@@ -141,7 +180,15 @@ export default function Composer({
   const [setupOpen, setSetupOpen] = useState(false);
   const [replyContextOpen, setReplyContextOpen] = useState(false);
   const [advancedActionsOpen, setAdvancedActionsOpen] = useState(false);
+  const [extensionHelpOpen, setExtensionHelpOpen] = useState(false);
+  const [browserSessionHint, setBrowserSessionHint] = useState<{ url: string; message: string } | null>(null);
+  const [urlSessionGate, setUrlSessionGate] = useState<{ url: string; acknowledged: boolean } | null>(null);
+  const moreMenuRef = useRef<HTMLDivElement | null>(null);
   const canSubmitMessage = canSend && !loading && !agentLoading && !timelineLoading;
+  const composerUrls = extractComposerUrls(question);
+  const primaryComposerUrl = composerUrls[0] || "";
+  const needsUrlSessionGate =
+    Boolean(primaryComposerUrl) && (!urlSessionGate || urlSessionGate.url !== primaryComposerUrl || !urlSessionGate.acknowledged);
   const questionLineCount = Math.max(1, question.split(/\r?\n/).length);
   const questionLooksLikeCode =
     /(<\/?[a-z][\s\S]*?>|=>|function\s+\w*|const\s+\w+|let\s+\w+|className=|import\s+.+from|public\s+class|<\/|{\s*$|;\s*$)/m.test(
@@ -150,6 +197,7 @@ export default function Composer({
   const composerHeight = Math.min(320, Math.max(hasConversation ? 84 : 96, 36 + questionLineCount * 22));
   const labelUpload = (file: UploadedFile, index: number) =>
     file.isImage ? `Image ${index + 1}: ${file.name}` : `File ${index + 1}: ${file.name}`;
+  const quickReplyVisible = hasConversation && quickReplyOptions.length > 0 && !loading && !agentLoading && !timelineLoading;
 
   function handleUpload(files: FileList | null) {
     originalHandleUpload(files);
@@ -172,81 +220,209 @@ export default function Composer({
     setReplyContextOpen(false);
   }
 
+  useEffect(() => {
+    if (!advancedActionsOpen) return;
+
+    function closeOnOutsideClick(event: MouseEvent) {
+      if (!moreMenuRef.current?.contains(event.target as Node)) {
+        setAdvancedActionsOpen(false);
+      }
+    }
+
+    function closeOnEscape(event: KeyboardEvent) {
+      if (event.key === "Escape") setAdvancedActionsOpen(false);
+    }
+
+    document.addEventListener("mousedown", closeOnOutsideClick);
+    document.addEventListener("keydown", closeOnEscape);
+
+    return () => {
+      document.removeEventListener("mousedown", closeOnOutsideClick);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [advancedActionsOpen]);
+
+  function toggleAdvancedActions() {
+    setAdvancedActionsOpen((open) => !open);
+  }
+
+  function closeMoreMenu() {
+    setAdvancedActionsOpen(false);
+  }
+
+  function buildTimelineFromMore() {
+    closeMoreMenu();
+    buildTimeline();
+  }
+
+  function runAgentFromMore() {
+    closeMoreMenu();
+    runAgent();
+  }
+
+  function openVisualFixFromMore() {
+    closeMoreMenu();
+    openColorTool();
+  }
+
+  function submitFromComposer() {
+    if (!canSubmitMessage) return;
+
+    if (needsUrlSessionGate) {
+      setUrlSessionGate({ url: primaryComposerUrl, acknowledged: false });
+      setBrowserSessionHint({
+        url: primaryComposerUrl,
+        message: "Choose the browser where you are logged in, or click Continue without browser if this is a public page.",
+      });
+      return;
+    }
+
+    analyze();
+  }
+
+  async function chooseLoggedInBrowser(browser: BrowserChoice) {
+    if (!primaryComposerUrl) return;
+    setUrlSessionGate({ url: primaryComposerUrl, acknowledged: true });
+
+    try {
+      const response = await fetch("/api/local-agent/app/open-url", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ browser: browser.id, url: primaryComposerUrl }),
+      });
+      const data = (await response.json().catch(() => null)) as { ok?: boolean; error?: string } | null;
+
+      if (!response.ok || !data?.ok) {
+        const rawError = data?.error || "PayFix Local Agent could not open the browser.";
+        const friendlyError = /returned text\/html|missing this endpoint|old/i.test(rawError)
+          ? "Restart payfix-agent so it has the new browser-opening endpoint."
+          : rawError;
+        throw new Error(friendlyError);
+      }
+
+      setBrowserSessionHint({
+        url: primaryComposerUrl,
+        message: `Opened in ${browser.label}. Click into the SDK/folder page, paste that page URL, visible file list, or screenshot here, then click Analyze.`,
+      });
+    } catch (error: unknown) {
+      try {
+        await navigator.clipboard.writeText(primaryComposerUrl);
+      } catch {
+        // Clipboard is a convenience fallback only.
+      }
+
+      const message = error instanceof Error ? error.message : "Could not open that browser automatically.";
+      setBrowserSessionHint({
+        url: primaryComposerUrl,
+        message: `${message} Your draft stays in the box until you send it. I copied the URL if clipboard access is allowed. Open ${browser.label}, paste the opened folder URL or screenshot here, then click Analyze.`,
+      });
+    }
+  }
+
+  function continueWithoutBrowser() {
+    if (!primaryComposerUrl) return;
+    setUrlSessionGate({ url: primaryComposerUrl, acknowledged: true });
+    setBrowserSessionHint({
+      url: primaryComposerUrl,
+      message: "Okay, click Analyze again and PayFix will read the public version. If it hits a login wall, attach the logged-in page evidence next.",
+    });
+  }
+
   return (
     <>
       {!hasConversation && (
-        <div className="min-h-0 flex-1 overflow-y-auto border-b border-slate-200/80 bg-white/55 px-5 pb-6 pt-5 backdrop-blur">
-          <div className="mx-auto max-w-[1100px] text-center">
-            <div className="text-xs font-black uppercase tracking-wide text-blue-600">
-              PayFix Workspace
+        <div className="allow-scroll min-h-0 flex-1 overflow-y-auto border-b border-[var(--pf-border)] px-6 pb-8 pt-8">
+          <div className="mx-auto max-w-[960px]">
+            <div className="text-center">
+              <div className="pf-badge mx-auto w-fit border-sky-500/25 bg-sky-500/10 text-sky-300">
+                PayFix Dev Studio
+              </div>
+              <h1 className="mt-4 bg-gradient-to-br from-white via-sky-100 to-sky-300 bg-clip-text text-3xl font-black tracking-tight text-transparent sm:text-4xl">
+                Debug payments like a senior engineer
+              </h1>
+              <p className="mx-auto mt-3 max-w-xl text-sm leading-6 text-[var(--pf-text-muted)]">
+                Drop logs, connect your repo, trace gateway flows, or let the agent patch your project - all from one console.
+              </p>
             </div>
-            <h1 className="mt-2 text-2xl font-black tracking-tight text-slate-950">
-              Ask a question, drop logs, or connect a project.
-            </h1>
-            <p className="mx-auto mt-2 max-w-2xl text-sm leading-6 text-slate-500">
-              Start with the message box below. Add project files, logs, screenshots, or code only when they help the investigation.
-            </p>
-            <div className="mt-4 grid grid-cols-1 gap-2 text-left md:grid-cols-3">
+
+            <div className="mt-8 grid grid-cols-1 gap-3 sm:grid-cols-3">
               {[
-                { label: "1. Ask", detail: "Describe the bug, error, or payment flow." },
-                { label: "2. Attach", detail: "Add logs, screenshots, source, or search results." },
-                { label: "3. Analyze", detail: "Let PayFix inspect the context and respond." },
-              ].map((step) => (
-                <div key={step.label} className="rounded-xl border border-slate-200 bg-white/80 px-4 py-3 shadow-sm">
-                  <div className="text-sm font-black text-slate-900">{step.label}</div>
-                  <div className="mt-1 text-xs leading-5 text-slate-500">{step.detail}</div>
+                { step: "01", label: "Ask", detail: "Describe the bug, decline, or payment flow.", Icon: MessageSquare },
+                { step: "02", label: "Attach", detail: "Logs, HAR files, screenshots, or source.", Icon: Paperclip },
+                { step: "03", label: "Fix", detail: "Analyze, trace payment, or run the agent.", Icon: Zap },
+              ].map((item) => (
+                <div
+                  key={item.label}
+                  className="group rounded-[var(--pf-radius)] border border-[var(--pf-border)] bg-white/[0.03] p-4 transition hover:border-sky-500/30 hover:bg-sky-500/[0.04]"
+                >
+                  <div className="flex items-center justify-between">
+                    <span className="font-mono text-[10px] font-bold text-sky-400/80">{item.step}</span>
+                    <item.Icon size={18} className="text-sky-400/70" />
+                  </div>
+                  <div className="mt-3 text-sm font-bold text-[var(--pf-text)]">{item.label}</div>
+                  <div className="mt-1 text-xs leading-5 text-[var(--pf-text-muted)]">{item.detail}</div>
                 </div>
               ))}
             </div>
+
+            <div className="mt-6 flex flex-wrap items-center justify-center gap-2 text-[var(--pf-text-faint)]">
+              <span className="pf-kbd">Enter</span>
+              <span className="text-xs">send</span>
+              <span className="text-[var(--pf-border-strong)]">/</span>
+              <span className="pf-kbd">Shift</span>
+              <span className="text-xs">+</span>
+              <span className="pf-kbd">Enter</span>
+              <span className="text-xs">new line</span>
+              <span className="text-[var(--pf-border-strong)]">/</span>
+              <span className="text-xs">paste or drag files into composer</span>
+            </div>
           </div>
 
-          <div className="mx-auto mt-5 max-w-[1200px] rounded-2xl bg-white/92 shadow-[0_18px_46px_rgba(15,23,42,0.08)] ring-1 ring-slate-200/80">
+          <div className="mx-auto mt-8 max-w-[1100px] rounded-[var(--pf-radius)] border border-[var(--pf-border)] bg-[var(--pf-surface)]/60 shadow-[var(--pf-shadow)]">
             <button
               type="button"
               onClick={() => setSetupOpen((open) => !open)}
-              className="flex w-full items-center justify-between gap-4 px-5 py-4 text-left"
+              className="flex w-full items-center justify-between gap-4 px-5 py-4 text-left transition hover:bg-white/[0.02]"
             >
               <div>
-                <div className="font-bold text-slate-950">Context Workspace</div>
-                <div className="mt-1 text-sm text-slate-500">
-                  Optional context: search, upload, connect a project, or paste logs/code.
+                <div className="font-bold text-[var(--pf-text)]">Context workspace</div>
+                <div className="mt-1 text-sm text-[var(--pf-text-muted)]">
+                  Search files, upload evidence, connect a project, or paste logs/code.
                 </div>
               </div>
-              <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-bold text-slate-600">
-                {setupOpen ? "Collapse" : "Expand"}
-              </span>
+              <span className="pf-badge">{setupOpen ? "Collapse" : "Expand"}</span>
             </button>
 
             {!setupOpen && (
-              <div className="border-t border-slate-100 px-5 pb-4">
-                <div className="flex flex-wrap gap-2 text-xs font-bold">
+              <div className="border-t border-[var(--pf-border)] px-5 pb-4">
+                <div className="flex flex-wrap gap-2 text-xs font-semibold">
                   {uploadedFiles.length > 0 && (
-                    <span className="rounded-full bg-blue-50 px-3 py-1 text-blue-700">
+                    <span className="rounded-full border border-sky-500/25 bg-sky-500/10 px-3 py-1 text-sky-300">
                       Uploads: {uploadedFiles.length}
                     </span>
                   )}
                   {connectedProjectPath && (
-                    <span className="rounded-full bg-purple-50 px-3 py-1 text-purple-700">
+                    <span className="rounded-full border border-violet-500/25 bg-violet-500/10 px-3 py-1 text-violet-300">
                       Project: {connectedProjectPath.split("\\").pop()}
                     </span>
                   )}
-                  {log.trim() && <span className="rounded-full bg-amber-50 px-3 py-1 text-amber-700">Log included</span>}
-                  {code.trim() && <span className="rounded-full bg-slate-100 px-3 py-1 text-slate-700">Code included</span>}
-                  {!hasAttachment && <span className="rounded-full bg-slate-100 px-3 py-1 text-slate-500">No context yet</span>}
+                  {log.trim() && <span className="rounded-full border border-amber-500/25 bg-amber-500/10 px-3 py-1 text-amber-300">Log included</span>}
+                  {code.trim() && <span className="rounded-full border border-[var(--pf-border)] bg-white/5 px-3 py-1 text-[var(--pf-text-muted)]">Code included</span>}
+                  {!hasAttachment && <span className="rounded-full border border-[var(--pf-border)] bg-white/[0.03] px-3 py-1 text-[var(--pf-text-faint)]">No context yet</span>}
                 </div>
               </div>
             )}
 
             {setupOpen && (
-              <div className="border-t border-slate-100 p-4">
+              <div className="border-t border-[var(--pf-border)] p-4">
                 <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
                   <div className={panelClass}>
-                    <div className="flex items-center gap-2 font-semibold">
-                      <Search size={17} className="text-emerald-600" />
-                      Search Anywhere on Computer
+                    <div className="flex items-center gap-2 font-semibold text-[var(--pf-text)]">
+                      <Search size={17} className="text-emerald-400" />
+                      Search anywhere
                     </div>
 
-                    <p className="mt-1 text-sm text-slate-500">
+                    <p className="mt-1 text-sm text-[var(--pf-text-muted)]">
                       Find files or snippets without leaving the workspace.
                     </p>
 
@@ -261,20 +437,20 @@ export default function Composer({
 
                     <button
                       onClick={searchComputerAndCollapse}
-                      className="mt-3 inline-flex h-11 items-center gap-2 rounded-xl bg-emerald-600 px-5 text-sm font-semibold text-white shadow-sm transition hover:bg-emerald-500"
+                      className="mt-3 inline-flex h-10 items-center gap-2 rounded-[var(--pf-radius-sm)] bg-emerald-600 px-5 text-sm font-semibold text-white shadow-lg shadow-emerald-900/30 transition hover:bg-emerald-500"
                     >
                       <Search size={16} />
-                      Search Computer
+                      Search computer
                     </button>
                   </div>
 
                   <div className={panelClass}>
-                    <div className="flex items-center gap-2 font-semibold">
-                      <Upload size={17} className="text-blue-600" />
-                      Upload Files / Images
+                    <div className="flex items-center gap-2 font-semibold text-[var(--pf-text)]">
+                      <Upload size={17} className="text-sky-400" />
+                      Upload files
                     </div>
 
-                    <p className="mt-1 text-sm text-slate-500">
+                    <p className="mt-1 text-sm text-[var(--pf-text-muted)]">
                       Attach logs, screenshots, configs, or source files.
                     </p>
 
@@ -283,35 +459,35 @@ export default function Composer({
                       multiple
                       accept={uploadAccept}
                       onChange={(e) => handleUpload(e.target.files)}
-                      className="mt-3 block w-full rounded-xl border border-slate-300 bg-white p-3 text-sm shadow-sm file:mr-3 file:rounded-lg file:border-0 file:bg-blue-50 file:px-3 file:py-2 file:text-sm file:font-semibold file:text-blue-700"
+                      className="mt-3 block w-full rounded-[var(--pf-radius-sm)] border border-[var(--pf-border)] bg-black/20 p-3 text-sm file:mr-3 file:rounded-lg file:border-0 file:bg-sky-500/15 file:px-3 file:py-2 file:text-sm file:font-semibold file:text-sky-300"
                     />
 
                     {uploadedFiles.length > 0 && (
-                      <div className="mt-3 text-sm text-slate-700">
+                      <div className="mt-3 text-sm text-[var(--pf-text-muted)]">
                         Attached: {uploadPreview.join(", ")}
                       </div>
                     )}
                   </div>
                 </div>
 
-                <div className="mt-4 rounded-2xl bg-white/90 p-4 shadow-sm ring-1 ring-slate-200">
-                  <div className="flex items-center gap-2 font-semibold">
-                    <FolderOpen size={17} className="text-violet-600" />
-                    Project Path
+                <div className={`${panelClass} mt-4`}>
+                  <div className="flex items-center gap-2 font-semibold text-[var(--pf-text)]">
+                    <FolderOpen size={17} className="text-violet-400" />
+                    Project path
                   </div>
 
                   <div className="mt-3 flex gap-3">
                     <input
                       value={projectPath}
                       onChange={(e) => setProjectPath(e.target.value)}
-                      placeholder="C:\\Users\\mekstein\\source\\repos\\MyProject"
-                      className={`${inputClass} w-full`}
+                      placeholder="C:\\Users\\you\\source\\repos\\MyProject"
+                      className={`${inputClass} w-full font-mono text-sm`}
                     />
 
                     <button
                       onClick={connectProjectAndCollapse}
                       disabled={!projectPath.trim()}
-                      className="rounded-xl bg-slate-950 px-6 font-semibold text-white shadow-sm transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-300 disabled:text-slate-500 disabled:shadow-none"
+                      className="pf-btn-primary shrink-0 px-6 disabled:opacity-40"
                     >
                       Connect
                     </button>
@@ -342,7 +518,7 @@ export default function Composer({
 
       {children}
 
-      <div className="shrink-0 border-t border-slate-300/80 bg-white/90 px-5 py-2 shadow-[0_-12px_34px_rgba(15,23,42,0.12)] backdrop-blur-xl">
+      <div className="shrink-0 border-t border-[var(--pf-border)] bg-[var(--pf-bg-elevated)]/90 px-5 py-3 backdrop-blur-xl">
         <div className="mx-auto max-w-[1200px]">
           {hasConversation && (
             <>
@@ -534,6 +710,44 @@ export default function Composer({
             </div>
           )}
 
+          {quickReplyVisible && (
+            <div className="mb-2 rounded-2xl border border-blue-100 bg-blue-50/80 p-2 shadow-sm">
+              <div className="flex flex-wrap items-center gap-2">
+                {quickReplyOptions.map((option) => {
+                  const selected = selectedQuickReplies.includes(option);
+
+                  return (
+                    <button
+                      key={option}
+                      type="button"
+                      onClick={() => toggleQuickReply(option)}
+                      className={`inline-flex min-h-8 max-w-full items-center rounded-full border px-3 py-1 text-left text-xs font-black transition ${
+                        selected
+                          ? "border-blue-600 bg-blue-600 text-white shadow-sm"
+                          : "border-blue-200 bg-white text-blue-700 hover:border-blue-400 hover:bg-blue-100"
+                      }`}
+                      title={option}
+                    >
+                      <span className="truncate">{option}</span>
+                    </button>
+                  );
+                })}
+
+                {selectedQuickReplies.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={clearSelectedQuickReplies}
+                    className="inline-flex h-8 items-center gap-1 rounded-full border border-slate-300 bg-white px-3 text-xs font-black text-slate-600 transition hover:bg-slate-50"
+                    title="Clear selected replies"
+                  >
+                    <X size={13} />
+                    Clear
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
+
           <div
             onPaste={(e) => {
               if (e.clipboardData.files.length > 0) {
@@ -550,8 +764,85 @@ export default function Composer({
             }}
             className="relative"
           >
+            {primaryComposerUrl && (
+              <div className="mb-2 rounded-[var(--pf-radius-sm)] border border-sky-500/25 bg-sky-500/10 p-3 shadow-sm">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2 text-sm font-black text-sky-100">
+                      <Globe2 size={16} className="text-sky-300" />
+                      Logged-in URL detected
+                    </div>
+                    <p className="mt-1 max-w-3xl text-sm leading-5 text-sky-100/80">
+                      PayFix can read public pages, but private portals need the browser where you are signed in.
+                      Before analyzing, open it in the browser where you are signed in. Then paste the opened page/folder URL,
+                      visible file list, or attach a screenshot.
+                    </p>
+                    <p className="mt-1 max-w-3xl text-xs font-semibold leading-5 text-sky-100/65">
+                      Your draft is not sent yet. Open the logged-in page first, attach/import the visible page evidence, then send.
+                    </p>
+                    <div className="mt-1 truncate text-xs font-semibold text-sky-200/70">{shortHost(primaryComposerUrl)}</div>
+                  </div>
+
+                  <a
+                    href={primaryComposerUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="inline-flex h-9 shrink-0 items-center gap-2 rounded-full border border-sky-400/30 bg-sky-400/10 px-3 text-xs font-black text-sky-100 transition hover:bg-sky-400/20"
+                    title="Opens in your current/default browser. Use browser choices below if you are logged in elsewhere."
+                  >
+                    <ExternalLink size={14} />
+                    Open default
+                  </a>
+                </div>
+
+                <div className="mt-3 flex flex-wrap items-center gap-2">
+                  {browserChoices.map((browser) => (
+                    <button
+                      key={browser.id}
+                      type="button"
+                      onClick={() => chooseLoggedInBrowser(browser)}
+                      className="inline-flex h-9 items-center gap-2 rounded-full border border-white/10 bg-[var(--pf-bg-elevated)] px-3 text-xs font-black text-[var(--pf-text)] transition hover:border-sky-400/40 hover:bg-sky-500/10"
+                      title={`Open this URL in ${browser.label} through PayFix Local Agent. If the agent is not running, PayFix will copy the URL instead.`}
+                    >
+                      <ExternalLink size={13} />
+                      Open {browser.label}
+                    </button>
+                  ))}
+                  {browserSessionHint?.url === primaryComposerUrl && (
+                    <span className="text-xs font-semibold leading-5 text-sky-100/75">{browserSessionHint.message}</span>
+                  )}
+                  <button
+                    type="button"
+                    onClick={continueWithoutBrowser}
+                    className="inline-flex h-9 items-center gap-2 rounded-full border border-amber-300/25 bg-amber-300/10 px-3 text-xs font-black text-amber-100 transition hover:bg-amber-300/20"
+                    title="Skip the logged-in-browser step and let PayFix analyze only what the public/server reader can access."
+                  >
+                    Continue without browser
+                  </button>
+                  <button
+                    type="button"
+                    onClick={importBrowserCapture}
+                    className="inline-flex h-9 items-center gap-2 rounded-full border border-emerald-300/25 bg-emerald-300/10 px-3 text-xs font-black text-emerald-100 transition hover:bg-emerald-300/20"
+                    title="After using the PayFix Page Capture extension, import the latest shared logged-in page as evidence."
+                  >
+                    <Upload size={13} />
+                    Import shared page
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setExtensionHelpOpen(true)}
+                    className="inline-flex h-9 items-center gap-2 rounded-full border border-violet-300/25 bg-violet-300/10 px-3 text-xs font-black text-violet-100 transition hover:bg-violet-300/20"
+                    title="Show exact setup steps for the PayFix browser capture extension."
+                  >
+                    <FileText size={13} />
+                    Setup extension
+                  </button>
+                </div>
+              </div>
+            )}
+
             {/* Unified container so textarea + buttons look like one connected control */}
-            <div className="rounded-2xl bg-white/95 p-2 shadow-[0_10px_30px_rgba(15,23,42,0.13)] ring-1 ring-slate-300/90 transition focus-within:ring-blue-200">
+            <div className="rounded-[var(--pf-radius)] border border-[var(--pf-border)] bg-[var(--pf-surface)]/80 p-2 shadow-[var(--pf-shadow)] transition focus-within:border-sky-500/40 focus-within:shadow-[0_0_0_1px_rgba(56,189,248,0.25)]">
               <div className="relative">
                 {questionLooksLikeCode && (
                   <div className="hidden">
@@ -574,9 +865,7 @@ export default function Composer({
 
                     e.preventDefault();
 
-                    if (canSubmitMessage) {
-                      analyze();
-                    }
+                    submitFromComposer();
                   }}
                   disabled={loading || agentLoading || timelineLoading}
                   placeholder={
@@ -588,10 +877,10 @@ export default function Composer({
                   }
                   // make top part rounded and bottom not so buttons can form the bottom rounded edge
                   style={{ height: composerHeight }}
-                  className={`w-full resize-none rounded-b-none px-4 py-3 pr-40 text-[15px] font-medium shadow-sm transition focus:ring-4 ${
+                  className={`w-full resize-none rounded-b-none border-0 bg-transparent px-4 py-3 pr-40 text-[15px] font-medium shadow-none transition focus:ring-0 ${
                     questionLooksLikeCode
-                      ? "rounded-t-2xl border border-slate-300 bg-white font-mono leading-6 text-[#1f1f1f] caret-[#007acc] placeholder:text-slate-400 shadow-inner selection:bg-[#add6ff] focus:border-[#007acc] focus:ring-[#007acc]/20"
-                      : `${inputClass} rounded-t-2xl`
+                      ? "rounded-t-[var(--pf-radius-sm)] font-mono leading-6 text-[var(--pf-text)] caret-sky-400 selection:bg-sky-500/25"
+                      : "rounded-t-[var(--pf-radius-sm)] text-[var(--pf-text)]"
                   }`}
                   spellCheck={!questionLooksLikeCode}
                   draggable={false}
@@ -599,7 +888,7 @@ export default function Composer({
 
                 <div
                   className={`pointer-events-none absolute bottom-3 right-3 rounded-full px-3 py-1 text-xs font-semibold ${
-                    questionLooksLikeCode ? "bg-blue-50 text-blue-700 shadow-sm ring-1 ring-blue-200" : "bg-slate-100 text-slate-500"
+                    questionLooksLikeCode ? "border border-sky-500/25 bg-sky-500/10 text-sky-300" : "bg-white/5 text-[var(--pf-text-faint)]"
                   }`}
                 >
                   {questionLooksLikeCode ? "Code detected" : "Paste screenshot"}
@@ -615,114 +904,164 @@ export default function Composer({
                       setReplyContextOpen((open) => !open);
                       if (!hasConversation) setSetupOpen((open) => !open);
                     }}
-                    className="inline-flex h-10 items-center gap-2 rounded-xl border border-slate-300 bg-white px-4 text-sm font-bold text-slate-700 shadow-sm transition hover:border-blue-300 hover:bg-blue-50"
+                    className="pf-btn-ghost h-10 px-4 text-sm"
                   >
                     <Plus size={16} />
-                    {hasConversation ? "Add Context" : "Context Workspace"}
+                    {hasConversation ? "Add context" : "Context"}
                   </button>
-
-                  {!hasConversation && (
-                    <button
-                      onClick={loadProjectContext}
-                      disabled={loading || !connectedProjectPath}
-                      className="inline-flex h-10 items-center gap-2 rounded-xl border border-violet-200 bg-violet-50 px-4 text-sm font-bold text-violet-700 shadow-sm transition hover:bg-violet-100 disabled:cursor-not-allowed disabled:border-slate-200 disabled:bg-slate-100 disabled:text-slate-400 disabled:shadow-none"
-                    >
-                      <FolderOpen size={16} />
-                      Use Project Files
-                    </button>
-                  )}
                 </div>
 
                 <div className="flex min-w-0 flex-wrap items-center justify-end gap-2">
-                <button
-                  onClick={analyze}
-                  disabled={!canSubmitMessage}
-                  className="inline-flex h-11 items-center gap-2 rounded-xl bg-blue-600 px-6 text-sm font-black text-white shadow-lg shadow-blue-950/20 transition hover:bg-blue-500 disabled:cursor-not-allowed disabled:bg-blue-300 disabled:shadow-none"
-                >
-                  {loading ? (
-                    <>
-                      <Loader2 size={16} className="animate-spin" />
-                      Sending...
-                    </>
-                  ) : (
-                    <>
-                      <Send size={16} />
-                      {hasConversation ? "Send Reply" : "Analyze"}
-                    </>
-                  )}
-                </button>
-
-                {isEditingMessage && (
                   <button
-                    type="button"
-                    onClick={cancelEditMessage}
-                    disabled={loading || agentLoading || timelineLoading}
-                    className="inline-flex h-10 items-center gap-2 rounded-xl border border-slate-300 bg-white px-4 text-sm font-black text-slate-700 shadow-sm transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:bg-slate-100 disabled:text-slate-400"
+                    onClick={submitFromComposer}
+                    disabled={!canSubmitMessage}
+                    className="pf-btn-primary h-11 px-6 text-sm"
                   >
-                    <X size={16} />
-                    Cancel Edit
-                  </button>
-                )}
-
-                <button
-                  onClick={buildTimeline}
-                  disabled={loading || timelineLoading || agentLoading || !canBuildTimeline}
-                  className="inline-flex h-10 items-center gap-2 rounded-xl border border-slate-300 bg-white px-4 text-sm font-black text-slate-700 shadow-sm transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:bg-slate-100 disabled:text-slate-400 disabled:shadow-none"
-                >
-                  {timelineLoading ? (
-                    <>
-                      <Loader2 size={16} className="animate-spin" />
-                      Building...
-                    </>
-                  ) : (
-                    <>
-                      <Clock3 size={16} />
-                      Trace Timeline
-                    </>
-                  )}
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => setAdvancedActionsOpen((open) => !open)}
-                  className="inline-flex h-10 items-center gap-2 rounded-xl border border-slate-300 bg-white px-3 text-sm font-black text-slate-700 shadow-sm transition hover:bg-slate-50"
-                >
-                  <MoreHorizontal size={16} />
-                  Advanced
-                </button>
-                </div>
-              </div>
-
-              {advancedActionsOpen && (
-                <div className="mt-2 flex flex-wrap justify-end gap-2 rounded-xl border border-slate-200 bg-slate-50 p-2">
-                  <button
-                    onClick={runAgent}
-                    disabled={loading || timelineLoading || agentLoading || !canSend}
-                    className="inline-flex h-10 items-center gap-2 rounded-xl bg-indigo-600 px-4 text-sm font-black text-white shadow-sm transition hover:bg-indigo-500 disabled:cursor-not-allowed disabled:bg-slate-300 disabled:text-slate-500 disabled:shadow-none"
-                  >
-                    {agentLoading ? (
+                    {loading ? (
                       <>
                         <Loader2 size={16} className="animate-spin" />
-                        Agent...
+                        Sending...
                       </>
                     ) : (
                       <>
-                        <Bot size={16} />
-                        Run Agent
+                        <Send size={16} />
+                        {hasConversation ? "Send Reply" : "Analyze"}
                       </>
                     )}
                   </button>
 
-                  <button
-                    onClick={openColorTool}
-                    disabled={loading || agentLoading}
-                    className="inline-flex h-10 items-center gap-2 rounded-xl border border-rose-200 bg-white px-4 text-sm font-black text-rose-700 shadow-sm transition hover:bg-rose-50 disabled:cursor-not-allowed disabled:bg-slate-100 disabled:text-slate-400 disabled:shadow-none"
-                  >
-                    <Wand2 size={16} />
-                    Color Tool
-                  </button>
+                  {isEditingMessage && (
+                    <button
+                      type="button"
+                      onClick={cancelEditMessage}
+                      disabled={loading || agentLoading || timelineLoading}
+                      className="pf-btn-ghost h-10 px-4 text-sm disabled:opacity-40"
+                    >
+                      <X size={16} />
+                      Cancel Edit
+                    </button>
+                  )}
+
+                  <div ref={moreMenuRef} className="relative">
+                    <button
+                      type="button"
+                      onClick={toggleAdvancedActions}
+                      aria-expanded={advancedActionsOpen}
+                      aria-haspopup="menu"
+                      className="pf-btn-ghost h-10 px-3 text-sm"
+                    >
+                      <MoreHorizontal size={16} />
+                      More
+                      <ChevronDown size={14} className={`transition ${advancedActionsOpen ? "rotate-180" : ""}`} />
+                    </button>
+
+                    {advancedActionsOpen && (
+                      <div
+                        role="menu"
+                        className="absolute bottom-full right-0 z-40 mb-2 w-64 overflow-hidden rounded-[var(--pf-radius-sm)] border border-[var(--pf-border)] bg-[var(--pf-bg-elevated)] shadow-2xl shadow-black/35"
+                      >
+                        <div className="border-b border-[var(--pf-border)] px-3 py-2">
+                          <div className="text-xs font-black uppercase tracking-wide text-[var(--pf-text-muted)]">More tools</div>
+                        </div>
+
+                        <div className="p-1.5">
+                          <button
+                            type="button"
+                            role="menuitem"
+                            title="Build a payment-specific timeline from logs or evidence."
+                            onClick={buildTimelineFromMore}
+                            disabled={loading || timelineLoading || agentLoading || !canBuildTimeline}
+                            className="group flex min-h-11 w-full items-center gap-3 rounded-lg px-3 py-2 text-left transition hover:bg-sky-500/10 disabled:cursor-not-allowed disabled:text-[var(--pf-text-faint)]"
+                          >
+                            {timelineLoading ? (
+                              <Loader2 size={16} className="shrink-0 animate-spin text-sky-300" />
+                            ) : (
+                              <Clock3 size={16} className="shrink-0 text-sky-300" />
+                            )}
+                            <span className="min-w-0">
+                              <span className="block text-sm font-bold text-[var(--pf-text)]">Trace Payment</span>
+                              <span className="hidden text-xs text-sky-200/80 group-hover:block">Device, SDK, app request, gateway, final result.</span>
+                            </span>
+                          </button>
+
+                          <button
+                            type="button"
+                            role="menuitem"
+                            title="Open Agent mode for project inspection, patches, validation, installs, or generated apps."
+                            onClick={runAgentFromMore}
+                            disabled={loading || timelineLoading || agentLoading || !canSend}
+                            className="group flex min-h-11 w-full items-center gap-3 rounded-lg px-3 py-2 text-left transition hover:bg-indigo-500/10 disabled:cursor-not-allowed disabled:text-[var(--pf-text-faint)]"
+                          >
+                            {agentLoading ? (
+                              <Loader2 size={16} className="shrink-0 animate-spin text-indigo-300" />
+                            ) : (
+                              <Bot size={16} className="shrink-0 text-indigo-300" />
+                            )}
+                            <span className="min-w-0">
+                              <span className="block text-sm font-bold text-[var(--pf-text)]">Run Agent</span>
+                              <span className="hidden text-xs text-indigo-200/80 group-hover:block">Patch files, validate, install, or build projects.</span>
+                            </span>
+                          </button>
+
+                          <button
+                            type="button"
+                            role="menuitem"
+                            title="Find visible UI problems from a screenshot and prepare a source patch."
+                            onClick={openVisualFixFromMore}
+                            disabled={loading || agentLoading}
+                            className="group flex min-h-11 w-full items-center gap-3 rounded-lg px-3 py-2 text-left transition hover:bg-rose-500/10 disabled:cursor-not-allowed disabled:text-[var(--pf-text-faint)]"
+                          >
+                            <Wand2 size={16} className="shrink-0 text-rose-300" />
+                            <span className="min-w-0">
+                              <span className="block text-sm font-bold text-[var(--pf-text)]">Visual Fix</span>
+                              <span className="hidden text-xs text-rose-200/80 group-hover:block">Screenshot-to-source fixes for contrast/layout.</span>
+                            </span>
+                          </button>
+
+                          {!hasConversation && (
+                            <button
+                              type="button"
+                              role="menuitem"
+                              title="Open the workspace for search, uploads, pasted logs/code, and project context."
+                              onClick={() => {
+                                setSetupOpen((open) => !open);
+                                closeMoreMenu();
+                              }}
+                              className="group flex min-h-11 w-full items-center gap-3 rounded-lg px-3 py-2 text-left transition hover:bg-emerald-500/10"
+                            >
+                              <Paperclip size={16} className="shrink-0 text-emerald-300" />
+                              <span className="min-w-0">
+                                <span className="block text-sm font-bold text-[var(--pf-text)]">Context Workspace</span>
+                                <span className="hidden text-xs text-emerald-200/80 group-hover:block">Search, upload, paste logs/code, or connect a repo.</span>
+                              </span>
+                            </button>
+                          )}
+
+                          {!hasConversation && (
+                            <button
+                              type="button"
+                              role="menuitem"
+                              title="Attach relevant files from the connected project to the regular chat."
+                              onClick={() => {
+                                closeMoreMenu();
+                                loadProjectContext();
+                              }}
+                              disabled={loading || !connectedProjectPath}
+                              className="group flex min-h-11 w-full items-center gap-3 rounded-lg px-3 py-2 text-left transition hover:bg-violet-500/10 disabled:cursor-not-allowed disabled:text-[var(--pf-text-faint)]"
+                            >
+                              <FolderOpen size={16} className="shrink-0 text-violet-300" />
+                              <span className="min-w-0">
+                                <span className="block text-sm font-bold text-[var(--pf-text)]">Use Project Files</span>
+                                <span className="hidden text-xs text-violet-200/80 group-hover:block">Load selected project context into the chat.</span>
+                              </span>
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    )}
+                  </div>
                 </div>
-              )}
+              </div>
             </div>
           </div>
         </div>
@@ -793,6 +1132,72 @@ export default function Composer({
           </div>
         </div>
       )}
+
+      {extensionHelpOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/75 p-6">
+          <div className="w-full max-w-2xl overflow-hidden rounded-[var(--pf-radius)] border border-[var(--pf-border)] bg-[var(--pf-bg-elevated)] shadow-2xl">
+            <div className="flex items-start justify-between gap-4 border-b border-[var(--pf-border)] px-5 py-4">
+              <div>
+                <div className="text-xs font-black uppercase tracking-wide text-sky-300">Logged-in page capture</div>
+                <h2 className="mt-1 text-xl font-black text-[var(--pf-text)]">Set up the PayFix browser extension</h2>
+                <p className="mt-2 text-sm leading-6 text-[var(--pf-text-muted)]">
+                  Use this when a portal needs your browser login. It shares only the page you explicitly capture.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setExtensionHelpOpen(false)}
+                className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-white/5 text-[var(--pf-text)] transition hover:bg-white/10"
+                title="Close extension setup"
+              >
+                <X size={18} />
+              </button>
+            </div>
+
+            <div className="space-y-4 px-5 py-5 text-sm leading-6 text-[var(--pf-text)]">
+              <div className="rounded-[var(--pf-radius-sm)] border border-sky-500/25 bg-sky-500/10 p-4">
+                <div className="font-black text-sky-100">Extension folder</div>
+                <code className="mt-2 block break-all rounded-lg bg-slate-950/70 px-3 py-2 text-xs text-sky-100">
+                  C:\Users\mekstein\payfix-ai\public\payfix-browser-capture-extension
+                </code>
+              </div>
+
+              <div className="grid gap-3 md:grid-cols-2">
+                <div className="rounded-[var(--pf-radius-sm)] border border-[var(--pf-border)] bg-white/[0.03] p-4">
+                  <div className="font-black">Chrome</div>
+                  <ol className="mt-2 list-decimal space-y-1 pl-5 text-[var(--pf-text-muted)]">
+                    <li>Open <code>chrome://extensions</code>.</li>
+                    <li>Turn on <strong>Developer mode</strong>.</li>
+                    <li>Click <strong>Load unpacked</strong>.</li>
+                    <li>Select the extension folder above.</li>
+                  </ol>
+                </div>
+
+                <div className="rounded-[var(--pf-radius-sm)] border border-[var(--pf-border)] bg-white/[0.03] p-4">
+                  <div className="font-black">Microsoft Edge</div>
+                  <ol className="mt-2 list-decimal space-y-1 pl-5 text-[var(--pf-text-muted)]">
+                    <li>Open <code>edge://extensions</code>.</li>
+                    <li>Turn on <strong>Developer mode</strong>.</li>
+                    <li>Click <strong>Load unpacked</strong>.</li>
+                    <li>Select the extension folder above.</li>
+                  </ol>
+                </div>
+              </div>
+
+              <div className="rounded-[var(--pf-radius-sm)] border border-emerald-500/25 bg-emerald-500/10 p-4">
+                <div className="font-black text-emerald-100">Use it on a logged-in portal</div>
+                <ol className="mt-2 list-decimal space-y-1 pl-5 text-emerald-100/80">
+                  <li>Open the logged-in page or SDK folder in that browser.</li>
+                  <li>Click the PayFix extension icon.</li>
+                  <li>Click <strong>Share visible page</strong>.</li>
+                  <li>Return to PayFix and click <strong>Import shared page</strong>.</li>
+                  <li>Click <strong>Analyze</strong>.</li>
+                </ol>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </>
   );
 }
@@ -840,3 +1245,4 @@ function SearchFields({
     </div>
   );
 }
+

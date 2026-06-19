@@ -1,5 +1,7 @@
 import OpenAI from "openai";
 
+import { payfixResponseConfig } from "../lib/modelRouting";
+
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
@@ -13,7 +15,7 @@ export async function POST(req: Request) {
     const updatedContent = String(body.updatedContent || "");
 
     const response = await openai.responses.create({
-      model: "gpt-4.1-mini",
+      ...payfixResponseConfig("validation"),
       max_output_tokens: 1000,
       input: [
         {

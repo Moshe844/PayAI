@@ -1,0 +1,12 @@
+{
+  "manifest_version": 3,
+  "name": "PayFix Page Capture",
+  "version": "0.1.0",
+  "description": "Share the currently visible logged-in page with PayFix by explicit click.",
+  "action": {
+    "default_title": "Share page with PayFix",
+    "default_popup": "popup.html"
+  },
+  "permissions": ["activeTab", "scripting"],
+  "host_permissions": ["http://localhost:3000/*", "http://127.0.0.1:3000/*"]
+}

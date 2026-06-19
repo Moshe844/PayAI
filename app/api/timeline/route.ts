@@ -1,5 +1,6 @@
 import OpenAI from "openai";
 
+import { payfixResponseConfig } from "../lib/modelRouting";
 import { lookupAplUpcs, type AplIndexResult } from "../../lib/aplIndex";
 import { decodeEmvTlv, emvDecodeToTimeline, looksLikeEmvTlv } from "../../lib/emvTlv";
 import type {
@@ -552,169 +553,170 @@ ${
       needsExternalProductLookup(enhancedTextContext) || ewicEvidence.upcs.length > 0 || aplSources.length > 0;
 
     const response = await openai.responses.create({
-      model: "gpt-4.1-mini",
+      ...payfixResponseConfig("timeline", {
+        text: {
+          format: {
+            type: "json_schema",
+            name: "payment_trace_timeline",
+            schema: {
+              type: "object",
+              additionalProperties: false,
+              properties: {
+                summary: { type: "string" },
+                rootCauseAnalysis: {
+                  type: "object",
+                  additionalProperties: false,
+                  properties: {
+                    title: { type: "string" },
+                    detail: { type: "string" },
+                    confidence: { type: "number" },
+                    evidence: { type: "array", items: { type: "string" } },
+                  },
+                  required: ["title", "detail", "confidence", "evidence"],
+                },
+                investigationFindings: {
+                  type: "array",
+                  items: {
+                    type: "object",
+                    additionalProperties: false,
+                    properties: {
+                      title: { type: "string" },
+                      detail: { type: "string" },
+                      severity: { type: "string", enum: ["info", "warning", "critical"] },
+                      evidence: { type: "string" },
+                    },
+                    required: ["title", "detail", "severity", "evidence"],
+                  },
+                },
+                fixActions: {
+                  type: "array",
+                  items: {
+                    type: "object",
+                    additionalProperties: false,
+                    properties: {
+                      title: { type: "string" },
+                      detail: { type: "string" },
+                      owner: { type: "string" },
+                      priority: { type: "string", enum: ["info", "warning", "critical"] },
+                    },
+                    required: ["title", "detail", "owner", "priority"],
+                  },
+                },
+                externalLookups: {
+                  type: "array",
+                  items: {
+                    type: "object",
+                    additionalProperties: false,
+                    properties: {
+                      query: { type: "string" },
+                      result: { type: "string" },
+                      sourceUrl: { type: "string" },
+                      confidence: { type: "number" },
+                    },
+                    required: ["query", "result", "sourceUrl", "confidence"],
+                  },
+                },
+                aplSources: {
+                  type: "array",
+                  items: {
+                    type: "object",
+                    additionalProperties: false,
+                    properties: {
+                      state: { type: "string" },
+                      url: { type: "string" },
+                      note: { type: "string" },
+                    },
+                    required: ["state", "url", "note"],
+                  },
+                },
+                lineItemAnalysis: {
+                  type: "array",
+                  items: {
+                    type: "object",
+                    additionalProperties: false,
+                    properties: {
+                      line: { type: "string" },
+                      upc: { type: "string" },
+                      quantity: { type: "string" },
+                      unitPrice: { type: "string" },
+                      amount: { type: "string" },
+                      category: { type: "string" },
+                      aplStatus: { type: "string" },
+                      finding: { type: "string" },
+                      severity: { type: "string", enum: ["info", "warning", "critical"] },
+                      evidence: { type: "string" },
+                    },
+                    required: [
+                      "line",
+                      "upc",
+                      "quantity",
+                      "unitPrice",
+                      "amount",
+                      "category",
+                      "aplStatus",
+                      "finding",
+                      "severity",
+                      "evidence",
+                    ],
+                  },
+                },
+                events: {
+                  type: "array",
+                  items: {
+                    type: "object",
+                    additionalProperties: false,
+                    properties: {
+                      id: { type: "string" },
+                      stage: { type: "string", enum: stages },
+                      timestamp: { type: "string" },
+                      sequence: { type: "number" },
+                      source: { type: "string" },
+                      action: { type: "string" },
+                      status: { type: "string" },
+                      gateway: { type: "string" },
+                      transactionId: { type: "string" },
+                      orderId: { type: "string" },
+                      amount: { type: "string" },
+                      evidence: { type: "string" },
+                      confidence: { type: "number" },
+                    },
+                    required: [
+                      "id",
+                      "stage",
+                      "timestamp",
+                      "sequence",
+                      "source",
+                      "action",
+                      "status",
+                      "gateway",
+                      "transactionId",
+                      "orderId",
+                      "amount",
+                      "evidence",
+                      "confidence",
+                    ],
+                  },
+                },
+                recommendedNextSteps: { type: "array", items: { type: "string" } },
+              },
+              required: [
+                "summary",
+                "rootCauseAnalysis",
+                "investigationFindings",
+                "fixActions",
+                "externalLookups",
+                "aplSources",
+                "lineItemAnalysis",
+                "events",
+                "recommendedNextSteps",
+              ],
+            },
+            strict: true,
+          },
+        },
+      }),
       max_output_tokens: 5000,
       tools: useProductLookup ? [{ type: "web_search_preview" }] : [],
-      text: {
-        format: {
-          type: "json_schema",
-          name: "payment_trace_timeline",
-          schema: {
-            type: "object",
-            additionalProperties: false,
-            properties: {
-              summary: { type: "string" },
-              rootCauseAnalysis: {
-                type: "object",
-                additionalProperties: false,
-                properties: {
-                  title: { type: "string" },
-                  detail: { type: "string" },
-                  confidence: { type: "number" },
-                  evidence: { type: "array", items: { type: "string" } },
-                },
-                required: ["title", "detail", "confidence", "evidence"],
-              },
-              investigationFindings: {
-                type: "array",
-                items: {
-                  type: "object",
-                  additionalProperties: false,
-                  properties: {
-                    title: { type: "string" },
-                    detail: { type: "string" },
-                    severity: { type: "string", enum: ["info", "warning", "critical"] },
-                    evidence: { type: "string" },
-                  },
-                  required: ["title", "detail", "severity", "evidence"],
-                },
-              },
-              fixActions: {
-                type: "array",
-                items: {
-                  type: "object",
-                  additionalProperties: false,
-                  properties: {
-                    title: { type: "string" },
-                    detail: { type: "string" },
-                    owner: { type: "string" },
-                    priority: { type: "string", enum: ["info", "warning", "critical"] },
-                  },
-                  required: ["title", "detail", "owner", "priority"],
-                },
-              },
-              externalLookups: {
-                type: "array",
-                items: {
-                  type: "object",
-                  additionalProperties: false,
-                  properties: {
-                    query: { type: "string" },
-                    result: { type: "string" },
-                    sourceUrl: { type: "string" },
-                    confidence: { type: "number" },
-                  },
-                  required: ["query", "result", "sourceUrl", "confidence"],
-                },
-              },
-              aplSources: {
-                type: "array",
-                items: {
-                  type: "object",
-                  additionalProperties: false,
-                  properties: {
-                    state: { type: "string" },
-                    url: { type: "string" },
-                    note: { type: "string" },
-                  },
-                  required: ["state", "url", "note"],
-                },
-              },
-              lineItemAnalysis: {
-                type: "array",
-                items: {
-                  type: "object",
-                  additionalProperties: false,
-                  properties: {
-                    line: { type: "string" },
-                    upc: { type: "string" },
-                    quantity: { type: "string" },
-                    unitPrice: { type: "string" },
-                    amount: { type: "string" },
-                    category: { type: "string" },
-                    aplStatus: { type: "string" },
-                    finding: { type: "string" },
-                    severity: { type: "string", enum: ["info", "warning", "critical"] },
-                    evidence: { type: "string" },
-                  },
-                  required: [
-                    "line",
-                    "upc",
-                    "quantity",
-                    "unitPrice",
-                    "amount",
-                    "category",
-                    "aplStatus",
-                    "finding",
-                    "severity",
-                    "evidence",
-                  ],
-                },
-              },
-              events: {
-                type: "array",
-                items: {
-                  type: "object",
-                  additionalProperties: false,
-                  properties: {
-                    id: { type: "string" },
-                    stage: { type: "string", enum: stages },
-                    timestamp: { type: "string" },
-                    sequence: { type: "number" },
-                    source: { type: "string" },
-                    action: { type: "string" },
-                    status: { type: "string" },
-                    gateway: { type: "string" },
-                    transactionId: { type: "string" },
-                    orderId: { type: "string" },
-                    amount: { type: "string" },
-                    evidence: { type: "string" },
-                    confidence: { type: "number" },
-                  },
-                  required: [
-                    "id",
-                    "stage",
-                    "timestamp",
-                    "sequence",
-                    "source",
-                    "action",
-                    "status",
-                    "gateway",
-                    "transactionId",
-                    "orderId",
-                    "amount",
-                    "evidence",
-                    "confidence",
-                  ],
-                },
-              },
-              recommendedNextSteps: { type: "array", items: { type: "string" } },
-            },
-            required: [
-              "summary",
-              "rootCauseAnalysis",
-              "investigationFindings",
-              "fixActions",
-              "externalLookups",
-              "aplSources",
-              "lineItemAnalysis",
-              "events",
-              "recommendedNextSteps",
-            ],
-          },
-          strict: true,
-        },
-      },
       input: [
         {
           role: "system",
@@ -774,7 +776,7 @@ Rules:
     return Response.json({ ok: true, timeline: result });
   } catch (error: unknown) {
     return Response.json(
-      { ok: false, error: error instanceof Error ? error.message : "Failed to build payment timeline." },
+      { ok: false, error: error instanceof Error ? error.message : "Failed to build payment trace." },
       { status: 500 },
     );
   }

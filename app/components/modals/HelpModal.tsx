@@ -7,8 +7,8 @@ type HelpModalProps = {
 const sections = [
   {
     title: "Regular Chat",
-    body: "Use for explanations, screenshots, log review, decoding, image conversion, EMV questions, and quick technical help. It can read attached context but should not modify your project.",
-    examples: ["Decode this base64/JWT", "What does this EMV tag mean?", "What is this screenshot showing?", "Explain this gateway error"],
+    body: "Use for reading and explaining evidence: screenshots, images, logs, TLV/EMV, gateway responses, pasted code snippets, image conversion, and quick technical questions. It can inspect attached context but should not modify your project.",
+    examples: ["Compare these two logs", "What does this screenshot show?", "Explain this gateway error", "Decode this EMV tag"],
   },
   {
     title: "Project Path",
@@ -27,13 +27,13 @@ const sections = [
   },
   {
     title: "Run Agent",
-    body: "Use when a connected project needs inspection, patches, validation, or dependency checks. Agent mode reads exact files, proposes verified changes, and asks before installing packages.",
-    examples: ["Find why my TypeScript project fails", "Fix this payment form bug", "Apply a safe patch", "Install a missing dependency after approval"],
+    body: "Use only when you want engineering work that Regular Chat should not do: connected-project inspection, file edits, patches, validation, installs, generated projects, Visual Fix, or multi-file codebase work.",
+    examples: ["Fix this payment form bug in the project", "Apply a safe patch", "Run validation after changing files", "Install a missing dependency after approval"],
   },
   {
-    title: "Trace Timeline",
-    body: "Use when you have a real payment flow across multiple systems: frontend submit, backend request, gateway response, webhook, database update, UI state, or device logs.",
-    examples: ["Build a timeline from these request/response logs", "Find missing webhook", "Detect duplicate gateway event", "Compare gateway status with DB status"],
+    title: "Payment Trace",
+    body: "Use when you have a real payment flow across device read, EMV/TLV, SDK event, app request, gateway response, webhook, database update, UI state, or device logs.",
+    examples: ["Build a trace from these request/response logs", "Find missing webhook", "Detect duplicate gateway event", "Compare gateway status with DB status"],
   },
   {
     title: "EMV Decoder",
@@ -64,34 +64,33 @@ const sections = [
 
 export default function HelpModal({ onClose }: HelpModalProps) {
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-6">
-      <div className="flex max-h-[90vh] w-full max-w-5xl flex-col overflow-hidden rounded-2xl bg-white shadow-2xl">
-        <div className="flex items-center justify-between border-b border-slate-200 px-6 py-5">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-6 backdrop-blur-sm">
+      <div className="pf-panel flex max-h-[90vh] w-full max-w-5xl flex-col overflow-hidden">
+        <div className="flex items-center justify-between border-b border-[var(--pf-border)] px-6 py-5">
           <div>
-            <div className="flex items-center gap-2 text-xs font-bold uppercase tracking-wide text-blue-600">
+            <div className="flex items-center gap-2 pf-section-label text-sky-400">
               <HelpCircle size={16} />
               PayFix Help
             </div>
-            <h3 className="mt-1 text-2xl font-bold">How To Use This Workspace</h3>
+            <h3 className="mt-1 text-2xl font-bold text-[var(--pf-text)]">How to use this workspace</h3>
           </div>
-          <button
-            type="button"
-            onClick={onClose}
-            className="inline-flex items-center gap-2 rounded-xl bg-slate-100 px-4 py-2 font-semibold text-slate-700 transition hover:bg-slate-200"
-          >
+          <button type="button" onClick={onClose} className="pf-btn-ghost h-10 px-4">
             <X size={16} />
             Close
           </button>
         </div>
 
-        <div className="min-h-0 flex-1 overflow-auto bg-slate-100 p-6">
-          <div className="grid grid-cols-1 gap-5 md:grid-cols-2">
+        <div className="min-h-0 flex-1 overflow-auto p-6">
+          <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
             {sections.map((section) => (
-              <section key={section.title} className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
-                <h4 className="text-lg font-bold">{section.title}</h4>
-                <p className="mt-2 text-sm leading-6 text-slate-600">{section.body}</p>
-                <div className="mt-4 text-xs font-bold uppercase tracking-wide text-slate-400">Examples</div>
-                <ul className="mt-2 list-disc space-y-1 pl-5 text-sm leading-6 text-slate-700">
+              <section
+                key={section.title}
+                className="rounded-[var(--pf-radius)] border border-[var(--pf-border)] bg-white/[0.03] p-5"
+              >
+                <h4 className="text-lg font-bold text-[var(--pf-text)]">{section.title}</h4>
+                <p className="mt-2 text-sm leading-6 text-[var(--pf-text-muted)]">{section.body}</p>
+                <div className="mt-4 pf-section-label">Examples</div>
+                <ul className="mt-2 list-disc space-y-1 pl-5 text-sm leading-6 text-[var(--pf-text-muted)]">
                   {section.examples.map((example) => (
                     <li key={example}>{example}</li>
                   ))}
@@ -100,19 +99,21 @@ export default function HelpModal({ onClose }: HelpModalProps) {
             ))}
           </div>
 
-          <section className="mt-5 rounded-2xl border border-blue-200 bg-blue-50 p-5 text-sm leading-6 text-blue-950">
-            <div className="font-bold">A good rule</div>
-            <p className="mt-1">
-              Ask Regular Chat when you want understanding. Use Run Agent when you want project changes. Use Trace Timeline when
+          <section className="mt-5 rounded-[var(--pf-radius)] border border-sky-500/25 bg-sky-500/10 p-5 text-sm leading-6 text-sky-100">
+            <div className="font-bold text-sky-50">A good rule</div>
+            <p className="mt-1 text-sky-100/90">
+              Ask Regular Chat when you want understanding. Use Run Agent when you want project changes. Use Payment Trace when
               you have multiple payment-flow events. Use EMV Decoder when the input is raw card/device TLV. Use Device Lab
               when the problem may be a reader, USB, COM port, or driver issue.
             </p>
           </section>
 
-          <section className="mt-5 rounded-2xl border border-slate-200 bg-white p-5 text-sm leading-6 text-slate-700">
-            <div className="font-bold text-slate-950">First-time setup</div>
+          <section className="mt-5 rounded-[var(--pf-radius)] border border-[var(--pf-border)] bg-white/[0.03] p-5 text-sm leading-6 text-[var(--pf-text-muted)]">
+            <div className="font-bold text-[var(--pf-text)]">First-time setup</div>
             <ol className="mt-2 list-decimal space-y-1 pl-5">
-              <li>Start the local agent in the <span className="font-mono">payfix-agent</span> folder.</li>
+              <li>
+                Start the local agent in the <span className="font-mono text-sky-300">payfix-agent</span> folder.
+              </li>
               <li>Paste your project folder into Project Path and click Connect.</li>
               <li>Use Regular Chat for explanations, Use Project Files for context, or Run Agent for real code fixes.</li>
               <li>Attach screenshots/logs before sending when they are part of the problem.</li>

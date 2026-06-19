@@ -25,11 +25,27 @@ async function proxyToLocalAgent(request: Request, context: RouteContext) {
       body: request.method === "GET" || request.method === "HEAD" ? undefined : await request.text(),
       cache: "no-store",
     });
+    const responseText = await response.text();
+    const responseContentType = response.headers.get("content-type") || "application/json";
 
-    return new Response(await response.text(), {
+    if (!responseContentType.includes("application/json")) {
+      return Response.json(
+        {
+          ok: false,
+          error: `Local agent returned ${responseContentType || "non-JSON"} for /${path.join("/")}. ${
+            response.status === 404
+              ? "The running payfix-agent may be old or missing this endpoint. Restart payfix-agent and try again."
+              : responseText.replace(/\s+/g, " ").slice(0, 220)
+          }`,
+        },
+        { status: response.ok ? 502 : response.status },
+      );
+    }
+
+    return new Response(responseText, {
       status: response.status,
       headers: {
-        "content-type": response.headers.get("content-type") || "application/json",
+        "content-type": responseContentType,
       },
     });
   } catch (error: unknown) {

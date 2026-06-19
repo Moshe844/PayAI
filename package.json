@@ -6,6 +6,9 @@
     "dev": "node --use-system-ca node_modules/next/dist/bin/next dev",
     "build": "node --use-system-ca node_modules/next/dist/bin/next build",
     "start": "node --use-system-ca node_modules/next/dist/bin/next start",
+    "eval:answers": "node scripts/payfix-answer-evals.mjs",
+    "eval:intents": "node scripts/payfix-intent-evals.mjs",
+    "eval:agent-router": "tsx scripts/payfix-agent-router-evals.ts",
     "lint": "eslint"
   },
   "dependencies": {

@@ -15,6 +15,7 @@ import {
   RotateCcw,
   Search,
   ShieldAlert,
+  Square,
   Usb,
   Webhook,
   Wrench,
@@ -42,6 +43,7 @@ import RunnerModal from "./components/modals/RunnerModal";
 import TimelineModal from "./components/modals/TimelineModal";
 import WebhookLabModal from "./components/modals/WebhookLabModal";
 import { decodeEmvTlv, looksLikeEmvTlv } from "./lib/emvTlv";
+import { asksCommandLocationHelp, asksContextualClarificationFollowUp, asksGradleTrustCheck, asksToExplainQuotedChoices, asksToRunReferencedCommands, classifyAgentFollowUpIntent, hasTerminalCommandOutput, selectedPreviousOption } from "./lib/agentIntent";
 import {
   buildRunnerSrcDoc,
   readBrowserFile,
@@ -75,6 +77,9 @@ type DraftState = {
   uploadedFiles?: UploadedFile[];
   messages?: ChatMessage[];
   activeChatId?: string;
+  agentSessionOpen?: boolean;
+  agentSessionMessages?: ChatMessage[];
+  agentSessionUploads?: UploadedFile[];
 };
 
 type ComputerSearchResult = {
@@ -88,6 +93,51 @@ type ProjectMatch = {
   file: string;
   line: number;
   text: string;
+};
+
+type BrowserCapture = {
+  id: string;
+  capturedAt: string;
+  url: string;
+  title: string;
+  text: string;
+  links?: { text: string; href: string }[];
+  meta?: {
+    userAgent?: string;
+    selectionText?: string;
+  };
+};
+
+type SdkInspectionResponse = {
+  ok?: boolean;
+  root?: string;
+  totalFiles?: number;
+  importantFiles?: {
+    file: string;
+    relative: string;
+    size: number;
+    mime: string;
+    role: string;
+  }[];
+  readableFiles?: {
+    file: string;
+    relative: string;
+    size: number;
+    mime: string;
+    role: string;
+    content?: string;
+  }[];
+  error?: string;
+};
+
+type CreateProjectResponse = {
+  ok: boolean;
+  path?: string;
+  folderName?: string;
+  files?: string[];
+  runCommands?: string[];
+  markdown?: string;
+  error?: string;
 };
 
 type ProjectMemoryResult = {
@@ -127,6 +177,56 @@ type GitStatusResult = {
   dirty?: boolean;
   changedFiles?: { status: string; file: string }[];
   diffStat?: string;
+  error?: string;
+};
+
+type PortManagerResult = {
+  ok: boolean;
+  currentRoot?: string | null;
+  ports?: {
+    port: number;
+    localAddresses?: string[];
+    devServerLikely?: boolean;
+    currentAgent?: boolean;
+    processes?: {
+      processId?: number;
+      name?: string;
+      executablePath?: string;
+      commandLine?: string;
+    }[];
+    projectCandidates?: {
+      root: string;
+      packageName?: string;
+      framework?: string;
+      confidence?: number;
+      reason?: string;
+      processHint?: string;
+    }[];
+  }[];
+  error?: string;
+};
+
+type ToolchainDoctorItem = {
+  id: string;
+  label: string;
+  detected: boolean;
+  available: boolean;
+  requiredCommands: string[];
+  availableCommands: string[];
+  missingCommands: string[];
+  version?: string;
+  installHint: string;
+  installCommand?: string;
+  installUrl?: string;
+};
+
+type ToolchainDoctorResult = {
+  ok: boolean;
+  root?: string;
+  detectedLanguages?: string[];
+  items?: ToolchainDoctorItem[];
+  missing?: ToolchainDoctorItem[];
+  unavailableValidation?: string[];
   error?: string;
 };
 
@@ -192,7 +292,7 @@ type ProjectReadResponse = {
 };
 
 type AgentPatch = {
-  mode: "replace" | "insert" | "none";
+  mode: "replace" | "insert" | "delete" | "none";
   file: string;
   search: string;
   replacement: string;
@@ -203,7 +303,7 @@ type AgentPatch = {
 type ApplyPatchSetItem = {
   fileCandidate: string;
   resolvedFile: string;
-  mode: "insert" | "replace" | "overwrite";
+  mode: "insert" | "replace" | "overwrite" | "delete";
   search: string;
   replacement: string;
 };
@@ -211,6 +311,10 @@ type ApplyPatchSetItem = {
 type DependencyProposal = {
   needed: boolean;
   packageName: string;
+  packageNames?: string[];
+  ecosystem?: "node" | "python" | "dotnet" | "rust" | "go" | "php" | "ruby" | "java" | "manual";
+  installCommand?: string;
+  installable?: boolean;
   devDependency: boolean;
   reason: string;
 };
@@ -240,6 +344,7 @@ type AgentApiResponse = {
     kind: string;
     size: number;
   }[];
+  selectedFiles?: string[];
   loopSteps?: {
     step: string;
     status: "done" | "skipped" | "blocked";
@@ -247,27 +352,156 @@ type AgentApiResponse = {
   }[];
 };
 
+type AgentProgressResponse = {
+  ok: boolean;
+  progress?: {
+    message: string;
+    step: string;
+    at: string;
+  } | null;
+};
+
+type AgentIntentApiResponse = {
+  ok: boolean;
+  route?: ReturnType<typeof classifyAgentFollowUpIntent>["route"];
+  reason?: string;
+  useImages?: boolean;
+  shouldRunProjectValidation?: boolean;
+  error?: string;
+};
+
+function isAgentApiResponse(value: unknown): value is AgentApiResponse {
+  return Boolean(value && typeof value === "object" && "patchReady" in value && "result" in value);
+}
+
+function primaryAgentPatch(data?: AgentApiResponse | null) {
+  if (!data?.patchReady) return null;
+
+  const directPatch = data.result?.patch;
+  if (directPatch && directPatch.mode !== "none") return directPatch;
+
+  const patchSet = data.result?.patchSet || data.patchSet || [];
+  return patchSet.find((item) => item.mode !== "none") || null;
+}
+
+function agentResponseHasApplyablePatch(data?: AgentApiResponse | null) {
+  const patch = primaryAgentPatch(data);
+  return Boolean(data?.patchReady && patch?.file);
+}
+
+function titleFromChatMessages(nextMessages: ChatMessage[]) {
+  const directUser = nextMessages.find((message) => message.role === "user" && message.content.trim())?.content.trim();
+  const agentUser = nextMessages
+    .flatMap((message) => message.agentSessionMessages || [])
+    .find((message) => message.role === "user" && message.content.trim())?.content.trim();
+  const source = directUser || agentUser || "PayFix investigation";
+
+  if (source === "Analyze attached context.") return "Attached context analysis";
+  if (/^(new chat|payfix investigation)$/i.test(source)) {
+    const assistantHint =
+      nextMessages
+        .flatMap((message) => [message, ...(message.agentSessionMessages || [])])
+        .find((message) => message.role === "assistant" && message.content.trim())?.content.trim() || source;
+    const firstLine = assistantHint.split(/\r?\n/).find((line) => line.trim() && !/^payfix investigation saved$/i.test(line.trim()));
+    return (firstLine || source).replace(/^request:\s*/i, "").slice(0, 60);
+  }
+
+  return source.slice(0, 60);
+}
+
+function normalizeSavedChatTitle(chat: SavedChat) {
+  const withActivity = chat.lastActivityAt ? chat : { ...chat, lastActivityAt: chat.createdAt };
+  if (!/^(new chat|payfix investigation)$/i.test(withActivity.title.trim())) return withActivity;
+
+  const recoveredTitle = titleFromChatMessages(withActivity.messages || []);
+  return recoveredTitle && recoveredTitle !== withActivity.title ? { ...withActivity, title: recoveredTitle } : withActivity;
+}
+
+function isAgentWorkspaceStatusMessage(message: ChatMessage) {
+  return (
+    message.role === "assistant" &&
+    /Dependency installed|PATCH APPLIED BY AGENT|PATCH VALIDATION|PATCH ROLLED BACK/i.test(message.content)
+  );
+}
+
+function isWorkingAssistantMessage(content: string) {
+  return /^(Agent is running|PayFix is reading|PayFix Agent is|PayFix Agent|Reviewing the screenshots|Answering your focused follow-up|Checking the current build error|Checking the connected project error|Running |Choosing |Reading |Following |Reasoning |Scanning |Evidence-only mode|Investigating evidence|Previewing |Dry-running |Applying |Installing |Validating |Preparing |Prepared |Checked |Connecting |Loading |Loaded |Selecting |Inspecting |SDK folder|Feeding |Checking |Toolchain |Project investigation)/i.test(
+    content,
+  );
+}
+
+function isStaleGenericAgentContext(content: string) {
+  const normalized = content.replace(/\s+/g, " ").trim();
+  return (
+    /\b(Log comparison|Needs attention|AGENT INVESTIGATION COMPLETE)\b/i.test(normalized) &&
+    /\b(compared the uploaded evidence|highlighted suspect-only|uploaded evidence|No concrete bug was proven|No automatic patch is ready|confidence was too low|Validation not run|PayFix found a blocker but does not have a safe patch)\b/i.test(
+      normalized,
+    )
+  );
+}
+
+function latestActionableAssistantContext(messages: ChatMessage[]) {
+  return (
+    [...messages]
+      .reverse()
+      .find(
+        (message) =>
+          message.role === "assistant" &&
+          message.content.trim() &&
+          !isWorkingAssistantMessage(message.content) &&
+          !isStaleGenericAgentContext(message.content),
+      )?.content || ""
+  );
+}
+
+function formatRecentAgentContext(messages: ChatMessage[], limit: number, maxChars: number) {
+  return [...messages]
+    .filter((message) => message.content.trim())
+    .reverse()
+    .slice(0, limit)
+    .reverse()
+    .map((message) => `${message.role.toUpperCase()}: ${message.content.slice(0, maxChars)}`)
+    .join("\n\n");
+}
+
+function recoverAgentTrailForMessages(messages: ChatMessage[], agentTrail: ChatMessage[]) {
+  if (!agentTrail.some((message) => message.role === "assistant")) return messages;
+
+  let changed = false;
+  const recovered = messages.map((message) => {
+    if (!isAgentWorkspaceStatusMessage(message) || message.agentSessionMessages?.length) return message;
+
+    changed = true;
+    return {
+      ...message,
+      agentSessionMessages: [...agentTrail, message],
+    };
+  });
+
+  return changed ? recovered : messages;
+}
+
 function statusTone(message: string) {
   if (/failed|error|blocked|could not|no .*found|invalid/i.test(message)) {
     return {
-      dot: "bg-amber-500",
-      shell: "border-amber-200 bg-amber-50 text-amber-900 shadow-amber-950/10",
-      hover: "hover:bg-amber-100",
+      dot: "bg-amber-400",
+      shell: "border-amber-500/30 bg-amber-500/10 text-amber-100 shadow-lg shadow-black/30",
+      hover: "hover:bg-amber-500/15",
     };
   }
 
   if (/success|connected|loaded|applied|complete|ready|found no obvious/i.test(message)) {
     return {
-      dot: "bg-emerald-500",
-      shell: "border-emerald-200 bg-emerald-50 text-emerald-900 shadow-emerald-950/10",
-      hover: "hover:bg-emerald-100",
+      dot: "bg-emerald-400",
+      shell: "border-emerald-500/30 bg-emerald-500/10 text-emerald-100 shadow-lg shadow-black/30",
+      hover: "hover:bg-emerald-500/15",
     };
   }
 
   return {
-    dot: "bg-blue-500",
-    shell: "border-blue-200 bg-blue-50 text-blue-900 shadow-blue-950/10",
-    hover: "hover:bg-blue-100",
+    dot: "bg-sky-400",
+    shell: "border-sky-500/30 bg-sky-500/10 text-sky-100 shadow-lg shadow-black/30",
+    hover: "hover:bg-sky-500/15",
   };
 }
 
@@ -277,6 +511,7 @@ type RollbackSnapshot = {
   relative: string;
   createdAt: string;
   reason: string;
+  fileExisted?: boolean;
 };
 
 type AppliedPatchNotice = {
@@ -313,6 +548,16 @@ type ImageConversionTarget = {
   label: string;
 };
 
+type ImageEditPlan = {
+  mode: "canvas" | "resize";
+  target: ImageConversionTarget;
+  label: string;
+  suffix: string;
+  aspectRatio?: number;
+  maxSide?: number;
+  mask?: "circle";
+};
+
 type DeviceScanResult = {
   ok?: boolean;
   error?: string;
@@ -326,6 +571,104 @@ type LiveVisualTarget = NonNullable<LiveAppInspectionResult["dom"]>["visualTarge
 
 function errorMessage(error: unknown, fallback = "Something went wrong.") {
   return error instanceof Error ? error.message : fallback;
+}
+
+function agentRunErrorMessage(error: unknown) {
+  if (error instanceof Error && error.name === "AbortError") {
+    return "Agent timed out after 3 minutes. Try a narrower request, or ask PayFix to inspect one specific file/workflow first.";
+  }
+
+  return errorMessage(error);
+}
+
+function trimStoredFile(file: UploadedFile): UploadedFile {
+  const isHeavyImage = file.isImage || /^data:image\//i.test(file.content);
+  if (!isHeavyImage && file.content.length <= 250_000) return file;
+
+  return {
+    ...file,
+    content: "",
+  };
+}
+
+function imageDimensionsFromDataUrl(dataUrl: string): Promise<{ width: number; height: number } | null> {
+  return new Promise((resolve) => {
+    const image = new window.Image();
+    image.onload = () => resolve({ width: image.naturalWidth, height: image.naturalHeight });
+    image.onerror = () => resolve(null);
+    image.src = dataUrl;
+  });
+}
+
+function trimStoredGeneratedFile(file: GeneratedFile): GeneratedFile {
+  const isHeavyImage = /^data:image\//i.test(file.content);
+  if (!isHeavyImage && file.content.length <= 250_000) return file;
+
+  return {
+    ...file,
+    content: "",
+  };
+}
+
+function trimStoredMessage(message: ChatMessage): ChatMessage {
+  return {
+    ...message,
+    attachedUploads: message.attachedUploads?.map(trimStoredFile),
+    generatedFiles: message.generatedFiles?.map(trimStoredGeneratedFile),
+    agentSessionMessages: message.agentSessionMessages?.map(trimStoredMessage),
+  };
+}
+
+function trimSavedChatForStorage(chat: SavedChat): SavedChat {
+  return {
+    ...chat,
+    messages: chat.messages.map(trimStoredMessage),
+  };
+}
+
+function trimDraftForStorage(draft: DraftState): DraftState {
+  return {
+    ...draft,
+    uploadedFiles: draft.uploadedFiles?.map(trimStoredFile),
+    messages: draft.messages?.map(trimStoredMessage),
+    agentSessionMessages: draft.agentSessionMessages?.map(trimStoredMessage),
+    agentSessionUploads: draft.agentSessionUploads?.map(trimStoredFile),
+  };
+}
+
+function safeSetJsonStorage(key: string, value: unknown, fallback?: unknown) {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+    return true;
+  } catch {
+    if (fallback === undefined) return false;
+
+    try {
+      localStorage.setItem(key, JSON.stringify(fallback));
+      return true;
+    } catch {
+      try {
+        localStorage.removeItem(key);
+      } catch {
+        // Storage can be unavailable or full; keep the app running either way.
+      }
+      return false;
+    }
+  }
+}
+
+async function fetchAgentWithTimeout(input: RequestInfo | URL, init: RequestInit, timeoutMs = 180000) {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await fetch(input, {
+      ...init,
+      signal: controller.signal,
+    });
+  } finally {
+    window.clearTimeout(timeout);
+  }
 }
 
 function cssRgbToHex(value: string) {
@@ -373,8 +716,111 @@ function timelineSourceLooksTraceable(source: {
   );
 }
 
+function splitOptionList(value: string) {
+  return value
+    .replace(/\band\/or\b/gi, ",")
+    .replace(/\bor\b/gi, ",")
+    .split(/[,;/|]+/)
+    .map((item) => item.replace(/\([^)]*\)/g, "").trim())
+    .filter((item) => item.length >= 3 && item.length <= 64)
+    .filter((item, index, items) => items.findIndex((candidate) => candidate.toLowerCase() === item.toLowerCase()) === index);
+}
+
+function extractQuickReplyOptions(content: string) {
+  const text = content.trim();
+  const labeledChoices = [...text.matchAll(/(?:^|\n)\s*([A-E])[\).:\s-]+([\s\S]+?)(?=\n\s*[A-E][\).:\s-]+|\n\s*$)/gi)]
+    .map((match) => {
+      const letter = (match[1] || "").toUpperCase();
+      const option = (match[2] || "")
+        .split(/\r?\n/)[0]
+        .replace(/\s+/g, " ")
+        .trim();
+      if (!letter || option.length < 3 || option.length > 120) return "";
+      return `${letter}. ${option}`;
+    })
+    .filter(Boolean);
+  if (/\bChoose one\b/i.test(text) && labeledChoices.length) {
+    return labeledChoices.slice(0, 5);
+  }
+
+  const asksForChoice =
+    /\b(quick questions|pick all|pick one|choose|confirm|select|which option|before I|answer these|tell me which)\b/i.test(text) ||
+    /(?:^|\n)\s*(?:primary users?|key features|features|preferred complexity|brand colors?|options?)\s*:/i.test(text);
+  const looksLikeFinalAnswer = /^(yes|no|found|done|i['’]ve|the logs show|here['’]s|payfix|agent investigation complete|requested change|found the issue)\b/i.test(text);
+  const hasDirectQuestion = /\?/.test(text) || /\b(reply with|tell me|choose|select|confirm|pick)\b/i.test(text);
+  if (!text || !asksForChoice || !hasDirectQuestion || looksLikeFinalAnswer) return [];
+
+  const options: string[] = [];
+  const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+
+  for (const line of lines) {
+    const primaryUsers = line.match(/primary users?\s*:\s*(.+)$/i)?.[1];
+    if (primaryUsers) {
+      splitOptionList(primaryUsers).forEach((item) => options.push(`Primary user: ${item}`));
+    }
+
+    const keyFeatures = line.match(/(?:key features|features).*?:\s*(.+)$/i)?.[1];
+    if (keyFeatures) {
+      splitOptionList(keyFeatures).forEach((item) => options.push(`Include: ${item}`));
+    }
+
+    const complexity = line.match(/(?:preferred )?complexity\s*:\s*(.+)$/i)?.[1];
+    if (complexity) {
+      splitOptionList(complexity).forEach((item) => options.push(`Complexity: ${item}`));
+    }
+  }
+
+  return options
+    .map((option) => option.replace(/\s+/g, " ").trim())
+    .filter((option, index, list) => list.findIndex((item) => item.toLowerCase() === option.toLowerCase()) === index)
+    .slice(0, 14);
+}
+
+function quickReplyIntent(text: string): "sketch" | "visual" | "log" | "project" | "code" | "image" | "payment" | "unknown" {
+  if (/\b(sketch|wireframe|mockup|dashboard|website|app map|draw|diagram|single-page|admin ui|brand colors|palette)\b/i.test(text)) {
+    return "sketch";
+  }
+
+  if (/\b(visual fix|contrast|overflow|spacing|css|selector|style|readability|layout defect)\b/i.test(text)) {
+    return "visual";
+  }
+
+  if (/\b(logs?|gateway response|declin|approved|cardknox|idtech|sdk|timeout|exception|error|mc|mastercard|visa)\b/i.test(text)) {
+    return "log";
+  }
+
+  if (/\b(payment trace|emv|tlv|9f27|9f26|tag 95|tag 8a|arqc|aac|card reader|terminal|transaction)\b/i.test(text)) {
+    return "payment";
+  }
+
+  if (/\b(project|repo|file|folder|patch|apply|validate|install|dependency|build|lint|test|component)\b/i.test(text)) {
+    return "project";
+  }
+
+  if (/\b(code|typescript|javascript|tsx|jsx|python|class|function|import|compile)\b/i.test(text)) {
+    return "code";
+  }
+
+  if (/\b(image|screenshot|photo|picture|png|jpg|jpeg|webp)\b/i.test(text)) {
+    return "image";
+  }
+
+  return "unknown";
+}
+
+function intentsCompatible(left: ReturnType<typeof quickReplyIntent>, right: ReturnType<typeof quickReplyIntent>) {
+  if (left === "unknown" || right === "unknown") return false;
+  if (left === right) return true;
+  if ((left === "log" && right === "payment") || (left === "payment" && right === "log")) return true;
+  if ((left === "visual" && right === "project") || (left === "project" && right === "visual")) return true;
+  if ((left === "code" && right === "project") || (left === "project" && right === "code")) return true;
+  if ((left === "sketch" && right === "image") || (left === "image" && right === "sketch")) return true;
+  return false;
+}
+
 export default function Home() {
   const [question, setQuestion] = useState("");
+  const [selectedQuickReplies, setSelectedQuickReplies] = useState<string[]>([]);
   const [log, setLog] = useState("");
   const [code, setCode] = useState("");
   const [projectPath, setProjectPath] = useState("");
@@ -386,6 +832,7 @@ export default function Home() {
   const [computerSearchResults, setComputerSearchResults] = useState("");
   const [computerSearchPreview, setComputerSearchPreview] = useState("");
   const [uploadedFiles, setUploadedFiles] = useState<UploadedFile[]>([]);
+  const [lastImportedBrowserCaptureId, setLastImportedBrowserCaptureId] = useState("");
   const [pendingQuestion, setPendingQuestion] = useState("");
   const [pendingUploads, setPendingUploads] = useState<UploadedFile[]>([]);
   const [agentStatus, setAgentStatus] = useState("");
@@ -397,6 +844,16 @@ export default function Home() {
   const [agentSessionOpen, setAgentSessionOpen] = useState(false);
   const [agentSessionMessages, setAgentSessionMessages] = useState<ChatMessage[]>([]);
   const [agentSessionUploads, setAgentSessionUploads] = useState<UploadedFile[]>([]);
+  const [agentSessionFreshUploads, setAgentSessionFreshUploads] = useState<UploadedFile[]>([]);
+  const [agentSessionInitialDraft, setAgentSessionInitialDraft] = useState("");
+  const [agentSessionSetupRevision, setAgentSessionSetupRevision] = useState(0);
+  const [agentSessionEditSnapshot, setAgentSessionEditSnapshot] = useState<{
+    messages: ChatMessage[];
+    uploads: UploadedFile[];
+    status: string;
+  } | null>(null);
+  const [recentAgentFiles, setRecentAgentFiles] = useState<string[]>([]);
+  const [lastVerifiedAgentPatch, setLastVerifiedAgentPatch] = useState<AgentApiResponse | null>(null);
   const [timelineResult, setTimelineResult] = useState<PaymentTimelineResult | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [editSnapshot, setEditSnapshot] = useState<{
@@ -419,6 +876,7 @@ export default function Home() {
   const [activeChatId, setActiveChatId] = useState("");
   const [activeAttachTab, setActiveAttachTab] = useState<AttachTab>("search");
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  const agentSessionRunSeqRef = useRef(0);
   const [showColorEditor, setShowColorEditor] = useState(false);
   const [cssFileName, setCssFileName] = useState("");
   const [cssSelector, setCssSelector] = useState("");
@@ -429,7 +887,7 @@ export default function Home() {
   const [cssPreview, setCssPreview] = useState("");
   const [showApplyModal, setShowApplyModal] = useState(false);
   const [applyFilePath, setApplyFilePath] = useState("");
-  const [applyMode, setApplyMode] = useState<"insert" | "replace" | "overwrite">("insert");
+  const [applyMode, setApplyMode] = useState<"insert" | "replace" | "overwrite" | "delete">("insert");
   const [applySearchContent, setApplySearchContent] = useState("");
   const [applyNewContent, setApplyNewContent] = useState("");
   const [applyDescription, setApplyDescription] = useState("");
@@ -438,7 +896,13 @@ export default function Home() {
   const [applyAgentFollowUpLoading, setApplyAgentFollowUpLoading] = useState(false);
   const [lastRollback, setLastRollback] = useState<RollbackSnapshot | null>(null);
   const [rollbackLoading, setRollbackLoading] = useState(false);
+  const [rollbackOptionsOpen, setRollbackOptionsOpen] = useState(false);
+  const [rollbackSnapshots, setRollbackSnapshots] = useState<RollbackSnapshot[]>([]);
+  const [selectedRollbackIds, setSelectedRollbackIds] = useState<string[]>([]);
+  const [showAllRollbackSnapshots, setShowAllRollbackSnapshots] = useState(false);
+  const [expandedRollbackFiles, setExpandedRollbackFiles] = useState<string[]>([]);
   const [dependencyProposal, setDependencyProposal] = useState<DependencyProposal | null>(null);
+  const [dependencyConfirmOpen, setDependencyConfirmOpen] = useState(false);
   const [dependencyInstalling, setDependencyInstalling] = useState(false);
   const [diffOldContent, setDiffOldContent] = useState("");
   const [diffNewContent, setDiffNewContent] = useState("");
@@ -476,6 +940,8 @@ export default function Home() {
   const [projectMap, setProjectMap] = useState<ProjectMapResult | null>(null);
   const [sandboxRunnerResult, setSandboxRunnerResult] = useState<SandboxRunnerResult | null>(null);
   const [gitStatusResult, setGitStatusResult] = useState<GitStatusResult | null>(null);
+  const [portManagerResult, setPortManagerResult] = useState<PortManagerResult | null>(null);
+  const [toolchainDoctorResult, setToolchainDoctorResult] = useState<ToolchainDoctorResult | null>(null);
   const [watchModeResult, setWatchModeResult] = useState<WatchModeResult | null>(null);
   const [watchFilePath, setWatchFilePath] = useState("");
   const [liveCaptureEnabled, setLiveCaptureEnabled] = useState(false);
@@ -511,29 +977,67 @@ export default function Home() {
   }, [toolsOpen]);
 
   useEffect(() => {
+    if (!connectedProjectPath) {
+      setRollbackSnapshots([]);
+      setLastRollback(null);
+      return;
+    }
+
+    let canceled = false;
+    const refreshTimer = window.setTimeout(async () => {
+      try {
+        const snapshots = await loadRollbackSnapshots();
+        if (canceled) return;
+        setRollbackSnapshots(snapshots);
+        setLastRollback(snapshots[0] || null);
+      } catch {
+        if (!canceled) {
+          setRollbackSnapshots([]);
+          setLastRollback(null);
+        }
+      }
+    }, 300);
+
+    return () => {
+      canceled = true;
+      window.clearTimeout(refreshTimer);
+    };
+  }, [connectedProjectPath, messages.length]);
+
+  useEffect(() => {
     const restoreTimer = window.setTimeout(() => {
       try {
-        const saved = JSON.parse(localStorage.getItem("payfix_saved_chats") || "[]") || [];
+        const savedRaw: SavedChat[] = JSON.parse(localStorage.getItem("payfix_saved_chats") || "[]") || [];
+        const saved = savedRaw.map(normalizeSavedChatTitle);
         const draft: DraftState = JSON.parse(localStorage.getItem("payfix_active_draft") || "{}") || {};
+        const lastConnectedProject = localStorage.getItem("payfix_last_connected_project") || "";
         const draftActiveChatId = draft.activeChatId || "";
         const activeSavedChat = draftActiveChatId
           ? saved.find((chat: SavedChat) => chat.id === draftActiveChatId)
           : null;
 
         setSavedChats(saved);
+        if (JSON.stringify(savedRaw) !== JSON.stringify(saved)) {
+          safeSetJsonStorage("payfix_saved_chats", saved.map(trimSavedChatForStorage), []);
+        }
         setQuestion(draft.question || "");
         setLog(draft.log || "");
         setCode(draft.code || "");
-        setProjectPath(draft.projectPath || "");
-        setConnectedProjectPath(draft.connectedProjectPath || "");
-        setProjectContext(draft.projectContext || "");
-        setSearchFolder(draft.searchFolder || "");
-        setSearchFileName(draft.searchFileName || "");
-        setSearchText(draft.searchText || "");
-        setComputerSearchResults(draft.computerSearchResults || "");
-        setComputerSearchPreview(draft.computerSearchPreview || "");
+        setProjectPath(draft.projectPath || activeSavedChat?.projectPath || activeSavedChat?.connectedProjectPath || lastConnectedProject || "");
+        setConnectedProjectPath(draft.connectedProjectPath || activeSavedChat?.connectedProjectPath || "");
+        setProjectContext(draft.projectContext || activeSavedChat?.projectContext || "");
+        setSearchFolder(draft.searchFolder || activeSavedChat?.searchFolder || "");
+        setSearchFileName(draft.searchFileName || activeSavedChat?.searchFileName || "");
+        setSearchText(draft.searchText || activeSavedChat?.searchText || "");
+        setComputerSearchResults(draft.computerSearchResults || activeSavedChat?.computerSearchResults || "");
+        setComputerSearchPreview(draft.computerSearchPreview || activeSavedChat?.computerSearchPreview || "");
+        const restoredAgentSessionMessages = draft.agentSessionMessages || [];
+        const restoredMessages = recoverAgentTrailForMessages(draft.messages || activeSavedChat?.messages || [], restoredAgentSessionMessages);
+
         setUploadedFiles(draft.uploadedFiles || []);
-        setMessages(draft.messages || activeSavedChat?.messages || []);
+        setMessages(restoredMessages);
+        setAgentSessionMessages(restoredAgentSessionMessages);
+        setAgentSessionOpen(Boolean(draft.agentSessionOpen && draft.agentSessionMessages?.length));
         setActiveChatId(draftActiveChatId || activeSavedChat?.id || crypto.randomUUID());
       } catch {
         setActiveChatId(crypto.randomUUID());
@@ -549,24 +1053,26 @@ export default function Home() {
     if (!draftRestoredRef.current) return;
 
     const saveDraft = () => {
-      localStorage.setItem(
-        "payfix_active_draft",
-        JSON.stringify({
-          question,
-          log,
-          code,
-          projectPath,
-          connectedProjectPath,
-          projectContext,
-          searchFolder,
-          searchFileName,
-          searchText,
-          computerSearchResults,
-          computerSearchPreview,
-          uploadedFiles,
-          activeChatId,
-        }),
-      );
+      const draft: DraftState = {
+        question,
+        log,
+        code,
+        projectPath,
+        connectedProjectPath,
+        projectContext,
+        searchFolder,
+        searchFileName,
+        searchText,
+        computerSearchResults,
+        computerSearchPreview,
+        uploadedFiles,
+        messages,
+        activeChatId,
+        agentSessionOpen,
+        agentSessionMessages,
+        agentSessionUploads,
+      };
+      safeSetJsonStorage("payfix_active_draft", draft, trimDraftForStorage(draft));
     };
     const saveTimer = window.setTimeout(saveDraft, 500);
 
@@ -584,7 +1090,11 @@ export default function Home() {
     computerSearchResults,
     computerSearchPreview,
     uploadedFiles,
+    messages,
     activeChatId,
+    agentSessionOpen,
+    agentSessionMessages,
+    agentSessionUploads,
   ]);
 
   useEffect(() => {
@@ -596,6 +1106,16 @@ export default function Home() {
 
     return () => window.clearTimeout(clearStatusTimer);
   }, [agentStatus, loading, agentLoading, timelineLoading, dependencyInstalling]);
+
+  useEffect(() => {
+    if (!connectedProjectPath) return;
+    localStorage.setItem("payfix_last_connected_project", connectedProjectPath);
+    void fetch("/api/local-agent/set-root", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ root: connectedProjectPath }),
+    }).catch(() => undefined);
+  }, [connectedProjectPath]);
 
   useEffect(() => {
     if (!liveCaptureEnabled || !connectedProjectPath) return;
@@ -631,7 +1151,7 @@ export default function Home() {
     Boolean(projectContext) ||
     Boolean(log.trim()) ||
     Boolean(code.trim());
-  const canSend = Boolean(question.trim()) || hasAttachment;
+  const canSend = Boolean(question.trim() || selectedQuickReplies.length) || hasAttachment;
   const hasFreshTimelineInput = Boolean(question.trim() || log.trim() || code.trim() || uploadedFiles.length);
   const uploadPreview = useMemo(
     () =>
@@ -662,9 +1182,43 @@ export default function Home() {
           if (seen.has(key)) return false;
           seen.add(key);
           return true;
-        });
+      });
     });
   }, [messages]);
+  const quickReplyOptions = useMemo(() => {
+    const latestAssistant = messages.at(-1);
+    if (
+      latestAssistant?.role !== "assistant" ||
+      /^(Thinking|Generating image|Editing the uploaded image|Converting image|PayFix Agent is|Agent is running)/i.test(latestAssistant.content)
+    ) {
+      return [];
+    }
+
+    const options = extractQuickReplyOptions(latestAssistant?.content || "");
+    if (!options.length) return [];
+
+    const currentDraftContext = [
+      question,
+      log,
+      code,
+      uploadedFiles.map((file) => file.name).join(" "),
+      computerSearchResults ? "computer search evidence" : "",
+      connectedProjectPath ? "connected project" : "",
+    ]
+      .filter(Boolean)
+      .join("\n");
+    const currentIntent = quickReplyIntent(currentDraftContext);
+    const assistantIntent = quickReplyIntent(latestAssistant?.content || "");
+
+    if (question.trim() && currentIntent === "unknown") return [];
+    if (currentDraftContext.trim() && !intentsCompatible(currentIntent, assistantIntent)) return [];
+
+    return options;
+  }, [code, computerSearchResults, connectedProjectPath, log, messages, question, uploadedFiles]);
+
+  useEffect(() => {
+    setSelectedQuickReplies((current) => current.filter((reply) => quickReplyOptions.includes(reply)));
+  }, [quickReplyOptions]);
   const timelineSourceCandidates = useMemo<TimelineSourceCandidate[]>(() => {
     const candidates: TimelineSourceCandidate[] = [];
 
@@ -818,11 +1372,112 @@ export default function Home() {
     () => buildRunnerSrcDoc(runnerHtml, runnerCss, runnerJs),
     [runnerHtml, runnerCss, runnerJs],
   );
+  const rollbackGroups = useMemo(() => {
+    const groups = new Map<string, { key: string; file: string; snapshots: RollbackSnapshot[] }>();
+
+    rollbackSnapshots.forEach((snapshot) => {
+      const file = snapshot.relative || snapshot.file;
+      const key = file.toLowerCase();
+      const group = groups.get(key) || { key, file, snapshots: [] };
+      group.snapshots.push(snapshot);
+      groups.set(key, group);
+    });
+
+    return [...groups.values()].map((group) => ({
+      ...group,
+      snapshots: group.snapshots.sort(
+        (left, right) => new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime(),
+      ),
+    }));
+  }, [rollbackSnapshots]);
+  const visibleRollbackGroups = useMemo(
+    () => (showAllRollbackSnapshots ? rollbackGroups : rollbackGroups.slice(0, 8)),
+    [rollbackGroups, showAllRollbackSnapshots],
+  );
+  const visibleRollbackSnapshots = useMemo(
+    () =>
+      visibleRollbackGroups.flatMap((group) => [
+        group.snapshots[0],
+        ...(expandedRollbackFiles.includes(group.key) ? group.snapshots.slice(1) : []),
+      ]).filter(Boolean),
+    [expandedRollbackFiles, visibleRollbackGroups],
+  );
 
   function questionReferencesImage(text: string) {
     return /\b(screenshot|screen shot|image|picture|photo|attached image|uploaded image|jpg|jpeg|png|webp)\b/i.test(
       text,
     );
+  }
+
+  function isRegularChatOnlyAgentRequest(
+    text: string,
+    files: UploadedFile[],
+    context: { log?: string; code?: string; computerSearchResults?: string; previousAssistant?: string } = {},
+  ) {
+    const normalized = text.trim();
+    const hasFiles = files.length > 0;
+    const hasImages = files.some((file) => file.isImage);
+    const hasTextEvidence = files.some((file) => !file.isImage);
+    const hasPastedEvidence = Boolean(context.log?.trim() || context.code?.trim() || context.computerSearchResults?.trim());
+    const asksToReadOrExplain =
+      /^(what|why|how|can you|could you|please|tell me|describe|read|look|view|analy[sz]e|investigate|check|compare|explain|summari[sz]e|do you see|is there|are there)\b/i.test(
+        normalized,
+      ) ||
+      /\b(what is|what's|look at|view|read|analy[sz]e|investigate|compare|explain|summari[sz]e|describe|see anything|sticking out|root cause|reason why)\b/i.test(
+        normalized,
+      ) ||
+      /\b(whats wrong|what's wrong|what is wrong|wrong with|why(?:'s| is)? .*?(?:failing|blocked|not working|broken|wrong))\b/i.test(
+        normalized,
+      );
+    const asksForProjectWork =
+      /\b(apply|patch|change|modify|edit|update|create|generate|write|add|remove|delete|rename|refactor|fix the project|fix code|full project|codebase|project files?|source files?|folder|install|dependency|package|run tests?|validate|lint|build|typecheck|compile|visual fix|css|component|local app|localhost)\b/i.test(
+        normalized,
+      ) ||
+      isSketchProjectCreationRequest(normalized);
+    const asksForSpecializedTool = /\b(payment trace|trace payment|timeline|emv decoder|decode tlv|device lab|webhook lab|visual fix)\b/i.test(
+      normalized,
+    );
+    const looksLikeGeneralQuestion =
+      /^(what|why|how|who|when|where|can you|could you|please|tell me|explain|summari[sz]e)\b/i.test(normalized) ||
+      /\?$/.test(normalized);
+    const isContextualFollowUp = asksContextualClarificationFollowUp(normalized, context.previousAssistant || "");
+    const evidenceOnly =
+      hasFiles ||
+      hasImages ||
+      hasTextEvidence ||
+      hasPastedEvidence ||
+      questionReferencesImage(normalized) ||
+      /\b(logs?|har|gateway response|screenshot|image|photo|picture|tlv|emv|receipt|payload|json|csv|txt|code snippet|pasted code)\b/i.test(normalized);
+
+    const uploadOnlyFallback = /^investigate uploaded file\(s\)\.?$/i.test(normalized) && hasFiles;
+
+    const regularEvidenceRequest =
+      (uploadOnlyFallback || (evidenceOnly && asksToReadOrExplain) || (hasPastedEvidence && !asksForProjectWork)) &&
+      !asksForProjectWork &&
+      !asksForSpecializedTool;
+    const regularGeneralQuestion =
+      looksLikeGeneralQuestion &&
+      !isContextualFollowUp &&
+      !evidenceOnly &&
+      !asksForProjectWork &&
+      !asksForSpecializedTool;
+
+    return regularEvidenceRequest || regularGeneralQuestion;
+  }
+
+  function regularChatRedirectMessage(prompt: string, files: UploadedFile[]) {
+    const fileText = files.length
+      ? `\n\nAttached evidence stays available: ${files.map((file) => file.name).join(", ")}`
+      : "";
+
+    return `This belongs in Regular Chat, not Agent mode.
+
+Regular Chat is the right place for reading, explaining, comparing, or summarizing logs, screenshots, uploaded images, gateway responses, TLV/EMV evidence, and general questions.
+
+Use Agent mode when you want PayFix to change files, inspect a connected project, prepare/apply a patch, install dependencies, run validation, create a new project, or launch Visual Fix against real project code. If the question is random or not related to the current project/action, ask it in Regular Chat.
+
+Send this in Regular Chat:
+${prompt}${fileText}`;
   }
 
   function watchEventKey(event: WatchEvent) {
@@ -858,8 +1513,356 @@ export default function Home() {
     return null;
   }
 
+  function isImageEditRequest(text: string) {
+    const normalized = text.trim();
+    const hasEditAction =
+      /\b(make|turn|convert|export|save|send|return|change|crop|resize|upscale|enlarge|format|download|give me)\b/i.test(
+        normalized,
+      ) || /^(resize|upscale|crop|convert|format)\b/i.test(normalized);
+    const looksLikeQuestion =
+      /[?？]\s*$/.test(normalized) ||
+      /^(does|do|is|are|was|were|can|could|should|would|what|why|how|where|tell me|describe|read|analyze|check)\b/i.test(
+        normalized,
+      );
+
+    return hasEditAction && !(looksLikeQuestion && !/\b(make|turn|convert|export|save|change|crop|resize|upscale|enlarge|format)\b/i.test(normalized));
+  }
+
+  function imageOutputTarget(text: string, labelPrefix: string): ImageConversionTarget {
+    if (/\b(jpe?g|jpg)\b/i.test(text)) {
+      return { extension: "jpg", mime: "image/jpeg", label: `${labelPrefix} JPG` };
+    }
+
+    if (/\bwebp\b/i.test(text)) {
+      return { extension: "webp", mime: "image/webp", label: `${labelPrefix} WebP` };
+    }
+
+    return { extension: "png", mime: "image/png", label: `${labelPrefix} PNG` };
+  }
+
+  function imageEditPlan(text: string): ImageEditPlan | null {
+    if (!isImageEditRequest(text)) return null;
+
+    const normalized = text.trim();
+    const explicitSize = normalized.match(/\b(\d{2,5})\s*[x×]\s*(\d{2,5})\b/i);
+    const explicitAspect = normalized.match(/\b(\d{1,3})\s*:\s*(\d{1,3})\b/);
+    const mask = /\b(circle|circular|round|rounded avatar|avatar)\b/i.test(normalized) ? "circle" : undefined;
+    const maxSide = resizedMaxSide(normalized);
+
+    if (explicitSize) {
+      const width = Number(explicitSize[1]);
+      const height = Number(explicitSize[2]);
+      const label = `${width}x${height}`;
+      return {
+        mode: "canvas",
+        target: imageOutputTarget(normalized, label),
+        label,
+        suffix: label,
+        aspectRatio: width / height,
+        maxSide: Math.max(width, height),
+        mask,
+      };
+    }
+
+    if (explicitAspect) {
+      const width = Number(explicitAspect[1]);
+      const height = Number(explicitAspect[2]);
+      const label = `${width}:${height}`;
+      return {
+        mode: "canvas",
+        target: imageOutputTarget(normalized, label),
+        label,
+        suffix: `${width}-${height}`,
+        aspectRatio: width / height,
+        maxSide,
+        mask,
+      };
+    }
+
+    if (/\b(square|squared|one[-\s]?to[-\s]?one|logo tile|app icon|icon size|favicon)\b/i.test(normalized)) {
+      const label = mask ? "round" : "square";
+      return {
+        mode: "canvas",
+        target: imageOutputTarget(normalized, label),
+        label,
+        suffix: label,
+        aspectRatio: 1,
+        maxSide: squareOutputSide(normalized),
+        mask,
+      };
+    }
+
+    if (/\b(wide|banner|landscape|hero|cover)\b/i.test(normalized)) {
+      return {
+        mode: "canvas",
+        target: imageOutputTarget(normalized, "wide"),
+        label: "wide",
+        suffix: "wide",
+        aspectRatio: 16 / 9,
+        maxSide,
+        mask,
+      };
+    }
+
+    if (/\b(portrait|vertical|story|mobile|phone)\b/i.test(normalized)) {
+      return {
+        mode: "canvas",
+        target: imageOutputTarget(normalized, "portrait"),
+        label: "portrait",
+        suffix: "portrait",
+        aspectRatio: 9 / 16,
+        maxSide,
+        mask,
+      };
+    }
+
+    if (mask) {
+      return {
+        mode: "canvas",
+        target: imageOutputTarget(normalized, "round"),
+        label: "round",
+        suffix: "round",
+        aspectRatio: 1,
+        maxSide,
+        mask,
+      };
+    }
+
+    if (/\b(resize|upscale|enlarge|larger|bigger|massive|huge|high[-\s]?res|hi[-\s]?res|4k|4096)\b/i.test(normalized)) {
+      return {
+        mode: "resize",
+        target: imageOutputTarget(normalized, "resized"),
+        label: "resized",
+        suffix: "resized",
+        maxSide,
+      };
+    }
+
+    return null;
+  }
+
+  function isImageGenerationRequest(text: string) {
+    const asksForGuidance =
+      /\b(step by step|instructions?|where do i go|where to start|how to build|how do i build|what do i need|roadmap|plan|guide|explain|tell me|from here|next steps?|developer portal|resources|api docs?|documentation|integrat(?:e|ion)|implementation guidance)\b/i.test(
+        text,
+      );
+    const explicitlyRequestsVisualAsset =
+      /\b(generate|create|make|draw|sketch|design|produce|give me|download|draft|render)\b/i.test(text) &&
+      /\b(image|picture|logo|icon|favicon|illustration|wireframe|mockup|prototype|diagram|flowchart|architecture diagram|uml|erd|entity relationship|blueprint|app map|site map|sitemap|program map|system map|screen map|user flow|ux flow|visual sketch|downloadable asset)\b/i.test(
+        text,
+      );
+    const wantsVisualPlan =
+      /\b(sketch|draw|visualize|wireframe|mockup|map out|blueprint|diagram|design)\b/i.test(text) &&
+      /\b(website|dashboard|app|application|program|screen|page|ui|ux|interface|layout|flow|map|inventory|shop|saas|admin|portal|system)\b/i.test(text);
+
+    return (
+      !asksForGuidance &&
+      (wantsVisualPlan || explicitlyRequestsVisualAsset) &&
+      !/\b(convert|export|change format|to jpg|to jpeg|to png|to webp|resize|upscale|enlarge|crop)\b/i.test(text)
+    );
+  }
+
+  function isReferenceImageEditRequest(text: string) {
+    return (
+      /\b(improve|enhance|polish|clean up|cleanup|professional|premium|make .*better|better|refine|redesign|rework|modernize|sharpen|vector|crisp|upgrade|fix logo|edit logo|edit image)\b/i.test(
+        text,
+      ) &&
+      /\b(logo|image|picture|photo|icon|brand|mark|uploaded|attached|this)\b/i.test(text) &&
+      !/\b(convert|export|change format|to jpg|to jpeg|to png|to webp|resize|crop|square)\b/i.test(text)
+    );
+  }
+
+  function isImageGenerationFollowUp(text: string) {
+    const previousAssistant = [...messages].reverse().find((message) => message.role === "assistant")?.content || "";
+    return (
+      /\b(surprise|surprise me|you choose|pick one|whatever you think|make it nice|ugly|better|redo|regenerate|try again|massive|larger|bigger|premium|luxury)\b/i.test(text) &&
+      /\b(logo|image|png|svg|jpg|jpeg|webp|favicon|monogram|downloadable|wireframe|mockup|prototype|diagram|flowchart|architecture|uml|erd|blueprint|dashboard|website|sketch|app map|user flow)\b/i.test(previousAssistant)
+    );
+  }
+
+  function dedupeUploadedFiles(files: UploadedFile[]) {
+    const seen = new Set<string>();
+
+    return files.filter((file) => {
+      const key = `${file.name}:${file.type}:${file.size}:${file.content.slice(0, 120)}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }
+
+  function chatEvidenceUploads() {
+    return dedupeUploadedFiles(messages.flatMap((message) => message.attachedUploads || []));
+  }
+
+  function mergePersistentEvidenceUploads(currentUploads: UploadedFile[]) {
+    const currentHasImages = currentUploads.some((file) => file.isImage);
+    const priorUploads = chatEvidenceUploads().filter((file) => !file.isImage || currentHasImages);
+    return dedupeUploadedFiles([...priorUploads, ...currentUploads]);
+  }
+
+  function promptReferencesVisualEvidence(text: string) {
+    const withoutWindowsPaths = text.replace(/[A-Za-z]:\\[^\s]+/g, " ");
+    return /\b(image|images|screenshot|screenshots|screen shot|picture|photo|attached|attachment|upload|uploads|visible|looks|look at|shown|showing|see this|see these|these screenshots|those screenshots|this screenshot|that screenshot|above screenshot|settings page|dropdown|menu|options|what is it using|which is it using)\b/i.test(
+      withoutWindowsPaths,
+    );
+  }
+
+  function promptExplicitlyRequestsSavedEvidence(text: string) {
+    const withoutWindowsPaths = text.replace(/[A-Za-z]:\\[^\s]+/g, " ");
+    return /\b(previous|prior|older|old|saved|first|earlier|all|both|compare|logs?|files?|attachments?|uploads?|evidence|browser capture|captured page|uploaded file|attached file|attached screenshot|attached image|the screenshot|the image|the file|the log|these screenshots|those files|source evidence)\b/i.test(
+      withoutWindowsPaths,
+    );
+  }
+
+  function scopedAgentSessionUploadsForPrompt(prompt: string, files: UploadedFile[]) {
+    const wantsVisualEvidence = promptReferencesVisualEvidence(prompt);
+    if (wantsVisualEvidence) return dedupeUploadedFiles(files);
+    return dedupeUploadedFiles(files.filter((file) => !file.isImage));
+  }
+
+  function activeAgentSessionUploadsForRun(prompt = "") {
+    const wantsOlderEvidence = !hasBuildErrorEvidence(prompt) && promptExplicitlyRequestsSavedEvidence(prompt);
+    if (agentSessionFreshUploads.length && !wantsOlderEvidence) {
+      return dedupeUploadedFiles(agentSessionFreshUploads);
+    }
+
+    const isProjectBuilderSession = agentSessionMessages.some((message) => /^PROJECT CREATION BRIEF:/i.test(message.content));
+    const wantsProjectBuilderImage =
+      promptReferencesVisualEvidence(prompt) ||
+      /\b(sketch|design|wireframe|mockup|generated image|from image|from screenshot|create project from|build app from|turn this into|turn the sketch|use this design)\b/i.test(
+        prompt,
+      );
+    if (isProjectBuilderSession) {
+      return wantsProjectBuilderImage ? dedupeUploadedFiles(agentSessionUploads.filter((file) => file.isImage)) : [];
+    }
+
+    if (!agentSessionFreshUploads.length && !wantsOlderEvidence) {
+      const previousAssistant = latestActionableAssistantContext(agentSessionMessages);
+      const scopedIntent = classifyAgentFollowUpIntent({
+        prompt,
+        hasImages: false,
+        hasProject: Boolean(connectedProjectPath),
+        isPaxAndroidBuiltSession: isPaxAndroidBuiltSession(),
+        previousAssistant,
+      });
+      const shouldAvoidStaleEvidence =
+        scopedIntent.route === "focused-follow-up" ||
+        scopedIntent.route === "build-error" ||
+        scopedIntent.route === "project-error" ||
+        scopedIntent.route === "exact-next-steps" ||
+        asksToRunReferencedCommands(prompt) ||
+        asksCommandLocationHelp(prompt);
+
+      if (shouldAvoidStaleEvidence) return [];
+    }
+
+    return scopedAgentSessionUploadsForPrompt(prompt, mergePersistentEvidenceUploads(agentSessionUploads));
+  }
+
+  async function classifyAgentFollowUpTurn({
+    prompt,
+    submittedUploadedFiles,
+    previousAssistant,
+  }: {
+    prompt: string;
+    submittedUploadedFiles: UploadedFile[];
+    previousAssistant: string;
+  }) {
+    const fallback = classifyAgentFollowUpIntent({
+      prompt,
+      hasImages: submittedUploadedFiles.some((file) => file.isImage),
+      hasProject: Boolean(connectedProjectPath),
+      isPaxAndroidBuiltSession: isPaxAndroidBuiltSession(),
+      previousAssistant,
+    });
+
+    try {
+      const recentConversation = agentSessionMessages
+        .slice(-8)
+        .map((message) => {
+          const uploads = message.attachedUploads?.length
+            ? `\nAttachments: ${message.attachedUploads.map((file) => `${file.isImage ? "image" : "file"}:${file.name}`).join(", ")}`
+            : "";
+          return `${message.role.toUpperCase()}: ${message.content.slice(0, 1200)}${uploads}`;
+        })
+        .join("\n\n");
+      const uploadSummary = submittedUploadedFiles
+        .map((file, index) => `${index + 1}. ${file.isImage ? "image" : "file"} ${file.name} (${file.type || "unknown"}, ${file.size} bytes)`)
+        .join("\n");
+      const response = await fetch("/api/agent/intent", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          prompt,
+          hasImages: submittedUploadedFiles.some((file) => file.isImage),
+          hasProject: Boolean(connectedProjectPath),
+          isPaxAndroidBuiltSession: isPaxAndroidBuiltSession(),
+          previousAssistant,
+          recentConversation,
+          uploadSummary,
+        }),
+      });
+      const data: AgentIntentApiResponse = await response.json();
+      if (!response.ok || !data.ok || !data.route) throw new Error(data.error || "Intent router failed.");
+
+      if (
+        (fallback.route === "build-error" || fallback.route === "project-error") &&
+        data.route !== "build-error" &&
+        data.route !== "project-error"
+      ) {
+        return {
+          ...fallback,
+          useImages: submittedUploadedFiles.some((file) => file.isImage),
+          shouldRunProjectValidation: true,
+        };
+      }
+
+      if (
+        fallback.route === "screenshot-review" &&
+        data.route !== "build-error" &&
+        data.route !== "project-error"
+      ) {
+        return {
+          ...fallback,
+          useImages: submittedUploadedFiles.some((file) => file.isImage),
+          shouldRunProjectValidation: false,
+        };
+      }
+
+      if (
+        fallback.route === "focused-follow-up" &&
+        data.route !== "build-error" &&
+        data.route !== "project-error"
+      ) {
+        return {
+          ...fallback,
+          useImages: submittedUploadedFiles.some((file) => file.isImage),
+          shouldRunProjectValidation: false,
+        };
+      }
+
+      return {
+        route: data.route,
+        reason: data.reason || "Classified by PayFix Agent router.",
+        useImages: Boolean(data.useImages),
+        shouldRunProjectValidation: Boolean(data.shouldRunProjectValidation),
+      };
+    } catch {
+      return {
+        ...fallback,
+        useImages: submittedUploadedFiles.some((file) => file.isImage),
+        shouldRunProjectValidation: fallback.route === "build-error" || fallback.route === "project-error" || fallback.route === "generic",
+      };
+    }
+  }
+
   function wantsDecode(text: string) {
     return /\b(decode|encoded|base64|base64url|hex|url encoded|jwt|token)\b/i.test(text);
+  }
+
+  function isSpreadsheetEditRequest(text: string) {
+    return /\b(excel|spreadsheet|xlsx|xls|csv)\b/i.test(text) && /\b(update|edit|change|modify|write|fix|add|delete|remove)\b/i.test(text);
   }
 
   function looksLikeSourceCode(value: string) {
@@ -963,7 +1966,78 @@ export default function Home() {
     return `Applying patch to ${fileLabel} and running ${uniqueLabels.slice(0, 3).join(", ") || "project diagnostics"}...`;
   }
 
+  function summarizeChangedLines(oldContent: string, newContent: string) {
+    const oldLines = oldContent.split(/\r?\n/);
+    const newLines = newContent.split(/\r?\n/);
+    let start = 0;
+
+    while (start < oldLines.length && start < newLines.length && oldLines[start] === newLines[start]) {
+      start += 1;
+    }
+
+    let oldEnd = oldLines.length - 1;
+    let newEnd = newLines.length - 1;
+    while (oldEnd >= start && newEnd >= start && oldLines[oldEnd] === newLines[newEnd]) {
+      oldEnd -= 1;
+      newEnd -= 1;
+    }
+
+    if (start > oldEnd && start > newEnd) {
+      return "No changed lines detected in preview.";
+    }
+
+    const newStartLine = start + 1;
+    const newEndLine = Math.max(newStartLine, newEnd + 1);
+    const oldStartLine = start + 1;
+    const oldEndLine = Math.max(oldStartLine, oldEnd + 1);
+    const newSnippet = newLines.slice(start, newEnd + 1).slice(0, 8);
+
+    return [
+      `Lines ${newStartLine}${newEndLine !== newStartLine ? `-${newEndLine}` : ""} updated`,
+      oldEnd >= start ? `(replaced previous line${oldEndLine !== oldStartLine ? `s ${oldStartLine}-${oldEndLine}` : ` ${oldStartLine}`})` : "(inserted)",
+      newSnippet.length
+        ? `New code:\n${newSnippet.map((line, index) => `${newStartLine + index}: ${line}`).join("\n")}`
+        : "New code: (empty block)",
+    ].join("\n");
+  }
+
+  function summarizePreviewChanges(previews: Array<{ file?: string; oldContent?: string; newContent?: string }>) {
+    if (!previews.length) return "- No preview diff was available.";
+
+    return previews
+      .map((preview) => {
+        const file = preview.file || "unknown file";
+        return `- ${file}\n${summarizeChangedLines(preview.oldContent || "", preview.newContent || "")
+          .split("\n")
+          .map((line) => `  ${line}`)
+          .join("\n")}`;
+      })
+      .join("\n");
+  }
+
   function agentWorkingMessageForPrompt(prompt: string, hasProject: boolean) {
+    if (/explain .*root cause|root cause/i.test(prompt)) {
+      return "PayFix Agent is explaining the root cause: separating failing evidence from baseline evidence and filtering out generic noise...";
+    }
+
+    if (/compare .*logs?|side by side|first divergence|suspect-only/i.test(prompt)) {
+      return "PayFix Agent is comparing failing vs working evidence: aligning logs, finding the first divergence, and ranking suspect-only signals...";
+    }
+
+    if (/payment trace|trace timeline|timeline/i.test(prompt)) {
+      return "PayFix Agent is building the payment trace: device read, SDK event, app request, gateway response, and final decision...";
+    }
+
+    if (/visual fix|contrast|spacing|overflow|css|style/i.test(prompt) && hasProject) {
+      return "PayFix Agent is preparing a visual fix: inspecting UI evidence, finding style files, and building a reviewable patch...";
+    }
+
+    if (/\b(build|create|generate)\b[\s\S]{0,120}\b(full app|full project|runnable project|from scratch|android studio|visual studio|xcode|vs code)\b/i.test(prompt)) {
+      return hasProject
+        ? "PayFix Agent is building the project: reading SDK/artifact folders, selecting source files, adding required files, installing safe dependencies, and validating..."
+        : "PayFix Agent is preparing the project build request. Connect or create a project folder so it can write files, install dependencies, and validate.";
+    }
+
     if (/apply|patch|change|update|fix/i.test(prompt)) {
       return hasProject
         ? "PayFix Agent is preparing the requested code change, checking exact files, and building a reviewable patch..."
@@ -985,6 +2059,151 @@ export default function Home() {
     return hasProject
       ? "PayFix Agent is investigating: indexing the project, selecting files, reading evidence, and preparing a reviewable result..."
       : "PayFix Agent is investigating evidence: reading uploads, logs, screenshots, and pasted context...";
+  }
+
+  function shouldUseProjectForAgentRun({
+    userContent,
+    submittedLog,
+    submittedCode,
+    submittedUploadedFiles,
+    submittedComputerSearchResults,
+  }: {
+    userContent: string;
+    submittedLog: string;
+    submittedCode: string;
+    submittedUploadedFiles: UploadedFile[];
+    submittedComputerSearchResults: string;
+  }) {
+    if (!connectedProjectPath) return false;
+
+    const text = userContent.toLowerCase();
+    const wantsProjectWork =
+      /\b(project|code|file|folder|repo|component|page|route|api|css|style|build|compile|lint|test|fix|patch|change|update|implement|create|install|dependency|localhost|app)\b/i.test(
+        text,
+      );
+    if (wantsProjectWork) return true;
+
+    const hasOnlyImageUploads =
+      submittedUploadedFiles.length > 0 && submittedUploadedFiles.every((file) => file.isImage);
+    if (hasOnlyImageUploads) return false;
+
+    const hasStandaloneEvidence =
+      Boolean(submittedLog.trim() || submittedCode.trim() || submittedComputerSearchResults.trim()) ||
+      submittedUploadedFiles.some(
+        (file) =>
+          !file.isImage ||
+          /\.(?:txt|log|har|json|xml|csv|tsv|yaml|yml|emv|tlv)$/i.test(file.name) ||
+          /\b(?:log|trace|gateway|response|cardknox|processor|webhook|receipt|statement)\b/i.test(file.name),
+      );
+
+    if (hasStandaloneEvidence) return false;
+
+    return true;
+  }
+
+  function replaceLatestAgentWorkingMessage(content: string, progress?: NonNullable<AgentProgressResponse["progress"]>) {
+    setAgentSessionMessages((currentMessages) => {
+      const lastMessage = currentMessages[currentMessages.length - 1];
+      if (!lastMessage || lastMessage.role !== "assistant") return currentMessages;
+      if (!/^(Agent is running|PayFix Agent is|PayFix Agent received|Running project|Running |Choosing |Reading |Following local|Reasoning |Reasoning over|Scanning |Evidence-only mode|Investigating evidence|The main reasoning|Previewing the patch|Temporarily applying|Preparing |Prepared |Checked |Connecting |Loading |Loaded |Selecting |Inspecting |SDK folder|Feeding |Checking |Toolchain |Project investigation|Agent completed|Agent timed out)/i.test(lastMessage.content)) {
+        return currentMessages;
+      }
+
+      return [
+        ...currentMessages.slice(0, -1),
+        {
+          ...lastMessage,
+          content,
+          agentProgress: progress
+            ? [
+                ...(lastMessage.agentProgress || []).filter(
+                  (item) => !(item.step === progress.step && item.message === progress.message),
+                ),
+                progress,
+              ].slice(-14)
+            : lastMessage.agentProgress,
+        },
+      ];
+    });
+  }
+
+  function userWantsManualPatchReview(text: string) {
+    return /\b(prepare (?:a )?patch|patch (?:file|preview|only)|preview|review before|show me (?:the )?patch|do not apply|don't apply|don't write|do not write|ask (?:me )?before|let me apply|manual apply|apply button|how can|how would|what (?:are|would)|options?|suggest(?:ion)?s?|could we|would it)\b/i.test(
+      text,
+    );
+  }
+
+  function shouldAutoApplyAgentPatch(text: string) {
+    if (userWantsManualPatchReview(text)) return false;
+
+    return /\b(do it|do this|do that|for me|make|change|update|fix|implement|add|remove|improve|redesign|restyle|style|clean up|build|create|apply)\b/i.test(
+      text,
+    );
+  }
+
+  function shouldAutoInstallAgentDependencies(text: string) {
+    if (userWantsManualPatchReview(text)) return false;
+
+    return /\b(build|create|generate|full app|full project|runnable project|from scratch|install dependencies|setup dependencies|add dependencies|make it run|run validation|compile|android studio|visual studio|vs code|xcode|gradle|maven|npm|pip|go mod|dotnet)\b/i.test(
+      text,
+    );
+  }
+
+  function isPaxAndroidBuildRequest(text: string) {
+    return /\b(pax|a920|a80|poslink|broadpos|paxstore)\b/i.test(text) &&
+      /\b(build|create|generate|full app|full project|runnable|go ahead|for me|android studio|android)\b/i.test(text);
+  }
+
+  function isReferentialAgentCommand(text: string) {
+    const trimmed = text.trim();
+    return (
+      trimmed.length < 320 &&
+      /\b(so|these|those|this|that|now what|what now|where exactly|what exactly|how exactly|please clarify|clarify|what do i click|where do i click|which option|what about|how about|do it|do this|do that|for me|go ahead|make it happen|yes|yep|ok(?:ay)?|apply it|implement it|fix it)\b/i.test(
+        trimmed,
+      )
+    );
+  }
+
+  function buildEffectiveAgentRequest({
+    userContent,
+    priorSessionMessages,
+    uploadedFilesForRun,
+  }: {
+    userContent: string;
+    priorSessionMessages: ChatMessage[];
+    uploadedFilesForRun: UploadedFile[];
+  }) {
+    const previousAssistant =
+      [...priorSessionMessages].reverse().find((message) => message.role === "assistant")?.content || "";
+    const previousUser = [...priorSessionMessages].reverse().find((message) => message.role === "user")?.content || "";
+    const hasImageEvidence = uploadedFilesForRun.some((file) => file.isImage);
+    const screenshotInstruction =
+      hasImageEvidence
+        ? `\n\nCURRENT UPLOADED SCREENSHOT/EVIDENCE HANDLING:
+The uploaded image(s) are part of the user's current message. Read them before answering.
+If the user's message is short or referential, such as "so", "these", "what about this", resolve it against the latest conversation plus the newly attached screenshots.
+Do not say no screenshot/image was provided when image uploads are present.
+If this is a UI/code-change request with a connected project, use the screenshot to choose likely source/style files. If this is an IDE/build/settings screenshot, answer the visible workflow/error question directly.`
+        : "";
+
+    if (!isReferentialAgentCommand(userContent) || !previousAssistant.trim()) {
+      return `${userContent}${screenshotInstruction}`;
+    }
+
+    return `CURRENT USER COMMAND:
+${userContent}
+
+RESOLVED ACTIVE TASK:
+The user is asking a follow-up about the previous Agent recommendation/request, not starting from scratch.
+If the current command asks to do/apply/build/fix something, carry out the prior actionable recommendation.
+If it asks "what now", "where exactly", "please clarify", "what do I click", or similar, clarify the exact prior step and give the narrow next action.
+
+PREVIOUS USER REQUEST:
+${previousUser.slice(0, 1600) || "(none)"}
+
+PREVIOUS AGENT RECOMMENDATION:
+${previousAssistant.slice(0, 3500)}
+${screenshotInstruction}`;
   }
 
   function textFromBytes(bytes: Uint8Array) {
@@ -1178,6 +2397,123 @@ export default function Home() {
     };
   }
 
+  function squareOutputSide(text: string) {
+    const explicit = text.match(/\b(512|1024|1200|1536|2048|3000|4096)\s*(?:px|pixels)?\b/i)?.[1];
+    if (explicit) return Number(explicit);
+    if (/\b(massive|huge|very large|4096|4k)\b/i.test(text)) return 4096;
+    if (/\b(large|big|high[-\s]?res|hi[-\s]?res|retina)\b/i.test(text)) return 2048;
+    return 1024;
+  }
+
+  function resizedMaxSide(text: string) {
+    const explicit = text.match(/\b(512|1024|1200|1536|2048|3000|4096)\s*(?:px|pixels)?\b/i)?.[1];
+    if (explicit) return Number(explicit);
+    if (/\b(massive|huge|4096|4k)\b/i.test(text)) return 4096;
+    if (/\b(large|big|larger|bigger|high[-\s]?res|hi[-\s]?res|retina)\b/i.test(text)) return 2048;
+    return 1024;
+  }
+
+  function drawImageWithOptionalMask(
+    context: CanvasRenderingContext2D,
+    image: HTMLImageElement,
+    x: number,
+    y: number,
+    width: number,
+    height: number,
+    mask?: ImageEditPlan["mask"],
+  ) {
+    if (!mask) {
+      context.drawImage(image, x, y, width, height);
+      return;
+    }
+
+    context.save();
+    if (mask === "circle") {
+      const diameter = Math.min(width, height);
+      context.beginPath();
+      context.arc(x + width / 2, y + height / 2, diameter / 2, 0, Math.PI * 2);
+      context.clip();
+    }
+    context.drawImage(image, x, y, width, height);
+    context.restore();
+  }
+
+  async function editImage(file: UploadedFile, plan: ImageEditPlan): Promise<GeneratedFile> {
+    const image = await loadImageElement(file.content);
+    const width = image.naturalWidth || image.width;
+    const height = image.naturalHeight || image.height;
+    const canvas = document.createElement("canvas");
+
+    if (plan.mode === "canvas") {
+      const ratio = plan.aspectRatio || width / height || 1;
+      const maxSide = Math.max(width, height, plan.maxSide || 1024);
+      if (ratio >= 1) {
+        canvas.width = maxSide;
+        canvas.height = Math.round(maxSide / ratio);
+      } else {
+        canvas.height = maxSide;
+        canvas.width = Math.round(maxSide * ratio);
+      }
+    } else {
+      const maxSide = Math.max(width, height, plan.maxSide || 1024);
+      const scale = maxSide / Math.max(width, height);
+      canvas.width = Math.round(width * scale);
+      canvas.height = Math.round(height * scale);
+    }
+
+    const context = canvas.getContext("2d");
+    if (!context) {
+      throw new Error("Image editing is not available in this browser.");
+    }
+
+    if (plan.target.mime === "image/jpeg") {
+      context.fillStyle = "#ffffff";
+      context.fillRect(0, 0, canvas.width, canvas.height);
+    } else {
+      context.clearRect(0, 0, canvas.width, canvas.height);
+    }
+
+    const scale =
+      plan.mode === "canvas"
+        ? Math.min(canvas.width / width, canvas.height / height)
+        : canvas.width / width;
+    const drawWidth = Math.round(width * scale);
+    const drawHeight = Math.round(height * scale);
+    context.imageSmoothingEnabled = true;
+    context.imageSmoothingQuality = "high";
+    drawImageWithOptionalMask(
+      context,
+      image,
+      Math.round((canvas.width - drawWidth) / 2),
+      Math.round((canvas.height - drawHeight) / 2),
+      drawWidth,
+      drawHeight,
+      plan.mask,
+    );
+
+    const blob = await new Promise<Blob>((resolve, reject) => {
+      canvas.toBlob(
+        (result) => {
+          if (result) {
+            resolve(result);
+          } else {
+            reject(new Error(`Could not export ${plan.target.label}.`));
+          }
+        },
+        plan.target.mime,
+        plan.target.mime === "image/jpeg" ? 0.92 : undefined,
+      );
+    });
+
+    const baseName = file.name.replace(/\.[^/.\\]+$/, "") || "image";
+    return {
+      name: `${baseName}-${plan.suffix}.${plan.target.extension}`,
+      type: plan.target.mime,
+      size: blob.size,
+      content: await blobToDataUrl(blob),
+    };
+  }
+
   async function convertImagesForChat(files: UploadedFile[], target: ImageConversionTarget) {
     const images = files.filter((file) => file.isImage && file.content);
     if (!images.length) {
@@ -1185,6 +2521,15 @@ export default function Home() {
     }
 
     return Promise.all(images.map((file) => convertImage(file, target)));
+  }
+
+  async function editImagesForChat(files: UploadedFile[], plan: ImageEditPlan) {
+    const images = files.filter((file) => file.isImage && file.content);
+    if (!images.length) {
+      throw new Error("No image was available to edit.");
+    }
+
+    return Promise.all(images.map((file) => editImage(file, plan)));
   }
 
   function resolveReferencedUploads(explicitUploads?: UploadedFile[]) {
@@ -1312,6 +2657,182 @@ ${uploads ? `\n${uploads}` : ""}`;
     ]
       .filter(Boolean)
       .join("\n\n");
+  }
+
+  function isSketchProjectCreationRequest(text: string) {
+    return /^CREATE PROJECT FROM GENERATED SKETCH\b/i.test(text.trim());
+  }
+
+  function projectCreationField(text: string, label: string) {
+    const pattern = new RegExp(`${label}:\\s*\\n([\\s\\S]*?)(?=\\n\\n[A-Z][A-Za-z ]+:|\\n\\nRequirements:|$)`, "i");
+    return text.match(pattern)?.[1]?.trim() || "";
+  }
+
+  function parseSketchProjectCreationRequest(text: string) {
+    const rawFolderName = projectCreationField(text, "Folder name");
+    return {
+      parentPath: projectCreationField(text, "Target parent path"),
+      folderName: /^\(auto-generate/i.test(rawFolderName) ? "" : rawFolderName,
+      stack: projectCreationField(text, "Preferred stack") || "Next.js app",
+    };
+  }
+
+  function currentProjectCreationBrief(messagesToSearch: ChatMessage[]) {
+    const brief = [...messagesToSearch].reverse().find((message) => /^PROJECT CREATION BRIEF:/i.test(message.content));
+    return brief?.content || "";
+  }
+
+  function latestGeneratedProjectPath(messagesToSearch: ChatMessage[]) {
+    const created = [...messagesToSearch].reverse().find((message) => /\bPROJECT CREATED\b/i.test(message.content) && /\bPath:\s*\n/i.test(message.content));
+    const explicitPath = created?.content.match(/Path:\s*\n([^\r\n]+)/i)?.[1]?.trim();
+    if (explicitPath) return explicitPath;
+
+    const request = [...messagesToSearch].reverse().find((message) => isSketchProjectCreationRequest(message.content));
+    if (!request) return "";
+    const parsed = parseSketchProjectCreationRequest(request.content);
+    if (!parsed.parentPath || !parsed.folderName) return "";
+    return `${parsed.parentPath.replace(/[\\/]+$/, "")}\\${parsed.folderName}`;
+  }
+
+  function asksToAddMissingJs(text: string) {
+    return /\b(missing|add|include|create|need|where(?:'s| is)?)\b[\s\S]{0,80}\b(js|javascript|app\.js)\b/i.test(text) ||
+      /\b(js|javascript|app\.js)\b[\s\S]{0,80}\b(missing|add|include|create|need)\b/i.test(text);
+  }
+
+  function asksToDeleteGeneratedProject(text: string) {
+    const normalized = normalizedProjectCommand(text);
+    const hasDeleteIntent = fuzzyProjectCommandToken(normalized, "delete") || /\b(clean up|trash|remove)\b/.test(normalized);
+    const hasTargetIntent = /\b(it|this|that|generated|created|project|app|folder|directory)\b/.test(normalized);
+    return hasDeleteIntent && hasTargetIntent;
+  }
+
+  function isPaxAndroidBuiltSession(messagesToCheck = agentSessionMessages) {
+    return messagesToCheck.some((message) => message.role === "assistant" && /^PAX ANDROID APP BUILT/i.test(message.content));
+  }
+
+  function latestPaxAndroidBuildReport(messagesToCheck = agentSessionMessages) {
+    return [...messagesToCheck].reverse().find((message) => message.role === "assistant" && /^PAX ANDROID APP BUILT/i.test(message.content))?.content || "";
+  }
+
+  function userSaysErrorsAreGone(text: string) {
+    return /\b(no errors?|no more errors?|errors? (?:are )?gone|sync passed|build passed|it works|all good|fixed now|wow[, ]+no errors?)\b/i.test(text);
+  }
+
+  function hasBuildErrorEvidence(text: string) {
+    return /\b(Configuration cache|Could not resolve|debugRuntimeClasspath|processDebugNavigationResources|Gradle|BUILD FAILED|CONFIGURE FAILED|PKIX path building failed|SSL handshake|certificate_unknown|Could not GET|Could not HEAD|Maven|repo\.maven|stacktrace|exception|error writing value|failed)\b/i.test(
+      text,
+    );
+  }
+
+  function asksForIdeWorkflowScreenshot(text: string, files: UploadedFile[]) {
+    const hasScreenshot = files.some((file) => file.isImage) || questionReferencesImage(text);
+    if (!hasScreenshot) return false;
+    if (hasBuildErrorEvidence(text)) return false;
+
+    const asksAboutVisibleUi = /\b(these|those|this|that|options?|menu|button|dropdown|what do i click|which one|i see|not seeing|can't find|cannot find|where is|under build|under file|under run)\b/i.test(
+      text,
+    );
+    const mentionsIdeWorkflow = /\b(build|run|sync|make project|rebuild|apk|bundle|debug|release|deploy|install|device|emulator|android studio|visual studio|vs code|xcode|intellij|rider|eclipse|ide)\b/i.test(
+      text,
+    );
+    const wantsVisualPatch = /\b(visual fix|fix ui|style|css|contrast|spacing|overflow|move|left side|right side|patch|change the project|make it look)\b/i.test(
+      text,
+    );
+
+    return asksAboutVisibleUi && mentionsIdeWorkflow && !wantsVisualPatch;
+  }
+
+  function sdkArtifactsFromProjectFileList(fileList: string) {
+    return fileList
+      .split(/\r?\n/)
+      .map((line) => line.match(/^FILE:\s*(.+)$/i)?.[1]?.trim() || "")
+      .filter((file) => /(^|[\\/])app[\\/]libs[\\/].+\.(?:aar|jar)$/i.test(file))
+      .filter((file, index, files) => files.findIndex((item) => item.toLowerCase() === file.toLowerCase()) === index)
+      .sort((left, right) => left.localeCompare(right))
+      .slice(0, 30);
+  }
+
+  function paxAndroidExactNextStepsMessage(
+    buildReport: string,
+    options: { latestValidation?: string; userSaysNoErrors?: boolean; liveSdkArtifacts?: string[] } = {},
+  ) {
+    const projectMatch = buildReport.match(/Project:\n([^\n]+)/i)?.[1]?.trim() || connectedProjectPath || "the connected Android project";
+    const namespace = buildReport.match(/Package\/namespace:\n([^\n]+)/i)?.[1]?.trim() || "the generated package";
+    const copiedArtifactsBlock = buildReport.match(/SDK artifacts copied into app\/libs:\n([\s\S]*?)\n\nWhat PayFix wired:/i)?.[1]?.trim() || "";
+    const liveSdkArtifacts = options.liveSdkArtifacts || [];
+    const savedSdkArtifacts = copiedArtifactsBlock && !/No AAR\/JAR files/i.test(copiedArtifactsBlock)
+      ? copiedArtifactsBlock
+          .split(/\r?\n/)
+          .map((line) => line.replace(/^-\s*/, "").trim())
+          .filter(Boolean)
+      : [];
+    const sdkArtifacts = liveSdkArtifacts.length ? liveSdkArtifacts : savedSdkArtifacts;
+    const latestValidation = options.latestValidation || "";
+    const liveValidationPassed =
+      /Sandbox checks passed|PASS .*gradlew|BUILD SUCCESSFUL/i.test(latestValidation) &&
+      !/\bFAIL\b|BUILD FAILED|Could not resolve|PKIX|SSL handshake/i.test(latestValidation);
+    const liveValidationFailed = /\bFAIL\b|BUILD FAILED|Could not resolve|PKIX|SSL handshake|Sandbox checks found failures/i.test(latestValidation);
+    const userReportsClean = Boolean(options.userSaysNoErrors);
+    const buildFailed =
+      !userReportsClean &&
+      (liveValidationFailed || (!latestValidation && /Sandbox checks found failures|FAIL .*gradlew|Build failed with an exception|Plugin \[id:/i.test(buildReport)));
+    const pluginFailure =
+      latestValidation.match(/Plugin \[id:[^\n]+/i)?.[0]?.trim() ||
+      latestValidation.match(/Settings file '[^']+settings\.gradle(?:\.kts)?' line: \d+/i)?.[0]?.trim() ||
+      latestValidation.match(/PKIX path building failed|SSL handshake exception|Could not resolve [^\r\n]+/i)?.[0]?.trim() ||
+      (!latestValidation && buildReport.match(/Plugin \[id:[^\n]+/i)?.[0]?.trim()) ||
+      (!latestValidation && buildReport.match(/Settings file '[^']+settings\.gradle(?:\.kts)?' line: \d+/i)?.[0]?.trim()) ||
+      "";
+    const successIntro =
+      userReportsClean || liveValidationPassed
+        ? "Nice, that means you are past the previous Gradle blocker. Here is the clean next path."
+        : "";
+
+    return `EXACT NEXT STEPS FOR THIS PAX ANDROID APP
+
+${successIntro ? `${successIntro}\n\n` : ""}Project PayFix changed:
+${projectMatch}
+
+Generated namespace:
+${namespace}
+
+Current status:
+${buildFailed ? `Do not try to run this on the PAX device yet. The project still has a build/sync failure${pluginFailure ? `:\n${pluginFailure}` : "."}` : userReportsClean && liveValidationFailed ? `Android Studio appears clean from your report. PayFix local validation still sees a machine/network validation issue (${pluginFailure || "see validation output"}), so continue in Android Studio and send PayFix the next real IDE/device error if one appears.` : "No known build/sync blocker is active from the latest context. Continue with build, install, and device testing."}
+
+1. Open the exact project in Android Studio
+- Android Studio -> File -> Open
+- Select this folder:
+  ${projectMatch}
+- Wait until Android Studio finishes indexing.
+
+2. Sync Gradle
+- Click "Sync Now" if Android Studio shows the banner.
+- Or use File -> Sync Project with Gradle Files.
+- If sync fails, click "Fix build failure" in PayFix or send the first red Gradle error. PayFix should patch the project, not just explain it.
+
+3. Confirm SDK libraries are present
+- In Android Studio Project view, open:
+  app/libs
+- Expected:
+  POSLink/PAX SDK files such as PAX_POSLinkAndroid_*.aar, POSLink_*.jar, and helper jars.
+- Current project status:
+${sdkArtifacts.length ? sdkArtifacts.map((file) => `  - ${file}`).join("\n") : "  No SDK .aar/.jar files were found in the current project file list. Add/select the extracted POSLink/PAX SDK folder, then ask PayFix to wire SDK artifacts again."}
+
+4. Build the app
+- Top menu -> Build -> Make Project.
+- If it fails, send the first error block here and say "fix this build error".
+
+5. Run it on the PAX device
+- Connect the PAX A920/A80 device with USB debugging enabled.
+- Select the device from the Android Studio device dropdown.
+- Click Run.
+
+6. Finish the real payment bridge
+- Open PaymentServiceBridge.
+- PayFix created the bridge file and copied SDK artifacts, but the exact POSLink/BroadPOS call depends on the vendor sample/docs inside your SDK.
+- If you want PayFix to finish that part, send: "wire the actual POSLink payment call from the SDK samples" and keep the SDK folders attached. PayFix will inspect readable samples/AIDL/docs and patch the bridge.
+
+If anything turns red, do not manually hunt through files. Paste the first error or screenshot and ask "fix this"; PayFix should run validation and patch the exact file.`;
   }
 
   function openEmvDecoderFromCurrentContext() {
@@ -1508,21 +3029,27 @@ ${uploads ? `\n${uploads}` : ""}`;
 
     try {
       await ensureLocalAgentProjectRoot();
-      const [memoryResponse, mapResponse, watchResponse, gitResponse] = await Promise.all([
+      const [memoryResponse, mapResponse, watchResponse, gitResponse, portResponse, toolchainResponse] = await Promise.all([
         fetch("/api/local-agent/project/memory"),
         fetch("/api/local-agent/project/map"),
         fetch("/api/local-agent/project/watch/events"),
         fetch("/api/local-agent/project/git/status"),
+        fetch("/api/local-agent/system/ports/list"),
+        fetch("/api/local-agent/project/toolchain"),
       ]);
       const memoryData = (await memoryResponse.json()) as ProjectMemoryResult;
       const mapData = (await mapResponse.json()) as ProjectMapResult;
       const watchData = (await watchResponse.json()) as WatchModeResult;
       const gitData = (await gitResponse.json()) as GitStatusResult;
+      const portData = (await portResponse.json()) as PortManagerResult;
+      const toolchainData = (await toolchainResponse.json()) as ToolchainDoctorResult;
 
       setProjectMemory(memoryData);
       setProjectMap(mapData);
       setWatchModeResult(watchData);
       setGitStatusResult(gitData);
+      setPortManagerResult(portData);
+      setToolchainDoctorResult(toolchainData);
 
       if (!memoryData.ok) throw new Error(memoryData.error || "Project memory failed.");
       if (!mapData.ok) throw new Error(mapData.error || "Project map failed.");
@@ -1554,6 +3081,98 @@ ${uploads ? `\n${uploads}` : ""}`;
     } catch (err: unknown) {
       setSandboxRunnerResult({ ok: false, error: errorMessage(err) });
       setAgentStatus(`Sandbox runner failed: ${errorMessage(err)}`);
+    } finally {
+      setProjectIqLoading(false);
+    }
+  }
+
+  async function refreshPorts() {
+    setProjectIqLoading(true);
+    setAgentStatus("Scanning listening localhost ports...");
+
+    try {
+      const response = await fetch("/api/local-agent/system/ports/list", { cache: "no-store" });
+      const data = (await response.json()) as PortManagerResult;
+      setPortManagerResult(data);
+      if (!data.ok) throw new Error(data.error || "Port scan failed.");
+
+      const devCount = (data.ports || []).filter((port) => port.devServerLikely).length;
+      setAgentStatus(`Port scan complete: ${(data.ports || []).length} listening port(s), ${devCount} likely dev server(s).`);
+    } catch (err: unknown) {
+      setAgentStatus(`Port scan failed: ${errorMessage(err)}`);
+    } finally {
+      setProjectIqLoading(false);
+    }
+  }
+
+  async function refreshToolchainDoctor() {
+    setProjectIqLoading(true);
+    setAgentStatus("Checking project toolchain...");
+
+    try {
+      await ensureLocalAgentProjectRoot();
+      const response = await fetch("/api/local-agent/project/toolchain", { cache: "no-store" });
+      const data = (await response.json()) as ToolchainDoctorResult;
+      setToolchainDoctorResult(data);
+      if (!data.ok) {
+        setAgentStatus("");
+        return;
+      }
+
+      const missingCount = data.missing?.length || 0;
+      setAgentStatus(
+        missingCount
+          ? `Toolchain Doctor found ${missingCount} missing validator/toolchain item(s).`
+          : "Toolchain Doctor found the detected project toolchains available.",
+      );
+    } catch (err: unknown) {
+      setToolchainDoctorResult({ ok: false, error: errorMessage(err) });
+      setAgentStatus("");
+    } finally {
+      setProjectIqLoading(false);
+    }
+  }
+
+  async function stopPort(port: number) {
+    setProjectIqLoading(true);
+    setAgentStatus(`Stopping dev server on port ${port}...`);
+
+    try {
+      const response = await fetch("/api/local-agent/system/ports/stop", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ port }),
+      });
+      const data = await response.json();
+      if (!data.ok) throw new Error(data.error || `Could not stop port ${port}.`);
+      setAgentStatus(`Stopped port ${port}.`);
+      await refreshPorts();
+    } catch (err: unknown) {
+      setAgentStatus(`Stop port failed: ${errorMessage(err)}`);
+    } finally {
+      setProjectIqLoading(false);
+    }
+  }
+
+  async function restartPort(port: number) {
+    setProjectIqLoading(true);
+    setAgentStatus(`Restarting connected project on port ${port}...`);
+
+    try {
+      await ensureLocalAgentProjectRoot();
+      const response = await fetch("/api/local-agent/system/ports/restart", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ port }),
+      });
+      const data = await response.json();
+      if (!data.ok) throw new Error(data.error || `Could not restart port ${port}.`);
+      setAgentStatus(`Restarted ${data.started?.script || "dev server"} on port ${port}.`);
+      window.setTimeout(() => {
+        void refreshPorts();
+      }, 1200);
+    } catch (err: unknown) {
+      setAgentStatus(`Restart port failed: ${errorMessage(err)}`);
     } finally {
       setProjectIqLoading(false);
     }
@@ -1808,6 +3427,7 @@ Please inspect the exact project file and neighboring code. Decide whether this 
     setAgentSessionOpen(true);
     setAgentSessionMessages([]);
     setAgentSessionUploads([]);
+    setAgentSessionFreshUploads([]);
     setAgentLoading(true);
     setAgentStatus("PayFix Agent is investigating the Live Capture event...");
 
@@ -1841,7 +3461,31 @@ Please inspect the exact project file and neighboring code. Decide whether this 
     setSelectedCssFile("");
     setCssPreview("");
     setShowColorEditor(true);
-    setAgentStatus("Color Tool opened from inspected element. Find the CSS file, preview, then apply.");
+    setAgentStatus("Visual Fix opened from inspected element. Find the CSS file manually or run the Agent for a real patch.");
+  }
+
+  function runVisualFixAgent(visualPrompt = "") {
+    const targetDetails = [
+      visualPrompt.trim() ? `User-described visual issue:\n${visualPrompt.trim()}` : "",
+      cssSelector ? `Selector: ${cssSelector}` : "",
+      selectedCssFile ? `Matched CSS file: ${selectedCssFile}` : cssFileName ? `CSS file hint: ${cssFileName}` : "",
+      cssProperty ? `CSS property focus: ${cssProperty}` : "",
+      cssColor ? `Candidate color: ${cssColor}` : "",
+      cssPreview ? `Current manual preview:\n${cssPreview.slice(0, 2200)}` : "",
+      uploadedFiles.length
+        ? `Attached visual evidence:\n${uploadedFiles.map((file, index) => `- ${file.isImage ? "Image" : "File"} ${index + 1}: ${file.name}`).join("\n")}`
+        : "",
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    setShowColorEditor(false);
+    void startAgentFromActionPrompt(`Visual Fix Agent request:
+Inspect the connected project UI styling and prepare a reviewable patch for the visible issue. Focus on contrast, readability, spacing, overflow, hover/focus states, and whether text is legible in the current PayFix theme.
+
+${targetDetails || "No visual issue was typed. Ask the user for a screenshot or a short description if the project evidence is not enough."}
+
+Do not just pick a color. Find the exact component/CSS source, explain the visual issue, prepare a safe patch preview, and recommend the validation/screenshot check.`);
   }
 
   async function downloadDeviceSupportBundle() {
@@ -1899,23 +3543,68 @@ Please inspect the exact project file and neighboring code. Decide whether this 
     setApplyPreviewKey("");
   }
 
+  function dependencyPackageNames(proposal: DependencyProposal | null) {
+    if (!proposal) return [];
+
+    const rawNames = proposal.packageNames?.length ? proposal.packageNames : [proposal.packageName];
+    return [
+      ...new Set(
+        rawNames
+          .flatMap((item) => String(item || "").split(/[,\s]+/))
+          .map((item) => item.trim())
+          .filter(Boolean),
+      ),
+    ];
+  }
+
+  function requestInstallProposedDependency() {
+    if (!dependencyProposal?.needed) return;
+
+    const packageNames = dependencyPackageNames(dependencyProposal);
+    if (!packageNames.length) return;
+    if (dependencyProposal.installable === false) {
+      setAgentStatus(dependencyProposal.installCommand || "PayFix found missing dependencies, but automatic install is not safe for this ecosystem.");
+      return;
+    }
+
+    setDependencyConfirmOpen(true);
+  }
+
   async function installProposedDependency() {
     if (!dependencyProposal?.needed) return;
 
+    const packageNames = dependencyPackageNames(dependencyProposal);
+    const packageLabel = packageNames.join(", ");
+    if (!packageNames.length) return;
+
+    setDependencyConfirmOpen(false);
     setDependencyInstalling(true);
-    setAgentStatus(`Installing ${dependencyProposal.packageName}...`);
+    setAgentStatus(`Installing ${packageLabel}...`);
 
     try {
       const response = await fetch("/api/local-agent/project/install-package", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          packageName: dependencyProposal.packageName,
+          packageName: packageNames[0],
+          packageNames,
+          ecosystem: dependencyProposal.ecosystem || "node",
           dev: dependencyProposal.devDependency,
         }),
       });
       const responseText = await response.text();
-      let data: { ok?: boolean; error?: string; command?: string } = {};
+      let data: {
+        ok?: boolean;
+        error?: string;
+        command?: string;
+        packageNames?: string[];
+        ecosystem?: string;
+        initialized?: boolean;
+        bootstrapCommands?: { command: string; ok: boolean; output: string }[];
+        metadataUpdated?: boolean;
+        metadataFile?: string;
+        metadataAdded?: string[];
+      } = {};
 
       try {
         data = responseText ? JSON.parse(responseText) : {};
@@ -1936,15 +3625,34 @@ Please inspect the exact project file and neighboring code. Decide whether this 
         );
       }
 
+      setAgentStatus(`Installed ${data.packageNames?.join(", ") || packageLabel}. Running validation...`);
+      const validationSummary = await runPostApplySandboxChecks();
+      const bootstrapSummary = data.initialized
+        ? `\nProject metadata initialized first:\n${(data.bootstrapCommands || [])
+            .map((command) => `- ${command.ok ? "PASS" : "FAIL"} ${command.command}`)
+            .join("\n")}\n`
+        : "";
+      const metadataSummary = data.metadataUpdated
+        ? `\nProject metadata updated: ${data.metadataFile}\nAdded: ${(data.metadataAdded || []).join(", ")}\n`
+        : "";
       const installMessage: ChatMessage = {
         role: "assistant",
-        content: `Dependency installed.\n\nPackage: ${dependencyProposal.packageName}\nCommand: ${data.command}`,
+        content: `Dependency installed.\n\nPackage${packageNames.length === 1 ? "" : "s"}: ${
+          data.packageNames?.join(", ") || packageLabel
+        }\nCommand: ${data.command}${bootstrapSummary}${metadataSummary}\nVALIDATION\n${validationSummary}`,
       };
+      if (agentSessionOpen) {
+        setAgentSessionMessages((current) => [...current, installMessage]);
+      }
       const nextMessages = [...messages, installMessage];
       setMessages(nextMessages);
       saveActiveChat(nextMessages);
       setDependencyProposal(null);
-      setAgentStatus(`Installed ${dependencyProposal.packageName}.`);
+      setAgentStatus(
+        /Sandbox checks found failures|FAIL/i.test(validationSummary)
+          ? "Dependencies installed, but validation still found failures. Use the Fix validation failure button."
+          : `Installed ${data.packageNames?.join(", ") || packageLabel} and validation passed or was safely skipped.`,
+      );
     } catch (err: unknown) {
       setAgentStatus(`Dependency install failed: ${errorMessage(err)}`);
     } finally {
@@ -1952,16 +3660,113 @@ Please inspect the exact project file and neighboring code. Decide whether this 
     }
   }
 
-  function loadAgentPatchIntoApplyModal(data: AgentApiResponse) {
-    const patch = data.result?.patch;
-    if (!(data.patchReady && patch && patch.mode !== "none" && data.preview?.ok)) {
-      return false;
+  async function autoInstallAgentDependencyProposal(proposal: DependencyProposal | undefined, prompt: string) {
+    if (!connectedProjectPath || !proposal?.needed || !shouldAutoInstallAgentDependencies(prompt)) return null;
+
+    const packageNames = dependencyPackageNames(proposal);
+    const packageLabel = packageNames.join(", ");
+    if (!packageNames.length) return null;
+
+    if (proposal.installable === false) {
+      const manualMessage: ChatMessage = {
+        role: "assistant",
+        content: `DEPENDENCY INSTALL NEEDS REVIEW\n\nPayFix detected missing dependencies, but automatic install is not safe for this ecosystem or package mapping.\n\nPackage(s): ${packageLabel}\nInstall command:\n${proposal.installCommand || "See the project package manager config."}\n\nReason:\n${proposal.reason}`,
+      };
+      setAgentStatus("Dependency install needs manual review.");
+      return manualMessage;
     }
 
+    setDependencyInstalling(true);
+    setAgentStatus(`Installing detected project dependencies: ${packageLabel}...`);
+
+    try {
+      await ensureLocalAgentProjectRoot();
+      const response = await fetch("/api/local-agent/project/install-package", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          packageName: packageNames[0],
+          packageNames,
+          ecosystem: proposal.ecosystem || "node",
+          dev: proposal.devDependency,
+        }),
+      });
+      const responseText = await response.text();
+      let data: {
+        ok?: boolean;
+        error?: string;
+        command?: string;
+        packageNames?: string[];
+        ecosystem?: string;
+        initialized?: boolean;
+        bootstrapCommands?: { command: string; ok: boolean; output: string }[];
+        metadataUpdated?: boolean;
+        metadataFile?: string;
+        metadataAdded?: string[];
+      } = {};
+
+      try {
+        data = responseText ? JSON.parse(responseText) : {};
+      } catch {
+        throw new Error(
+          response.status === 404
+            ? "The running local agent is old and does not have the install endpoint. Stop the process using port 7777, then restart payfix-agent."
+            : `Local agent returned a non-JSON response: ${responseText.slice(0, 120)}`,
+        );
+      }
+
+      if (!data.ok) {
+        throw new Error(data.error || "Package install failed.");
+      }
+
+      setAgentStatus(`Installed ${data.packageNames?.join(", ") || packageLabel}. Running validation...`);
+      const validationSummary = await runPostApplySandboxChecks();
+      const bootstrapSummary = data.initialized
+        ? `\n\nProject metadata initialized first:\n${(data.bootstrapCommands || [])
+            .map((command) => `- ${command.ok ? "PASS" : "FAIL"} ${command.command}`)
+            .join("\n")}`
+        : "";
+      const metadataSummary = data.metadataUpdated
+        ? `\n\nProject metadata updated: ${data.metadataFile}\nAdded: ${(data.metadataAdded || []).join(", ")}`
+        : "";
+
+      setDependencyProposal(null);
+      setAgentStatus(
+        /Sandbox checks found failures|FAIL/i.test(validationSummary)
+          ? "Dependencies installed, but validation still found failures."
+          : `Installed ${data.packageNames?.join(", ") || packageLabel} and validation passed or was safely skipped.`,
+      );
+
+      return {
+        role: "assistant" as const,
+        content: `DEPENDENCIES INSTALLED BY AGENT\n\nPackage${packageNames.length === 1 ? "" : "s"}: ${
+          data.packageNames?.join(", ") || packageLabel
+        }\nEcosystem: ${data.ecosystem || proposal.ecosystem || "node"}\nCommand: ${data.command}${bootstrapSummary}${metadataSummary}\n\nReason:\n${proposal.reason}\n\nVALIDATION\n${validationSummary}`,
+      };
+    } catch (error: unknown) {
+      setAgentStatus(`Dependency install failed: ${errorMessage(error)}`);
+      return {
+        role: "assistant" as const,
+        content: `DEPENDENCY INSTALL FAILED\n\nPackage${packageNames.length === 1 ? "" : "s"}: ${packageLabel}\nReason:\n${proposal.reason}\n\nError:\n${errorMessage(error)}`,
+      };
+    } finally {
+      setDependencyInstalling(false);
+    }
+  }
+
+  function loadAgentPatchIntoApplyModal(data: AgentApiResponse) {
+    const patch = primaryAgentPatch(data);
+    const preview = data.preview;
+    if (!agentResponseHasApplyablePatch(data) || !patch || patch.mode === "none" || !preview?.ok) {
+      return false;
+    }
+    const patchMode = patch.mode === "delete" ? "delete" : patch.mode === "replace" ? "replace" : "insert";
+
+    setLastVerifiedAgentPatch(data);
     const apiPatchSet = data.result?.patchSet || data.patchSet || [];
     const nextApplyKey = makeApplyPreviewKey({
       file: patch.file,
-      mode: patch.mode,
+      mode: patchMode,
       search: patch.search,
       content: patch.replacement,
     });
@@ -1972,7 +3777,7 @@ Please inspect the exact project file and neighboring code. Decide whether this 
     }
 
     setApplyFilePath(patch.file);
-    setApplyMode(patch.mode);
+    setApplyMode(patchMode);
     setApplySearchContent(patch.search);
     setApplyNewContent(patch.replacement);
     setApplyDescription(
@@ -1983,14 +3788,14 @@ Please inspect the exact project file and neighboring code. Decide whether this 
         .filter(Boolean)
         .join("\n\n"),
     );
-    setDiffOldContent(data.preview.oldContent || "");
-    setDiffNewContent(data.preview.newContent || "");
+    setDiffOldContent(preview.oldContent || "");
+    setDiffNewContent(preview.newContent || "");
     setApplyPatchSet(
       apiPatchSet.length > 1
         ? apiPatchSet.map((item) => ({
             fileCandidate: item.file,
             resolvedFile: item.file,
-            mode: item.mode === "replace" ? "replace" : "insert",
+            mode: item.mode === "delete" ? "delete" : item.mode === "replace" ? "replace" : "insert",
             search: item.search,
             replacement: item.replacement,
           }))
@@ -2008,7 +3813,7 @@ Please inspect the exact project file and neighboring code. Decide whether this 
     content,
   }: {
     file: string;
-    mode: "insert" | "replace" | "overwrite";
+    mode: "insert" | "replace" | "overwrite" | "delete";
     search: string;
     content: string;
   }) {
@@ -2042,6 +3847,16 @@ Please inspect the exact project file and neighboring code. Decide whether this 
     });
   }
 
+  function rememberRollbackSnapshot(snapshot: RollbackSnapshot) {
+    setLastRollback(snapshot);
+    setRollbackSnapshots((current) => {
+      const withoutDuplicate = current.filter((item) => item.id !== snapshot.id);
+      return [snapshot, ...withoutDuplicate].sort(
+        (left, right) => new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime(),
+      );
+    });
+  }
+
   function invalidateApplyPreview() {
     setApplyPreviewKey("");
     setDiffOldContent("");
@@ -2049,9 +3864,15 @@ Please inspect the exact project file and neighboring code. Decide whether this 
   }
 
   function appendAssistantStatusMessage(content: string) {
+    const shouldAttachAgentTrail =
+      agentSessionMessages.some((message) => message.role === "assistant") &&
+      /Dependency installed|PATCH APPLIED BY AGENT|PATCH VALIDATION|PATCH ROLLED BACK/i.test(content);
     const statusMessage: ChatMessage = {
       role: "assistant",
       content,
+      agentSessionMessages: shouldAttachAgentTrail
+        ? [...agentSessionMessages, { role: "assistant", content }]
+        : undefined,
     };
     setMessages((currentMessages) => {
       const nextMessages = [...currentMessages, statusMessage];
@@ -2060,7 +3881,20 @@ Please inspect the exact project file and neighboring code. Decide whether this 
     });
   }
 
+  function latestApplyableAgentPatch(messagesToSearch = agentSessionMessages) {
+    if (agentResponseHasApplyablePatch(lastVerifiedAgentPatch)) return lastVerifiedAgentPatch;
+
+    const latestPatch = [...messagesToSearch]
+      .reverse()
+      .map((message) => message.agentPatchData)
+      .find(isAgentApiResponse);
+
+    return agentResponseHasApplyablePatch(latestPatch) ? latestPatch : null;
+  }
+
   function closeAgentSessionAndSave() {
+    setAgentSessionInitialDraft("");
+
     if (!agentSessionMessages.some((message) => message.role === "assistant")) {
       setAgentSessionOpen(false);
       return;
@@ -2070,33 +3904,20 @@ Please inspect the exact project file and neighboring code. Decide whether this 
     const lastAssistant = [...agentSessionMessages].reverse().find((message) => message.role === "assistant")?.content || "";
     const appliedFiles = appliedPatchNotice?.files || [];
     const appliedSummary = appliedPatchNotice
-      ? `PATCH ALREADY APPLIED
+      ? `Agent result saved. Patch already applied at ${appliedPatchNotice.appliedAt}.
 
-PayFix already wrote this change while the Agent workspace was open.
-
-Updated file${appliedFiles.length === 1 ? "" : "s"}:
-${appliedFiles.map((file) => `- ${file}`).join("\n")}
-
-Validation/checks:
-${appliedPatchNotice.validationLabel}
-
-Applied:
-${appliedPatchNotice.appliedAt}
-
-No Apply preview is attached to this saved summary because the patch is no longer pending. Reopen the investigation only if you want follow-up review, more changes, or explanation.`
+${appliedFiles.length ? `File${appliedFiles.length === 1 ? "" : "s"}: ${appliedFiles.map((file) => basename(file)).join(", ")}` : "Files: already applied"}
+Checks: ${appliedPatchNotice.validationLabel}
+Undo: available from the applied patch message.`
       : "";
     const agentSummary: ChatMessage = {
       role: "assistant",
       isAgentSessionSummary: true,
       patchAlreadyApplied: Boolean(appliedPatchNotice),
       agentSessionMessages,
+      agentPatchData: !appliedPatchNotice ? latestApplyableAgentPatch() || undefined : undefined,
       content: appliedSummary
-        ? `PAYFIX INVESTIGATION SAVED
-
-${appliedSummary}
-
-Original investigation question:
-${firstUser.slice(0, 700)}`
+        ? appliedSummary
         : `PAYFIX INVESTIGATION SAVED
 
 Investigation question:
@@ -2105,7 +3926,10 @@ ${firstUser.slice(0, 700)}
 Latest investigation result:
 ${lastAssistant.slice(0, 1400)}
 
-Reopen this saved investigation to continue the project review, upload more evidence, or ask PayFix to revise the fix.`,
+Full investigation trail saved:
+${agentSessionMessages.length} message(s). Reopen Investigation restores the full agent workspace, not only this summary.
+
+Reopen this saved investigation to continue the project review, upload more evidence, or apply/revise the fix.`,
     };
 
     setMessages((currentMessages) => {
@@ -2169,7 +3993,7 @@ Reopen this saved investigation to continue the project review, upload more evid
   function saveChats(chats: SavedChat[]) {
     setSavedChats(chats);
     window.setTimeout(() => {
-      localStorage.setItem("payfix_saved_chats", JSON.stringify(chats));
+      safeSetJsonStorage("payfix_saved_chats", chats, chats.map(trimSavedChatForStorage));
     }, 0);
   }
 
@@ -2179,12 +4003,23 @@ Reopen this saved investigation to continue the project review, upload more evid
       return;
     }
 
-    const firstUser = nextMessages.find((message) => message.role === "user")?.content || "New chat";
+    const existingChat = savedChats.find((chatItem) => chatItem.id === activeChatId);
+    const now = new Date().toISOString();
     const chat: SavedChat = {
       id: activeChatId,
-      title: firstUser === "Analyze attached context." ? "Attached context analysis" : firstUser.slice(0, 60),
-      createdAt: new Date().toLocaleString(),
+      title: titleFromChatMessages(nextMessages),
+      createdAt: existingChat?.createdAt || now,
+      lastActivityAt: now,
       messages: nextMessages,
+      projectPath,
+      connectedProjectPath,
+      projectContext,
+      computerSearchResults,
+      computerSearchPreview,
+      searchFolder,
+      searchFileName,
+      searchText,
+      lastConnectedAt: connectedProjectPath ? new Date().toISOString() : undefined,
     };
 
     saveChats([chat, ...savedChats.filter((chatItem) => chatItem.id !== activeChatId)]);
@@ -2197,22 +4032,61 @@ Reopen this saved investigation to continue the project review, upload more evid
       setMessages([]);
     });
     setQuestion("");
-    clearAttachments();
+    setSelectedQuickReplies([]);
+    setLog("");
+    setCode("");
+    setProjectContext("");
+    setProjectMatches([]);
+    setLoadedProjectFiles([]);
+    setComputerSearchResults("");
+    setComputerSearchPreview("");
+    setUploadedFiles([]);
+    setSearchFolder("");
+    setSearchFileName("");
+    setSearchText("");
+    setProjectPath("");
+    setConnectedProjectPath("");
+    localStorage.removeItem("payfix_last_connected_project");
     resetColorTool();
     resetRunner();
     resetApplyModal();
     setAppliedPatchKeys([]);
     setAppliedPatchNotice(null);
+    setLastVerifiedAgentPatch(null);
     setDependencyProposal(null);
-    setAgentStatus("New chat started.");
+    setAgentStatus("New chat started. Project disconnected.");
   }
 
   function openSavedChat(chat: SavedChat) {
+    if (chat.id === activeChatId) {
+      return;
+    }
+
     setActiveChatId(chat.id);
+    setSelectedQuickReplies([]);
     startTransition(() => {
       setMessages(chat.messages);
     });
-    setAgentStatus(`Opened: ${chat.title}`);
+    setProjectPath(chat.projectPath || chat.connectedProjectPath || "");
+    setConnectedProjectPath(chat.connectedProjectPath || "");
+    setProjectContext(chat.projectContext || "");
+    setComputerSearchResults(chat.computerSearchResults || "");
+    setComputerSearchPreview(chat.computerSearchPreview || "");
+    setSearchFolder(chat.searchFolder || "");
+    setSearchFileName(chat.searchFileName || "");
+    setSearchText(chat.searchText || "");
+    setLoadedProjectFiles([]);
+    setProjectMatches([]);
+
+    if (chat.connectedProjectPath) {
+      void fetch("/api/local-agent/set-root", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ root: chat.connectedProjectPath }),
+      }).catch(() => undefined);
+    }
+
+    setAgentStatus(chat.connectedProjectPath ? `Opened: ${chat.title} with project connected.` : `Opened: ${chat.title}`);
   }
 
   function editUserMessage(messageIndex: number) {
@@ -2237,6 +4111,7 @@ Reopen this saved investigation to continue the project review, upload more evid
     });
     setMessages(retainedMessages);
     setQuestion(message.content);
+    setSelectedQuickReplies([]);
     setLog(message.attachedLog || "");
     setCode(message.attachedCode || "");
     setUploadedFiles(message.attachedUploads || []);
@@ -2249,25 +4124,23 @@ Reopen this saved investigation to continue the project review, upload more evid
     resetApplyModal();
     setAgentStatus("Editing message. Add text, screenshots, or files, then send again.");
     saveActiveChat(retainedMessages);
-    localStorage.setItem(
-      "payfix_active_draft",
-      JSON.stringify({
-        question: message.content,
-        log: message.attachedLog || "",
-        code: message.attachedCode || "",
-        projectPath,
-        connectedProjectPath,
-        projectContext,
-        searchFolder,
-        searchFileName,
-        searchText,
-        computerSearchResults,
-        computerSearchPreview,
-        uploadedFiles: message.attachedUploads || [],
-        messages: retainedMessages,
-        activeChatId,
-      }),
-    );
+    const draft: DraftState = {
+      question: message.content,
+      log: message.attachedLog || "",
+      code: message.attachedCode || "",
+      projectPath,
+      connectedProjectPath,
+      projectContext,
+      searchFolder,
+      searchFileName,
+      searchText,
+      computerSearchResults,
+      computerSearchPreview,
+      uploadedFiles: message.attachedUploads || [],
+      messages: retainedMessages,
+      activeChatId,
+    };
+    safeSetJsonStorage("payfix_active_draft", draft, trimDraftForStorage(draft));
   }
 
   function cancelEditMessage() {
@@ -2275,6 +4148,7 @@ Reopen this saved investigation to continue the project review, upload more evid
 
     setMessages(editSnapshot.messages);
     setQuestion(editSnapshot.question);
+    setSelectedQuickReplies([]);
     setLog(editSnapshot.log);
     setCode(editSnapshot.code);
     setProjectPath(editSnapshot.projectPath);
@@ -2303,6 +4177,7 @@ Reopen this saved investigation to continue the project review, upload more evid
       setActiveChatId(crypto.randomUUID());
       setMessages([]);
       setQuestion("");
+      setSelectedQuickReplies([]);
       clearAttachments();
       setAgentStatus("Deleted current chat.");
     }
@@ -2310,12 +4185,12 @@ Reopen this saved investigation to continue the project review, upload more evid
     setChatToDelete(null);
   }
 
-  async function connectProject() {
-    const trimmedProjectPath = projectPath.trim();
+  async function connectProjectPath(path: string) {
+    const trimmedProjectPath = path.trim();
 
     if (!trimmedProjectPath) {
       setAgentStatus("Enter a project path before connecting.");
-      return;
+      return false;
     }
 
     try {
@@ -2329,13 +4204,19 @@ Reopen this saved investigation to continue the project review, upload more evid
       setProjectPath(data.root);
       setConnectedProjectPath(data.root);
       setAgentStatus(`Connected: ${data.root}`);
+      return true;
     } catch (err: unknown) {
       setConnectedProjectPath("");
       setProjectContext("");
       setProjectMatches([]);
       setLoadedProjectFiles([]);
       setAgentStatus(`Failed: ${errorMessage(err)}`);
+      return false;
     }
+  }
+
+  async function connectProject() {
+    await connectProjectPath(projectPath);
   }
 
   function updateProjectPath(value: string) {
@@ -2430,6 +4311,230 @@ SIZE: ${item.size || 0} bytes`;
     }
   }
 
+  function normalizedProjectCommand(text: string) {
+    return text
+      .toLowerCase()
+      .replace(/[^a-z0-9\\/:._-]+/g, " ")
+      .replace(/\b(delte|dlete|deltee|dleete|deltet|deltete|delet|deleet|deleete|dellete)\b/g, "delete")
+      .replace(/\b(foler|foldr|fodler|foleder|flder)\b/g, "folder")
+      .replace(/\b(sub folders|sub-folders)\b/g, "subfolders")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function sdkPathsFromAgentPrompt(text: string) {
+    const block =
+      text.match(/Vendor SDK \/ local artifacts folders:\s*\n([\s\S]*?)(?:\n\n|$)/i)?.[1] ||
+      text.match(/Vendor SDK \/ local artifacts folder:\s*([^\r\n]+)/i)?.[1] ||
+      text.match(/SDK folders?:\s*\n([\s\S]*?)(?:\n\n|$)/i)?.[1] ||
+      text.match(/SDK folder:\s*([^\r\n]+)/i)?.[1] ||
+      "";
+
+    return Array.from(
+      new Set(
+        block
+          .split(/\r?\n|[;|]/)
+          .map((line) => line.replace(/^[-*]\s*/, "").trim())
+          .filter(Boolean),
+      ),
+    ).slice(0, 6);
+  }
+
+  function formatSdkInspection(data: SdkInspectionResponse, index = 1) {
+    if (!data.ok) return "";
+
+    const important = (data.importantFiles || [])
+      .slice(0, 60)
+      .map((file) => `- ${file.relative} (${file.role}, ${file.mime}, ${file.size} bytes)`)
+      .join("\n");
+    const readable = (data.readableFiles || [])
+      .filter((file) => file.content?.trim())
+      .slice(0, 16)
+      .map(
+        (file) => `FILE: ${file.relative}
+ROLE: ${file.role}
+MIME: ${file.mime}
+SIZE: ${file.size} bytes
+CONTENT:
+${(file.content || "").slice(0, 12000)}`,
+      )
+      .join("\n\n---\n\n");
+
+    return `VENDOR SDK / LOCAL ARTIFACTS INSPECTION ${index}
+Root: ${data.root || "unknown"}
+Total files found: ${data.totalFiles || 0}
+
+Important SDK files/artifacts:
+${important || "No important SDK artifacts detected."}
+
+Readable SDK docs/source/config:
+${readable || "No readable SDK docs/source/config were extracted."}`;
+  }
+
+  async function inspectSdkFolderForAgent(prompt: string) {
+    const sdkPaths = sdkPathsFromAgentPrompt(prompt);
+    if (!sdkPaths.length) return "";
+
+    setAgentStatus(`Inspecting ${sdkPaths.length} extracted SDK/artifacts folder(s)...`);
+    const inspections: string[] = [];
+
+    for (const [index, sdkPath] of sdkPaths.entries()) {
+      try {
+        const response = await fetch("/api/local-agent/sdk/inspect", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ root: sdkPath }),
+        });
+        const data = (await response.json()) as SdkInspectionResponse;
+        if (!response.ok || !data.ok) {
+          throw new Error(data.error || "Could not inspect SDK folder.");
+        }
+        inspections.push(formatSdkInspection(data, index + 1));
+      } catch (error: unknown) {
+        inspections.push(`VENDOR SDK / LOCAL ARTIFACTS INSPECTION ${index + 1}
+Path: ${sdkPath}
+Status: Could not inspect this SDK folder.
+Error: ${errorMessage(error)}
+
+If this is a zip, extract it first and paste the extracted folder path.`);
+      }
+    }
+
+    return inspections.filter(Boolean).join("\n\n====================\n\n");
+  }
+
+  function fuzzyProjectCommandToken(text: string, type: "delete" | "folder") {
+    const tokens = normalizedProjectCommand(text).split(" ").filter(Boolean);
+
+    return tokens.some((token) => {
+      if (type === "delete") {
+        return (
+          /^(delete|remove|erase|purge|cleanup)$/.test(token) ||
+          (token.length >= 4 && token.length <= 10 && /^d/.test(token) && token.includes("l") && token.includes("t"))
+        );
+      }
+
+      return (
+        /^(folder|folders|subfolder|subfolders|directory|directories|dir|tree|project)$/.test(token) ||
+        (token.length >= 4 && token.length <= 12 && /^fo/.test(token) && token.includes("l") && token.includes("r"))
+      );
+    });
+  }
+
+  function isProjectFolderDeleteRequest(text: string) {
+    if (hasBuildErrorEvidence(text)) return false;
+    const normalized = normalizedProjectCommand(text);
+    const hasDeleteIntent =
+      /\b(delete|remove|erase|purge|trash)\b/.test(normalized) ||
+      /\b(clean up|cleanup)\b[\s\S]{0,80}\b(folder|directory|project|from disk)\b/.test(normalized);
+    const hasFolderIntent =
+      /\b(this|that|current|connected|generated|created|empty)?\s*(folder|folders|subfolder|subfolders|directory|directories|dir|tree|project)\b/.test(
+        normalized,
+      ) ||
+      /\bfrom disk\b/.test(normalized);
+
+    return hasDeleteIntent && hasFolderIntent;
+  }
+
+  function isProjectDisconnectRequest(text: string) {
+    if (hasBuildErrorEvidence(text)) return false;
+    const normalized = normalizedProjectCommand(text);
+    return /\b(disconnect|detach|unattach|clear)\b.*\b(project|folder|payfix)\b/.test(normalized);
+  }
+
+  function shouldDeleteProjectFolderNow(text: string) {
+    const normalized = normalizedProjectCommand(text);
+    return isProjectFolderDeleteRequest(text) && !/\b(preview|review|prepare|show me|explain)\b/.test(normalized);
+  }
+
+  function shouldForceDeleteProjectFolder(text: string) {
+    const normalized = normalizedProjectCommand(text);
+    return isProjectFolderDeleteRequest(text) && /\b(force|bypass|busy|locked|try anyway|even if windows)\b/.test(normalized);
+  }
+
+  async function handleEmptyProjectFolderDeleteRequest(prompt: string) {
+    if (isProjectDisconnectRequest(prompt)) {
+      setConnectedProjectPath("");
+      setProjectPath("");
+      setProjectContext("");
+      setComputerSearchResults("");
+      setComputerSearchPreview("");
+      setLoadedProjectFiles([]);
+      setProjectMatches([]);
+      setProjectMemory(null);
+      setProjectMap(null);
+      return `PROJECT DISCONNECTED\n\nPayFix cleared the connected project. No files were deleted.`;
+    }
+
+    const apply = shouldDeleteProjectFolderNow(prompt);
+    const force = shouldForceDeleteProjectFolder(prompt);
+    const response = await fetch("/api/local-agent/project/delete-root", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ apply, force }),
+    });
+    const data = (await response.json()) as {
+      ok?: boolean;
+      error?: string;
+      root?: string;
+      applied?: boolean;
+      message?: string;
+      code?: string;
+      detail?: string;
+      canForce?: boolean;
+      fileCount?: number;
+      directoryCount?: number;
+      remaining?: string[];
+    };
+    if (!data.ok) {
+      if (data.code === "busy" || /EBUSY|busy|locked|resource/i.test(`${data.error || ""}\n${data.detail || ""}`)) {
+        return `PROJECT FOLDER BUSY
+
+The operating system says the connected project folder is busy or locked, so PayFix did not delete it.
+
+Folder:
+${data.root || connectedProjectPath}
+${data.detail ? `\nDetails:\n${data.detail}\n` : ""}
+Next:
+- Use Retry delete folder after closing Explorer, VS Code tabs, terminals, or running servers that are inside this folder.
+- Use Force disk delete if you want PayFix to retry deleting the actual folder from disk.
+- Use Disconnect only if you only want to detach this project from PayFix without deleting it from VS Code or disk.`;
+      }
+
+      if (data.code === "not_empty" || /not empty|still contains files/i.test(data.error || "")) {
+        const remainingExamples = (data.remaining || []).slice(0, 6).map((file) => `- ${file}`).join("\n");
+        return `PROJECT FOLDER NOT EMPTY
+
+PayFix cannot delete the folder yet because it still contains ${data.fileCount || "some"} file(s) and ${data.directoryCount || 0} folder(s).
+${remainingExamples ? `\nFiles still inside:\n${remainingExamples}\n` : ""}
+
+Next:
+- Use Delete files from disk to create a reviewable delete preview for the files still inside.
+- After those files are deleted, use Delete folder from disk.
+- Use Disconnect only if you only want to detach this project from PayFix without deleting it from VS Code or disk.`;
+      }
+
+      throw new Error(data.error || "Could not inspect the connected project folder.");
+    }
+
+    if (data.applied) {
+      setConnectedProjectPath("");
+      setProjectPath("");
+      setProjectContext("");
+      setComputerSearchResults("");
+      setComputerSearchPreview("");
+      setLoadedProjectFiles([]);
+      setProjectMatches([]);
+      setProjectMemory(null);
+      setProjectMap(null);
+    }
+
+    return data.applied
+      ? `PROJECT FOLDER DELETED\n\nDeleted the empty connected folder tree:\n${data.root}\n\nProject connection was cleared.`
+      : `EMPTY PROJECT FOLDER\n\nThe connected project has no files left${data.directoryCount ? `, only ${data.directoryCount} empty folder(s)` : ""}. PayFix can delete the actual folder tree from disk.\n\nFolder:\n${data.root}\n\nNext:\n- Use Delete folder from disk if you want PayFix to remove it from VS Code/disk now.
+- Use Disconnect only if you only want PayFix to stop tracking it.`;
+  }
+
   async function ensureLocalAgentRoot(pathToConnect: string) {
     const trimmed = pathToConnect.trim();
     if (!trimmed) throw new Error("No project path is connected.");
@@ -2491,17 +4596,86 @@ SIZE: ${item.size || 0} bytes`;
     const loaded: UploadedFile[] = [];
     for (const file of Array.from(files)) {
       const isImage = file.type.startsWith("image/");
+      const content = await readBrowserFile(file, isImage);
+      const dimensions = isImage ? await imageDimensionsFromDataUrl(content) : null;
       loaded.push({
         name: file.name,
         type: file.type || "unknown",
         size: file.size,
-        content: await readBrowserFile(file, isImage),
+        content,
         isImage,
+        width: dimensions?.width,
+        height: dimensions?.height,
       });
     }
 
-    setUploadedFiles((prev) => [...prev, ...loaded]);
-    setAgentStatus(`${loaded.length} file(s) uploaded and attached for AI.`);
+    setUploadedFiles((prev) => dedupeUploadedFiles([...prev, ...loaded]));
+    setAgentStatus(
+      `${loaded.length} file(s) uploaded and attached for AI${
+        loaded.some((file) => file.isImage) ? " with original-detail image analysis enabled" : ""
+      }.`,
+    );
+  }
+
+  async function importBrowserCapture() {
+    try {
+      const response = await fetch("/api/browser-capture", { cache: "no-store" });
+      const data = (await response.json()) as { ok?: boolean; captures?: BrowserCapture[]; error?: string };
+      if (!response.ok || !data.ok) {
+        throw new Error(data.error || "Could not read browser captures.");
+      }
+
+      const capture = data.captures?.[0];
+      if (!capture) {
+        setAgentStatus(
+          "No shared page found yet. Open the logged-in page, click the PayFix Page Capture extension, then click Import shared page.",
+        );
+        return;
+      }
+
+      if (capture.id === lastImportedBrowserCaptureId) {
+        setAgentStatus("That browser page capture is already attached.");
+        return;
+      }
+
+      const host = (() => {
+        try {
+          return new URL(capture.url).hostname.replace(/[^a-z0-9.-]+/gi, "-");
+        } catch {
+          return "page";
+        }
+      })();
+      const links = (capture.links || [])
+        .slice(0, 250)
+        .map((link, index) => `${index + 1}. ${link.text || "(no text)"}\n   ${link.href}`)
+        .join("\n");
+      const content = [
+        "PAYFIX LOGGED-IN BROWSER PAGE CAPTURE",
+        `Captured at: ${capture.capturedAt}`,
+        `Title: ${capture.title || "(untitled)"}`,
+        `URL: ${capture.url}`,
+        capture.meta?.selectionText ? `Selected text:\n${capture.meta.selectionText}` : "",
+        "Visible page text:",
+        capture.text || "(No visible text captured.)",
+        links ? `\nVisible links:\n${links}` : "",
+      ]
+        .filter(Boolean)
+        .join("\n\n");
+
+      const attachedCapture: UploadedFile = {
+        name: `browser-capture-${host}.txt`,
+        type: "text/plain",
+        size: content.length,
+        content,
+        isImage: false,
+      };
+
+      setUploadedFiles((prev) => dedupeUploadedFiles([attachedCapture, ...prev]));
+      setLastImportedBrowserCaptureId(capture.id);
+      setAgentStatus(`Attached logged-in browser page: ${capture.title || capture.url}`);
+    } catch (error: unknown) {
+      setAgentStatus(error instanceof Error ? error.message : "Could not import browser capture.");
+    }
   }
 
   async function handleAgentSessionUpload(files: FileList | null) {
@@ -2510,21 +4684,52 @@ SIZE: ${item.size || 0} bytes`;
     const loaded: UploadedFile[] = [];
     for (const file of Array.from(files)) {
       const isImage = file.type.startsWith("image/");
+      const content = await readBrowserFile(file, isImage);
+      const dimensions = isImage ? await imageDimensionsFromDataUrl(content) : null;
       loaded.push({
         name: file.name,
         type: file.type || "unknown",
         size: file.size,
-        content: await readBrowserFile(file, isImage),
+        content,
         isImage,
+        width: dimensions?.width,
+        height: dimensions?.height,
       });
     }
 
-    setAgentSessionUploads((prev) => [...prev, ...loaded]);
+    setAgentSessionUploads((prev) => dedupeUploadedFiles([...prev, ...loaded]));
+    setAgentSessionFreshUploads((prev) => dedupeUploadedFiles([...prev, ...loaded]));
     setAgentStatus(`${loaded.length} file(s) added to Agent workspace.`);
   }
 
   function removeAgentSessionUpload(index: number) {
-    setAgentSessionUploads((prev) => prev.filter((_, itemIndex) => itemIndex !== index));
+    const removedFromFresh = agentSessionFreshUploads[index];
+    setAgentSessionUploads((prev) => {
+      const removed = removedFromFresh || prev[index];
+      if (removed) {
+        setAgentSessionFreshUploads((fresh) =>
+          fresh.filter(
+            (file) =>
+              !(
+                file.name === removed.name &&
+                file.type === removed.type &&
+                file.size === removed.size &&
+                file.content.slice(0, 120) === removed.content.slice(0, 120)
+              ),
+          ),
+        );
+      }
+      if (!removedFromFresh) return prev.filter((_, itemIndex) => itemIndex !== index);
+      return prev.filter(
+        (file) =>
+          !(
+            file.name === removedFromFresh.name &&
+            file.type === removedFromFresh.type &&
+            file.size === removedFromFresh.size &&
+            file.content.slice(0, 120) === removedFromFresh.content.slice(0, 120)
+          ),
+      );
+    });
   }
 
   function removeUpload(index: number) {
@@ -2644,21 +4849,48 @@ SIZE: ${item.size || 0} bytes`;
       }
 
       if (data.rollback?.id) {
-        setLastRollback(data.rollback as RollbackSnapshot);
+        rememberRollbackSnapshot(data.rollback as RollbackSnapshot);
       }
       const appliedKey = currentApplyPreviewKey();
+      const changedLineSummary = summarizePreviewChanges([
+        {
+          file: applyFilePath,
+          oldContent: diffOldContent,
+          newContent: diffNewContent,
+        },
+      ]);
       markPatchApplied([applyFilePath], appliedKey);
       setShowApplyModal(false);
-      setAgentStatus(`Patch applied to ${basename(applyFilePath)}. Running ${validationLabelForFile(applyFilePath)} checks...`);
-      appendAssistantStatusMessage(
-        `PATCH APPLIED\n\nUpdated ${applyFilePath}.\n\nVALIDATION NOW RUNNING\n${validationLabelForFile(
-          applyFilePath,
-        )} checks plus project diagnostics where available.`,
-      );
-      await validateAppliedFileChange();
+      if (applyMode === "delete") {
+        setAgentStatus(`Deleted ${basename(applyFilePath)}. Running project checks...`);
+        const sandboxSummary = await runPostApplySandboxChecks();
+        appendAssistantStatusMessage(
+          `FILE DELETED\n\nDeleted ${applyFilePath}.\n\nUNDO\nA rollback snapshot was saved, so Undo can restore this file.\n\nSANDBOX CHECKS\n\n${sandboxSummary}`,
+        );
+      } else {
+        setAgentStatus(`Patch applied to ${basename(applyFilePath)}. Running ${validationLabelForFile(applyFilePath)} checks...`);
+        appendAssistantStatusMessage(
+          `PATCH APPLIED\n\nUpdated ${applyFilePath}.\n\nCHANGED LINES\n${changedLineSummary}\n\nVALIDATION NOW RUNNING\n${validationLabelForFile(
+            applyFilePath,
+          )} checks plus project diagnostics where available.`,
+        );
+        await validateAppliedFileChange();
+      }
     } catch (err: unknown) {
       setAgentStatus(errorMessage(err, "Apply failed."));
     }
+  }
+
+  function summarizeFailedCommandOutput(output: string) {
+    const lines = output
+      .split(/\r?\n/)
+      .map((line) => line.trimEnd())
+      .filter(Boolean);
+    const important = lines.filter((line) =>
+      /error|failed|cannot|missing|not found|syntax|type|TS\d+|ESLint|Build failed|Module not found|Traceback|Exception/i.test(line),
+    );
+
+    return (important.length ? important : lines).slice(0, 10).join("\n  ");
   }
 
   async function runPostApplySandboxChecks() {
@@ -2671,7 +4903,7 @@ SIZE: ${item.size || 0} bytes`;
       const sandboxRes = await fetch("/api/local-agent/project/sandbox-runner", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ checks: ["typescript", "lint", "test", "build"] }),
+        body: JSON.stringify({ checks: ["check", "typescript", "lint", "test", "build"] }),
       });
       const sandboxData = (await sandboxRes.json()) as SandboxRunnerResult;
       setSandboxRunnerResult(sandboxData);
@@ -2682,11 +4914,418 @@ SIZE: ${item.size || 0} bytes`;
 
       const commandSummary =
         sandboxData.commands
-          ?.map((command) => `${command.ok ? "PASS" : "FAIL"} ${command.command}`)
+          ?.map((command) => {
+            const output = command.ok ? "" : summarizeFailedCommandOutput(command.output || "");
+            const outputBlock = output ? `\n  ${output}` : "";
+            return `${command.ok ? "PASS" : "FAIL"} ${command.command}${outputBlock}`;
+          })
           .join("\n") || sandboxData.error || "see Project IQ.";
-      return `Sandbox checks found failures:\n${commandSummary}`;
+      const failedCommands = sandboxData.commands?.filter((command) => !command.ok).map((command) => command.command).join(", ");
+      if (isGradleSslTrustBlocker(commandSummary)) {
+        return `VALIDATION ATTEMPTED
+
+Commands PayFix tried:
+${sandboxData.commands?.map((command) => `- ${command.ok ? "PASS" : "FAIL"} ${command.command}`).join("\n") || "- Project diagnostics"}
+
+Result:
+Gradle is still blocked before app code can compile because the Java runtime used by Gradle does not trust the HTTPS certificate chain for Maven/Google dependency downloads.
+
+Evidence:
+${compactValidationEvidence(commandSummary)}
+
+What this means:
+- PayFix did try to run the build/test diagnostics.
+- This is an environment/JDK truststore/proxy problem, not a source-code bug in the Android app.
+- PayFix cannot safely patch Java source files to fix this.
+
+Next action:
+- Import the corporate/root certificate into the exact JBR/JDK Gradle uses, or use a local/offline Maven artifact fallback if you cannot change certificates yet.`;
+      }
+      return `Sandbox checks found failures${failedCommands ? ` in ${failedCommands}` : ""}:\n${commandSummary}\n\nNEXT ACTION\nUse Fix validation failure so PayFix can inspect exact files, patch the issue, and rerun validation.`;
     } catch (err: unknown) {
       return `Sandbox checks could not run: ${errorMessage(err)}`;
+    }
+  }
+
+  function isGradleSslTrustBlocker(text: string) {
+    return /\b(PKIX path building failed|certificate_unknown|SSL handshake|Could not GET|Could not HEAD|repo\.maven\.apache\.org|repo\.maven|maven\.google|dl\.google\.com)\b/i.test(text);
+  }
+
+  function isMavenLocalFallbackRequest(text: string) {
+    const trimmed = text.trim();
+    if (asksToExplainQuotedChoices(trimmed)) return false;
+
+    return (
+      /^\s*(?:prepare|run|start|do|use|apply|go ahead|continue)\b[\s\S]{0,120}\b(mavenLocal\(\)|maven local|local[-\s]?artifact|local artifacts?|offline fallback|offline Maven|local Maven|file-based repo|file based repo|dependency download blocker)\b/i.test(
+        trimmed,
+      ) ||
+      (/^\s*(?:option\s*)?C\b/i.test(trimmed) && /\b(maven|offline|artifact|local)\b/i.test(trimmed)) ||
+      /\b(prepare|run|start|do|use|apply|go ahead|continue)\b[\s\S]{0,80}\b(mavenLocal\(\)|maven local|offline fallback|local Maven)\b/i.test(
+        trimmed,
+      )
+    );
+  }
+
+  async function gradleTrustCheckMessage() {
+    if (!connectedProjectPath) {
+      return `TRUST CHECK NOT RUN
+
+I understood this as a request to run the Gradle/JDK certificate trust check.
+
+PayFix cannot run it yet because no project folder is connected in this Agent workspace.
+
+Next:
+A. Connect the project folder, then run the trust check again.
+B. If the project is connected but this still appears, restart payfix-agent and reopen the investigation.`;
+    }
+
+    await ensureLocalAgentRoot(connectedProjectPath);
+    const sandboxSummary = await runPostApplySandboxChecks();
+    const stillBlocked = isGradleSslTrustBlocker(sandboxSummary);
+
+    return `TRUST CHECK RUN
+
+I treated your request as: run the connected-project checks for the Gradle/JDK certificate blocker.
+I did not compare logs and I did not replay app setup steps.
+
+Project:
+${connectedProjectPath}
+
+What PayFix ran:
+${compactValidationEvidence(sandboxSummary)}
+
+Result:
+${stillBlocked
+  ? "The blocker is still present. Gradle is still failing before Android code compiles because the Java runtime used by Gradle does not trust the certificate chain returned while downloading Maven/Google dependencies."
+  : "The previous Gradle/JDK certificate blocker did not appear in this validation output. If another error appeared, that is now the next blocker to fix."}
+
+What this means:
+${stillBlocked
+  ? "If the URLs are already whitelisted, whitelisting was not enough. The next useful check is the exact JBR/JDK truststore Gradle is using, or a local/offline Maven fallback if the certificate cannot be fixed quickly."
+  : "Move to the next visible build/sync error and ask PayFix to fix that specific blocker."}
+
+Do next:
+A. Prepare cert fix: attach the corporate/root CA file or give its path, then PayFix can produce the exact keytool command for the JBR/JDK Gradle uses.
+B. Prepare offline fallback: attach/select the folder containing the required .pom/.jar/.aar files so PayFix can inspect and patch safely.
+C. Re-run validation after either fix so the next real project error can surface.`;
+  }
+
+  function projectFilesFromFileList(fileList: string) {
+    return fileList
+      .split(/\r?\n/)
+      .map((line) => line.match(/^FILE:\s*(.+)$/i)?.[1]?.trim() || "")
+      .filter(Boolean);
+  }
+
+  type MavenCoordinate = {
+    group: string;
+    artifact: string;
+    version: string;
+  };
+
+  function parseMissingMavenCoordinates(text: string) {
+    const coordinates: MavenCoordinate[] = [];
+    const seen = new Set<string>();
+    for (const match of text.matchAll(/\bCould not resolve\s+([A-Za-z0-9_.-]+):([A-Za-z0-9_.-]+):([A-Za-z0-9_.+-]+)/g)) {
+      const coordinate = { group: match[1], artifact: match[2], version: match[3] };
+      const key = `${coordinate.group}:${coordinate.artifact}:${coordinate.version}`.toLowerCase();
+      if (!seen.has(key)) {
+        seen.add(key);
+        coordinates.push(coordinate);
+      }
+    }
+    return coordinates.slice(0, 12);
+  }
+
+  function expectedMavenArtifactNames(coordinate: MavenCoordinate) {
+    const base = `${coordinate.artifact}-${coordinate.version}`;
+    return [`${base}.pom`, `${base}.jar`, `${base}.aar`];
+  }
+
+  function expectedMavenRepositoryPath(coordinate: MavenCoordinate, extension: "pom" | "jar" | "aar") {
+    const groupPath = coordinate.group.replace(/\./g, "/");
+    return `${groupPath}/${coordinate.artifact}/${coordinate.version}/${coordinate.artifact}-${coordinate.version}.${extension}`;
+  }
+
+  function matchingLocalArtifacts(coordinate: MavenCoordinate, files: string[]) {
+    const expectedNames = expectedMavenArtifactNames(coordinate).map((name) => name.toLowerCase());
+    const expectedPathParts = ["pom", "jar", "aar"].map((extension) =>
+      expectedMavenRepositoryPath(coordinate, extension as "pom" | "jar" | "aar").replace(/\//g, "\\").toLowerCase(),
+    );
+
+    return files.filter((file) => {
+      const normalized = file.replace(/\//g, "\\").toLowerCase();
+      const name = normalized.split("\\").pop() || normalized;
+      return expectedNames.includes(name) || expectedPathParts.some((part) => normalized.endsWith(part));
+    });
+  }
+
+  async function readProjectTextFile(file: string) {
+    const res = await fetch("/api/local-agent/project/read-file-ai", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ file }),
+    });
+    const data = await res.json();
+    if (!data.ok || data.file?.kind !== "text") return "";
+    return String(data.file.content || "");
+  }
+
+  async function mavenLocalFallbackMessage(prompt: string, recentAssistantContext = "") {
+    if (!connectedProjectPath) {
+      return `MAVEN LOCAL FALLBACK CHECK
+
+I understood this as a request to prepare an offline/local Maven dependency workaround.
+
+I cannot inspect or patch it yet because no project folder is connected in this Agent workspace.
+
+Next:
+A. Connect the project folder, then run Prepare offline fallback again.
+B. Attach/select the folder that contains the downloaded .pom/.jar/.aar files.
+C. Use the cert/truststore fix instead if you have the corporate root certificate.`;
+    }
+
+    await ensureLocalAgentRoot(connectedProjectPath);
+    const [fileList, sandboxSummary] = await Promise.all([loadFileList(), runPostApplySandboxChecks()]);
+    const projectFiles = projectFilesFromFileList(fileList);
+    const buildFiles = projectFiles.filter((file) => /(^|[\\/])(settings\.gradle(?:\.kts)?|build\.gradle(?:\.kts)?|gradle\.properties)$/i.test(file));
+    const localArtifacts = projectFiles.filter((file) => /\.(?:pom|jar|aar)$/i.test(file));
+    const coordinates = parseMissingMavenCoordinates([prompt, recentAssistantContext, sandboxSummary].join("\n\n"));
+    const settingsFile = buildFiles.find((file) => /(^|[\\/])settings\.gradle(?:\.kts)?$/i.test(file));
+    const rootBuildFile = buildFiles.find((file) => /(^|[\\/])build\.gradle(?:\.kts)?$/i.test(file) && !/[\\/]app[\\/]/i.test(file));
+    const appBuildFile = buildFiles.find((file) => /(^|[\\/]app[\\/])build\.gradle(?:\.kts)?$/i.test(file));
+    const buildSnippets = (
+      await Promise.all(
+        [settingsFile, rootBuildFile, appBuildFile]
+          .filter(Boolean)
+          .map(async (file) => ({ file: file || "", content: await readProjectTextFile(file || "") })),
+      )
+    ).filter((item) => item.file);
+    const alreadyUsesMavenLocal = buildSnippets.some((item) => /\bmavenLocal\s*\(/.test(item.content));
+    const coordinateLines = coordinates.length
+      ? coordinates
+          .map((coordinate) => {
+            const matches = matchingLocalArtifacts(coordinate, localArtifacts);
+            const found = matches.length ? `found: ${matches.slice(0, 3).join(", ")}` : "not found locally";
+            return `- ${coordinate.group}:${coordinate.artifact}:${coordinate.version} (${found})
+  Need: ${expectedMavenRepositoryPath(coordinate, "pom")}
+  Need one binary: ${expectedMavenRepositoryPath(coordinate, "jar")} or ${expectedMavenRepositoryPath(coordinate, "aar")}`;
+          })
+          .join("\n")
+      : "- I could not parse exact missing Maven coordinates from the current validation output. Attach/paste the latest full Gradle dependency-resolution error so PayFix can list exact files.";
+    const allCoordinatesSatisfied =
+      coordinates.length > 0 &&
+      coordinates.every((coordinate) => {
+        const matches = matchingLocalArtifacts(coordinate, localArtifacts);
+        const hasPom = matches.some((file) => /\.pom$/i.test(file));
+        const hasBinary = matches.some((file) => /\.(?:jar|aar)$/i.test(file));
+        return hasPom && hasBinary;
+      });
+    const canPatchNow = allCoordinatesSatisfied || alreadyUsesMavenLocal;
+
+    return `MAVEN LOCAL FALLBACK CHECK
+
+I checked this as a dependency-download workaround, not as an Android source-code bug.
+
+What I checked:
+- Connected project: ${connectedProjectPath}
+- Validation/build status: ${isGradleSslTrustBlocker(sandboxSummary) ? "still blocked by Gradle/JDK SSL trust while downloading dependencies" : "validation ran; see result below"}
+- Build config files seen: ${buildFiles.slice(0, 5).join(", ") || "none found"}
+- Local artifact files seen in the project: ${localArtifacts.length ? `${localArtifacts.length} .pom/.jar/.aar file(s)` : "none"}
+- mavenLocal() already present: ${alreadyUsesMavenLocal ? "yes" : "no"}
+
+Can PayFix patch the fallback now?
+${canPatchNow ? "Maybe. PayFix found enough signal to add/prefer a local repository path, but validation may still need a real local Maven layout." : "Not safely yet. A Maven/local fallback only works if the missing Maven coordinates exist locally with matching .pom plus .jar/.aar files."}
+
+Missing or required artifacts from the current blocker:
+${coordinateLines}
+
+What to do next:
+A. Attach/select the folder that contains these Maven artifacts, then run Prepare offline fallback again.
+B. If the files are already somewhere on disk, add that folder in the Agent setup as a Vendor SDK / local artifacts folder.
+C. Use the certificate fix instead if you can get the corporate/root CA, because that fixes dependency downloads without manually mirroring artifacts.
+
+Validation snapshot:
+${compactValidationEvidence(sandboxSummary)}`;
+  }
+
+  function compactValidationEvidence(text: string) {
+    return text
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .filter((line) => /\b(FAIL|PKIX|certificate_unknown|SSL handshake|Could not resolve|Could not GET|Could not HEAD|repo\.maven|maven\.google|dl\.google|JAVA_HOME|gradlew\.bat|gradle)\b/i.test(line))
+      .slice(0, 10)
+      .map((line) => `- ${line.replace(/^[-*]\s+/, "")}`)
+      .join("\n") || "- Gradle dependency resolution failed with a Java SSL trust error.";
+  }
+
+  function shouldReturnEnvironmentBlockerInsteadOfPatch(prompt: string, sandboxSummary: string) {
+    if (!isGradleSslTrustBlocker(sandboxSummary)) return false;
+    if (/\b(mavenLocal|maven local|local fallback|local artifacts?|copy local|offline fallback|patch repository|maven \{ url|file-based repository)\b/i.test(prompt)) {
+      return false;
+    }
+
+    return /\b(fix|investigate|build|validation|validate|why|error|errors|failed|failing|failure|gradle|sync)\b/i.test(prompt);
+  }
+
+  function completedStepContextForEnvironmentBlocker(prompt: string) {
+    const normalized = prompt.toLowerCase();
+    const completedSignals: string[] = [];
+
+    if (
+      /\b(?:already|did|done|confirmed|tried|set up|setup)\b[\s\S]{0,160}\b(?:whitelist(?:ed|ing)?|allowlist(?:ed|ing)?|allowed|unblocked)\b/i.test(prompt) ||
+      /\b(?:whitelist(?:ed|ing)?|allowlist(?:ed|ing)?|allowed|unblocked)\b[\s\S]{0,160}\b(?:already|done|confirmed|tried)\b/i.test(prompt)
+    ) {
+      completedSignals.push(
+        "You already whitelisted the repository URLs, so PayFix should stop treating this as a URL allowlist problem. The remaining blocker is likely Java/JBR certificate trust, a proxy certificate chain, Gradle using a different JDK than the one you fixed, or missing local Maven artifacts.",
+      );
+    }
+
+    if (/\b(?:already|did|done|confirmed|tried|imported|added)\b[\s\S]{0,140}\b(?:cert|certificate|root ca|truststore|cacerts)\b/i.test(prompt)) {
+      completedSignals.push(
+        "You said the certificate/trust step was already attempted. The next useful check is whether the cert landed in the exact JDK/JBR Gradle is using, whether the alias exists, and whether intermediate/proxy certs are still missing.",
+      );
+    }
+
+    if (/\b(?:already|did|done|confirmed|tried|selected|pointed|set)\b[\s\S]{0,140}\b(?:jdk|jbr|java_home|java home|gradle jvm)\b/i.test(prompt)) {
+      completedSignals.push(
+        "You said the JDK/JBR path was already selected or found. The next useful check is to run validation with that runtime and confirm the failure still names the same PKIX/certificate chain.",
+      );
+    }
+
+    if (/\b(?:already|did|done|confirmed|tried|attached|selected|added)\b[\s\S]{0,140}\b(?:sdk|artifact|jar|aar|pom|mavenlocal|maven local|offline)\b/i.test(prompt)) {
+      completedSignals.push(
+        "You said local SDK/artifact files are already present. The next useful check is whether the exact missing Maven coordinates have matching .pom/.jar/.aar files and whether the build files point to them.",
+      );
+    }
+
+    if (!completedSignals.length && /\b(?:already|did|done|confirmed|tried)\b/i.test(normalized)) {
+      completedSignals.push(
+        "Your latest message says a previous step was already attempted. PayFix should treat that as current evidence and move to the next remaining blocker instead of repeating the same step.",
+      );
+    }
+
+    return completedSignals.length
+      ? `\nWhat your latest note changes:\n${completedSignals.map((item) => `- ${item}`).join("\n")}\n`
+      : "";
+  }
+
+  function extractCommandFromPrompt(text: string) {
+    const lines = text
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+    const commandLine = lines.find((line) =>
+      /^(?:\.\\gradlew(?:\.bat)?|\.\/gradlew|gradlew(?:\.bat)?|npm|pnpm|yarn|mvn|dotnet|cargo|pytest|python(?:\.exe)?|go|composer|bundle)\b/i.test(
+        line,
+      ),
+    );
+    return commandLine || lines.find((line) => /\b(?:gradlew(?:\.bat)?|npm|pnpm|yarn|mvn|dotnet|cargo|pytest|python(?:\.exe)?|go test)\b/i.test(line)) || "";
+  }
+
+  function commandLocationHelpMessage(prompt: string) {
+    const command = extractCommandFromPrompt(prompt);
+    const projectRoot = connectedProjectPath || "the project root folder";
+    const commandName = command.match(/^(?:\.\\|\.\/)?([^\s]+)/)?.[1]?.toLowerCase() || "";
+    const isWrapperCommand = /gradlew(?:\.bat)?/i.test(commandName);
+    const rootHint = isWrapperCommand
+      ? "the folder that contains `gradlew.bat` / `gradlew`"
+      : "the root folder of the project that owns this command";
+
+    return `COMMAND LOCATION
+
+Run it from:
+${connectedProjectPath ? `\`${projectRoot}\`` : rootHint}
+
+Command:
+\`${command || "the command you pasted"}\`
+
+Exact steps:
+1. Open a terminal.
+2. Change into ${connectedProjectPath ? "the connected project folder" : rootHint}:
+   \`cd "${projectRoot}"\`
+3. Run:
+   \`${command || "paste the command here"}\`
+
+Why:
+${isWrapperCommand
+  ? "`gradlew.bat` is a project-local Gradle wrapper, so Windows only finds it when your terminal is inside the project folder that contains that file."
+  : "Most project commands expect to run from the folder that contains the build/config files, so relative paths and local tool wrappers resolve correctly."}
+
+If it fails:
+Paste the first red error block from that terminal.`;
+  }
+
+  function gradleEnvironmentBlockerMessage(prompt: string, sandboxSummary: string) {
+    return `ENVIRONMENT BLOCKER: GRADLE CERTIFICATE TRUST
+
+Request:
+${prompt}
+
+${completedStepContextForEnvironmentBlocker(prompt)}
+
+What PayFix tried:
+${compactValidationEvidence(sandboxSummary)}
+
+What this means:
+Gradle is still failing before Android code can compile. If the URLs are already whitelisted, the remaining likely blocker is that the JBR/JDK running Gradle does not trust the certificate chain returned by your network/proxy when Gradle downloads from Maven/Google repositories.
+
+Can PayFix fix this by editing project source files?
+No. Not safely. This is not an app-code error. The build is blocked at dependency download time.
+
+Useful next Agent actions:
+A. Run a trust check: re-run supported project validation/build checks and show the exact command output.
+B. Prepare a certificate fix: use the exact JBR/JDK path and attached corporate/root CA certificate file to produce the right keytool command.
+C. Prepare an offline Maven fallback: inspect selected artifact folders for required .pom/.jar/.aar files and patch repository order only if safe.
+D. Re-run validation after either environment fix so the next real project error can surface.
+
+What still needs approval/manual input:
+- Writing to the JBR truststore under Program Files may need admin permission.
+- Importing a certificate requires the actual corporate/root CA file.
+- PayFix should not fake these steps; it should either run supported local-agent validation or tell you exactly what permission/file is missing.
+
+Bottom line:
+PayFix did try the build. Since dependency download is still failing with PKIX/certificate errors, the next useful move is to verify the exact Gradle JDK truststore or use local/offline dependency supply, then validate again.`;
+  }
+
+  async function runAgentSessionValidation() {
+    if (!connectedProjectPath) {
+      setAgentStatus("Connect a project before running validation.");
+      return;
+    }
+
+    const userMessage: ChatMessage = {
+      role: "user",
+      content: "Run validation",
+    };
+    const workingMessage: ChatMessage = {
+      role: "assistant",
+      content: "Running language-aware project validation checks...",
+    };
+
+    setAgentLoading(true);
+    setAgentStatus("Running project validation checks...");
+    setAgentSessionMessages((current) => [...current, userMessage, workingMessage]);
+
+    try {
+      const sandboxSummary = await runPostApplySandboxChecks();
+      const resultMessage: ChatMessage = {
+        role: "assistant",
+        content: `VALIDATION RESULT\n\n${sandboxSummary}`,
+      };
+
+      setAgentSessionMessages((current) => [...current.filter((message) => message !== workingMessage), resultMessage]);
+      setAgentStatus("Project validation finished.");
+    } catch (err: unknown) {
+      const message = errorMessage(err, "Validation failed.");
+      setAgentSessionMessages((current) => [
+        ...current.filter((entry) => entry !== workingMessage),
+        { role: "assistant", content: `VALIDATION FAILED\n\n${message}` },
+      ]);
+      setAgentStatus(`Validation failed: ${message}`);
+    } finally {
+      setAgentLoading(false);
     }
   }
 
@@ -2771,13 +5410,14 @@ SIZE: ${item.size || 0} bytes`;
             mode: item.mode,
             search: item.search,
             content: item.replacement,
+            reason: applyDescription || `Apply ${basename(item.resolvedFile)} change`,
         });
 
         if (!applyResult.ok) {
           throw new Error(`${item.resolvedFile}: ${applyResult.error || "Apply failed."}`);
         }
         if (applyResult.rollback?.id) {
-          setLastRollback(applyResult.rollback as RollbackSnapshot);
+          rememberRollbackSnapshot(applyResult.rollback as RollbackSnapshot);
         }
       }
 
@@ -2796,10 +5436,11 @@ SIZE: ${item.size || 0} bytes`;
       setAgentStatus(`Applied ${uniquePatchSet.length} file changes. Running language checks and project diagnostics...`);
       const rereadResults = await rereadAppliedFiles(uniquePatchSet.map((item) => item.resolvedFile));
       const sandboxSummary = await runPostApplySandboxChecks();
+      const changedLineSummary = summarizePreviewChanges(previews);
       appendAssistantStatusMessage(
         `PATCH APPLIED\n\nUpdated ${uniquePatchSet.length} file(s):\n${uniquePatchSet
           .map((item) => `- ${item.resolvedFile}`)
-          .join("\n")}\n\nRE-READ CHECK\n${rereadResults
+          .join("\n")}\n\nCHANGED LINES\n${changedLineSummary}\n\nRE-READ CHECK\n${rereadResults
           .map((result) => `- ${result.ok ? "PASS" : "FAIL"} ${result.file}: ${result.summary}`)
           .join("\n")}\n\nSANDBOX CHECKS\n\n${sandboxSummary}`,
       );
@@ -2809,6 +5450,449 @@ SIZE: ${item.size || 0} bytes`;
     } finally {
       setApplyAllLoading(false);
     }
+  }
+
+  async function autoApplyAgentPatch(data: AgentApiResponse, prompt: string) {
+    const patch = primaryAgentPatch(data);
+    if (!agentResponseHasApplyablePatch(data) || !patch) {
+      return false;
+    }
+
+    const apiPatchSet = data.result?.patchSet || data.patchSet || [];
+    const primaryPatchItem = {
+      file: patch.file,
+      mode: patch.mode === "delete" ? ("delete" as const) : patch.mode === "replace" ? ("replace" as const) : ("insert" as const),
+      search: patch.search,
+      content: patch.replacement,
+      reason: patch.explanation || `Apply ${basename(patch.file)} change`,
+    };
+    const patchItems = [
+      primaryPatchItem,
+      ...apiPatchSet
+        .filter((item) => item.mode !== "none")
+        .map((item) => ({
+          file: item.file,
+          mode: item.mode === "delete" ? ("delete" as const) : item.mode === "replace" ? ("replace" as const) : ("insert" as const),
+          search: item.search,
+          content: item.replacement,
+          reason: item.explanation || `Apply ${basename(item.file)} change`,
+        })),
+    ];
+
+    const safePatchItems = patchItems
+      .filter((item) => item.file && (item.mode === "delete" || item.content))
+      .filter(
+        (item, index, items) =>
+          items.findIndex(
+            (candidate) =>
+              candidate.file === item.file &&
+              candidate.mode === item.mode &&
+              candidate.search === item.search &&
+              candidate.content === item.content,
+          ) === index,
+      );
+    if (!safePatchItems.length) return false;
+
+    setLastRollback(null);
+    setShowApplyModal(false);
+    setAgentStatus(applyStatusForFiles(safePatchItems.map((item) => item.file)));
+
+    const previewResults: Array<{
+      ok: boolean;
+      file: string;
+      oldContent?: string;
+      newContent?: string;
+      error?: string;
+    }> = [];
+    const previewedPatchItems: typeof safePatchItems = [];
+    const skippedPatchItems: string[] = [];
+    const alreadyAppliedPatchItems: string[] = [];
+    let primaryPreviewed = false;
+    for (const item of safePatchItems) {
+      const preview = await requestFileChangeWithValues({
+        apply: false,
+        file: item.file,
+        mode: item.mode,
+        search: item.search,
+        content: item.content,
+        reason: item.reason,
+      });
+
+      if (!preview.ok) {
+        const readRes = await fetch("/api/local-agent/project/read-file-ai", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ file: item.file }),
+        }).catch(() => null);
+        const readData = readRes ? await readRes.json().catch(() => null) : null;
+        const currentContent =
+          readData?.ok && readData.file?.kind === "text" && typeof readData.file.content === "string"
+            ? readData.file.content
+            : "";
+        const alreadyApplied =
+          item.mode !== "delete" &&
+          item.content.trim() &&
+          currentContent.includes(item.content.trim()) &&
+          (!item.search.trim() || !currentContent.includes(item.search));
+
+        if (alreadyApplied) {
+          alreadyAppliedPatchItems.push(item.file);
+          if (
+            item.file === primaryPatchItem.file &&
+            item.mode === primaryPatchItem.mode &&
+            item.search === primaryPatchItem.search &&
+            item.content === primaryPatchItem.content
+          ) {
+            primaryPreviewed = true;
+          }
+          continue;
+        }
+
+        skippedPatchItems.push(`${item.file}: ${preview.error || "Preview failed."}`);
+        continue;
+      }
+      previewResults.push(preview);
+      previewedPatchItems.push(item);
+      if (
+        item.file === primaryPatchItem.file &&
+        item.mode === primaryPatchItem.mode &&
+        item.search === primaryPatchItem.search &&
+        item.content === primaryPatchItem.content
+      ) {
+        primaryPreviewed = true;
+      }
+    }
+
+    if (!previewedPatchItems.length) {
+      if (primaryPreviewed && alreadyAppliedPatchItems.length) {
+        appendAssistantStatusMessage(
+          `PATCH ALREADY APPLIED\n\nThe current verified patch is already present on disk.\n\nFile(s):\n${alreadyAppliedPatchItems
+            .map((file) => `- ${file}`)
+            .join("\n")}`,
+        );
+        setAgentStatus("Patch was already applied. No file write needed.");
+        return true;
+      }
+
+      throw new Error(skippedPatchItems.join("\n") || "No patch item could be previewed safely.");
+    }
+    if (!primaryPreviewed) {
+      throw new Error(
+        `The current verified patch for ${primaryPatchItem.file} could not be previewed. Stale patch items were not applied.${
+          skippedPatchItems.length ? `\n${skippedPatchItems.join("\n")}` : ""
+        }`,
+      );
+    }
+
+    let rollbackSaved = false;
+    for (const item of previewedPatchItems) {
+      const applyResult = await requestFileChangeWithValues({
+        apply: true,
+        file: item.file,
+        mode: item.mode,
+        search: item.search,
+        content: item.content,
+        reason: item.reason,
+      });
+
+      if (!applyResult.ok) {
+        throw new Error(`${item.file}: ${applyResult.error || "Apply failed."}`);
+      }
+
+      if (applyResult.rollback?.id) {
+        rememberRollbackSnapshot(applyResult.rollback as RollbackSnapshot);
+        rollbackSaved = true;
+      }
+    }
+
+    setDiffOldContent(previewResults.map((preview) => `FILE: ${preview.file}\n\n${preview.oldContent || ""}`).join("\n\n---\n\n"));
+    setDiffNewContent(previewResults.map((preview) => `FILE: ${preview.file}\n\n${preview.newContent || ""}`).join("\n\n---\n\n"));
+    markPatchApplied(
+      previewedPatchItems.map((item) => item.file),
+      JSON.stringify(previewedPatchItems),
+    );
+
+    const deletedFiles = previewedPatchItems.filter((item) => item.mode === "delete").map((item) => item.file);
+    const changedFiles = previewedPatchItems.filter((item) => item.mode !== "delete").map((item) => item.file);
+    const rereadResults = [
+      ...deletedFiles.map((file) => ({ file, ok: true, summary: "deleted; rollback snapshot saved" })),
+      ...(await rereadAppliedFiles(changedFiles)),
+    ];
+    const sandboxSummary = await runPostApplySandboxChecks();
+    const changedLineSummary = summarizePreviewChanges(previewResults);
+    const validationLabel = [...new Set(previewedPatchItems.map((item) => item.mode === "delete" ? "Project validation" : validationLabelForFile(item.file)))]
+      .slice(0, 3)
+      .join(", ");
+    const actionLabel = previewedPatchItems.every((item) => item.mode === "delete") ? "Deleted" : "Updated";
+    const skippedBlock = skippedPatchItems.length
+      ? `\n\nSKIPPED STALE PATCH ITEMS\n${skippedPatchItems.map((item) => `- ${item}`).join("\n")}`
+      : "";
+
+    appendAssistantStatusMessage(
+      `PATCH APPLIED BY AGENT\n\nRequest:\n${prompt}\n\n${actionLabel} ${previewedPatchItems.length} file(s):\n${previewedPatchItems
+        .map((item) => `- ${item.file}`)
+        .join("\n")}\n\nCHANGED LINES\n${changedLineSummary}\n\nVALIDATION\n${validationLabel || "Project diagnostics"} checks were run where available.\n\nRE-READ CHECK\n${rereadResults
+        .map((result) => `- ${result.ok ? "PASS" : "FAIL"} ${result.file}: ${result.summary}`)
+        .join("\n")}${skippedBlock}\n\nUNDO\n${rollbackSaved ? "Rollback snapshot saved." : "No rollback snapshot was returned for this apply."}\n\nSANDBOX CHECKS\n\n${sandboxSummary}`,
+    );
+    setAgentStatus(
+      rollbackSaved
+        ? `Agent applied ${previewedPatchItems.length} verified file change(s). Undo is available.`
+        : `Agent applied ${previewedPatchItems.length} verified file change(s). No rollback snapshot was returned.`,
+    );
+    return true;
+  }
+
+  async function applyLastVerifiedAgentPatch() {
+    const patchData = latestApplyableAgentPatch();
+    if (!patchData) {
+      setAgentStatus("No verified Agent patch is ready to apply.");
+      return;
+    }
+
+    const prompt =
+      "Apply the verified patch from the current Agent result, then run the right project validation checks and keep Undo available.";
+    const userMessage: ChatMessage = {
+      role: "user",
+      content: "Apply verified patch",
+    };
+    const workingMessage: ChatMessage = {
+      role: "assistant",
+      content: "PayFix Agent is applying the verified patch, saving rollback data, and running validation checks...",
+    };
+
+    setAgentLoading(true);
+    setAgentStatus("Applying the verified Agent patch...");
+    setAgentSessionMessages((current) => [...current, userMessage, workingMessage]);
+
+    try {
+      const applied = await autoApplyAgentPatch(patchData, prompt);
+      if (!applied) {
+        throw new Error("The saved Agent result no longer has a verified patch preview to apply.");
+      }
+
+      setLastVerifiedAgentPatch(null);
+      setAgentSessionMessages((current) => [
+        ...current.slice(0, -1).map((message) =>
+          message.role === "assistant" &&
+          /Patch preview is ready|Patch prepared:|prepared .*patch|Review\/apply the prepared patch/i.test(message.content)
+            ? {
+                ...message,
+                patchAlreadyApplied: true,
+                agentPatchData: undefined,
+                content: "PATCH ALREADY APPLIED\n\nThis prepared patch was applied. Pending Apply actions are closed.",
+              }
+            : message,
+        ),
+        {
+          role: "assistant",
+          content:
+            "PATCH APPLIED BY AGENT\n\nApplied the verified patch and ran available validation checks. Undo is available if rollback data was returned.",
+        },
+      ]);
+    } catch (err: unknown) {
+      const message = agentRunErrorMessage(err);
+      setAgentStatus(`Agent apply failed: ${message}`);
+      setAgentSessionMessages((current) => [
+        ...current.slice(0, -1),
+        {
+          role: "assistant",
+          content: `AUTO-APPLY BLOCKED\n\nPayFix did not write the patch because applying it failed safely:\n${message}`,
+        },
+      ]);
+    } finally {
+      setAgentLoading(false);
+    }
+  }
+
+  async function fixKnownGradleFoojayFailure(prompt: string) {
+    if (!connectedProjectPath) return false;
+
+    const diagnostics = await runPostApplySandboxChecks();
+    if (!/org\.gradle\.toolchains\.foojay-resolver-convention|foojay-resolver-convention/i.test(diagnostics)) {
+      return false;
+    }
+
+    const readRes = await fetch("/api/local-agent/project/read-file-ai", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ file: "settings.gradle.kts" }),
+    });
+    const readData = await readRes.json();
+    const currentContent =
+      readData?.ok && readData.file?.kind === "text" && typeof readData.file.content === "string"
+        ? readData.file.content
+        : "";
+    if (!currentContent.trim()) return false;
+
+    const exactBlock = `plugins {\n    id("org.gradle.toolchains.foojay-resolver-convention") version "1.0.0"\n}`;
+    const updatedContent = currentContent.includes(exactBlock)
+      ? currentContent.replace(exactBlock, "").replace(/\n{3,}/g, "\n\n")
+      : currentContent.replace(
+          /\n?plugins\s*\{\s*id\("org\.gradle\.toolchains\.foojay-resolver-convention"\)\s+version\s+"[^"]+"\s*\}\s*/i,
+          "\n",
+        );
+    if (updatedContent === currentContent) return false;
+
+    const preview = await requestFileChangeWithValues({
+      apply: false,
+      file: "settings.gradle.kts",
+      mode: "replace",
+      search: currentContent,
+      content: updatedContent,
+      reason: "Remove unresolved Foojay toolchain resolver plugin that blocks Gradle sync.",
+    });
+    if (!preview.ok) {
+      throw new Error(preview.error || "Could not preview settings.gradle.kts fix.");
+    }
+
+    const applyResult = await requestFileChangeWithValues({
+      apply: true,
+      file: "settings.gradle.kts",
+      mode: "replace",
+      search: currentContent,
+      content: updatedContent,
+      reason: "Remove unresolved Foojay toolchain resolver plugin that blocks Gradle sync.",
+    });
+    if (!applyResult.ok) {
+      throw new Error(applyResult.error || "Could not apply settings.gradle.kts fix.");
+    }
+    if (applyResult.rollback?.id) {
+      rememberRollbackSnapshot(applyResult.rollback as RollbackSnapshot);
+    }
+
+    const sandboxSummary = await runPostApplySandboxChecks();
+    const changedLineSummary = summarizePreviewChanges([
+      {
+        file: "settings.gradle.kts",
+        oldContent: preview.oldContent || currentContent,
+        newContent: preview.newContent || updatedContent,
+      },
+    ]);
+
+    setAgentSessionMessages((current) => {
+      const latest = current.at(-1);
+      const withoutWorking =
+        latest?.role === "assistant" && isWorkingAssistantMessage(latest.content) ? current.slice(0, -1) : current;
+
+      return [
+        ...withoutWorking,
+        {
+          role: "assistant",
+          content: `PATCH APPLIED BY AGENT
+
+Request:
+${prompt}
+
+Updated 1 file:
+- settings.gradle.kts
+
+What PayFix fixed:
+- Removed the unresolved Gradle Foojay toolchain resolver plugin block.
+- This was blocking Gradle sync/build before the app module could compile.
+
+CHANGED LINES
+${changedLineSummary}
+
+VALIDATION
+PayFix reran project diagnostics after applying the fix.
+
+SANDBOX CHECKS
+
+${sandboxSummary}
+
+NEXT STEPS
+1. In Android Studio, click File -> Sync Project with Gradle Files.
+2. If sync passes, click Build -> Make Project.
+3. If a new red error appears, send that exact error back. PayFix should continue from this applied patch, not rebuild the app from scratch.
+
+UNDO
+${applyResult.rollback?.id ? "Rollback snapshot saved." : "No rollback snapshot was returned for this apply."}`,
+        },
+      ];
+    });
+    setAgentStatus("Applied the Gradle settings fix and reran validation.");
+    return true;
+  }
+
+  function gradleSslNetworkAnswer(prompt: string) {
+    if (!/PKIX path building failed|SSL handshake|certificate_unknown|Could not GET|Could not HEAD|repo\.maven\.apache\.org|Could not resolve/i.test(prompt)) {
+      return "";
+    }
+    if (isAgentExecutionActionPrompt(prompt)) {
+      return "";
+    }
+
+    const hosts = Array.from(new Set((prompt.match(/https?:\/\/([^/\s'"]+)/gi) || []).map((url) => {
+      try {
+        return new URL(url).host;
+      } catch {
+        return url.replace(/^https?:\/\//i, "").split("/")[0];
+      }
+    }))).filter(Boolean);
+    const dependencies = Array.from(
+      new Set((prompt.match(/Could not resolve\s+([A-Za-z0-9_.:-]+)\./g) || []).map((match) => match.replace(/^Could not resolve\s+/i, "").replace(/\.$/, ""))),
+    );
+    const hostList = hosts.length ? hosts.map((host) => `- ${host}`).join("\n") : "- repo.maven.apache.org";
+    const dependencyList = dependencies.length ? dependencies.map((item) => `- ${item}`).join("\n") : "- Maven/Gradle dependencies from the runtime classpath";
+
+    return `GRADLE NETWORK / CERTIFICATE BLOCKER
+
+Yes, this looks like something that may need to be allowed/trusted, but the main issue is not your app code.
+
+Most likely cause:
+Gradle is trying to download dependencies from Maven Central, but the Java runtime used by Android Studio/Gradle does not trust the HTTPS certificate chain it is receiving. That usually means one of these:
+- corporate proxy / SSL inspection is intercepting Maven traffic
+- antivirus/firewall is intercepting HTTPS
+- company root certificate is missing from the Android Studio JBR/JDK truststore
+- network blocks Maven Central
+
+Evidence from your error:
+- Gradle fails on :app:debugRuntimeClasspath
+- It cannot resolve dependencies such as:
+${dependencyList}
+- The failing host(s):
+${hostList}
+- The actual root error is:
+  PKIX path building failed / certificate_unknown / SSL handshake exception
+
+What to whitelist / allow:
+- https://repo.maven.apache.org/maven2/
+- If your Gradle files use it, also allow https://dl.google.com/dl/android/maven2/
+- If a company proxy is required, configure Gradle/Android Studio to use that proxy.
+
+What to fix:
+1. Open this URL in the same machine/browser:
+   https://repo.maven.apache.org/maven2/org/jetbrains/annotations/23.0.0/annotations-23.0.0.pom
+   Expected: you should see/download the POM, with no certificate warning.
+
+2. In Android Studio:
+   File -> Settings -> Appearance & Behavior -> System Settings -> HTTP Proxy
+   Confirm whether your company needs a proxy.
+
+3. Find which Java Gradle is using:
+   Android Studio -> Settings -> Build, Execution, Deployment -> Build Tools -> Gradle -> Gradle JDK
+   If it uses Android Studio JBR, the company/root CA must be trusted by that JBR/JDK.
+
+4. If your company uses SSL inspection:
+   Ask IT for the corporate root CA certificate, then import it into the JDK truststore used by Gradle/Android Studio.
+
+5. Rerun:
+   File -> Sync Project with Gradle Files
+
+What PayFix can do next:
+- If you paste the Gradle JDK path or a screenshot of Gradle JDK settings, PayFix can give the exact Windows keytool command to import the certificate.
+- If Maven opens fine in Chrome but Gradle still fails, PayFix should inspect Gradle proxy/JDK settings next.
+
+Bottom line:
+This is a machine/network trust problem around Maven Central, not a missing app source file.`;
+  }
+
+  function isAgentExecutionActionPrompt(prompt: string) {
+    return /^(Investigate and fix|Fix |Prepare |Patch |Apply |Install |Run |Check |Wire |Create |Add |Delete |Retry )/i.test(prompt.trim()) ||
+      /\b(do not just repeat|do not replay|apply safe|safe patch|patch the connected|run validation|report exactly what changed|use the failure output|inspect the exact affected files)\b/i.test(
+        prompt,
+      );
   }
 
   async function validateAppliedFileChange() {
@@ -2850,24 +5934,106 @@ SIZE: ${item.size || 0} bytes`;
     }
   }
 
-  async function rollbackLastAppliedChange() {
-    if (!lastRollback) return;
+  async function loadRollbackSnapshots() {
+    const response = await fetch("/api/local-agent/project/rollback/list", { cache: "no-store" });
+    const data = await response.json();
+    if (!data.ok) throw new Error(data.error || "Could not load rollback snapshots.");
 
+    const snapshots = (data.snapshots || []) as RollbackSnapshot[];
+    setRollbackSnapshots(snapshots);
+    setLastRollback(snapshots[0] || null);
+    return snapshots;
+  }
+
+  async function openRollbackOptions() {
     setRollbackLoading(true);
-    setAgentStatus(`Rolling back ${lastRollback.relative || lastRollback.file}...`);
+    setAgentStatus("Loading Undo options...");
 
     try {
-      const response = await fetch("/api/local-agent/project/rollback/apply", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ id: lastRollback.id }),
-      });
-      const data = await response.json();
-      if (!data.ok) throw new Error(data.error || "Rollback failed.");
+      const snapshots = await loadRollbackSnapshots();
+      if (!snapshots.length) {
+        setAgentStatus("No rollback snapshots are available.");
+        return;
+      }
 
-      appendAssistantStatusMessage(`PATCH ROLLED BACK\n\n${data.message || `Restored ${lastRollback.relative || lastRollback.file}.`}`);
-      setLastRollback(null);
-      setAgentStatus(data.message || "Rollback complete.");
+      setSelectedRollbackIds(lastRollback?.id ? [lastRollback.id] : [snapshots[0].id]);
+      setShowAllRollbackSnapshots(false);
+      setExpandedRollbackFiles([]);
+      setRollbackOptionsOpen(true);
+      setAgentStatus("Choose which PayFix changes to undo.");
+    } catch (err: unknown) {
+      setAgentStatus(`Could not load Undo options: ${errorMessage(err)}`);
+    } finally {
+      setRollbackLoading(false);
+    }
+  }
+
+  function latestRollbackBatchIds(snapshots = rollbackSnapshots) {
+    const latest = snapshots[0];
+    if (!latest) return [];
+
+    const latestTime = new Date(latest.createdAt).getTime();
+    return snapshots
+      .filter((snapshot) => Math.abs(new Date(snapshot.createdAt).getTime() - latestTime) <= 4000)
+      .map((snapshot) => snapshot.id);
+  }
+
+  function rollbackSnapshotReason(snapshot: RollbackSnapshot, isNewest: boolean) {
+    if (snapshot.reason && !/^Apply file change$/i.test(snapshot.reason)) {
+      return snapshot.reason;
+    }
+
+    const file = snapshot.relative || snapshot.file;
+    if (snapshot.fileExisted === false) {
+      return `PayFix created ${file}. Undo will delete that created file.`;
+    }
+
+    return isNewest
+      ? `Latest snapshot for ${file}. The exact issue/fix reason was not stored for this older Apply.`
+      : `Older snapshot for ${file}. The exact issue/fix reason was not stored for this older Apply.`;
+  }
+
+  async function applyRollbackSnapshots(ids = selectedRollbackIds) {
+    if (!ids.length) return;
+
+    setRollbackLoading(true);
+    setAgentStatus(`Rolling back ${ids.length} snapshot${ids.length === 1 ? "" : "s"}...`);
+
+    const restored: string[] = [];
+    const failed: string[] = [];
+
+    try {
+      for (const id of ids) {
+        const snapshot = rollbackSnapshots.find((item) => item.id === id);
+        const response = await fetch("/api/local-agent/project/rollback/apply", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ id }),
+        });
+        const data = await response.json();
+
+        if (data.ok) {
+          restored.push(data.message || `Restored ${snapshot?.relative || snapshot?.file || id}.`);
+        } else {
+          failed.push(`${snapshot?.relative || snapshot?.file || id}: ${data.error || "Rollback failed."}`);
+        }
+      }
+
+      appendAssistantStatusMessage(
+        `PATCH ROLLED BACK\n\n${restored.length ? restored.map((item) => `- ${item}`).join("\n") : "No files restored."}${
+          failed.length ? `\n\nFAILED\n${failed.map((item) => `- ${item}`).join("\n")}` : ""
+        }`,
+      );
+
+      const remaining = await loadRollbackSnapshots().catch(() => []);
+      setSelectedRollbackIds([]);
+      setRollbackOptionsOpen(false);
+      setAgentStatus(
+        failed.length
+          ? `Rollback completed with ${failed.length} failure${failed.length === 1 ? "" : "s"}.`
+          : `Rolled back ${restored.length} change${restored.length === 1 ? "" : "s"}.`,
+      );
+      setLastRollback(remaining[0] || null);
     } catch (err: unknown) {
       setAgentStatus(`Rollback failed: ${errorMessage(err)}`);
     } finally {
@@ -2882,6 +6048,7 @@ SIZE: ${item.size || 0} bytes`;
       mode: applyMode,
       search: applySearchContent,
       content: applyNewContent,
+      reason: applyDescription || `Apply ${basename(applyFilePath)} change`,
     });
   }
 
@@ -2891,25 +6058,55 @@ SIZE: ${item.size || 0} bytes`;
     mode,
     search,
     content,
+    reason,
   }: {
     apply: boolean;
     file: string;
-    mode: "insert" | "replace" | "overwrite";
+    mode: "insert" | "replace" | "overwrite" | "delete";
     search: string;
     content: string;
+    reason?: string;
   }) {
-    const res = await fetch("/api/local-agent/project/preview-write-file", {
+    const body = JSON.stringify({
+      file,
+      mode,
+      search,
+      content,
+      apply,
+      reason,
+    });
+    const requestInit = {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        file,
-        mode,
-        search,
-        content,
-        apply,
-      }),
-    });
-    return res.json();
+      body,
+    };
+
+    async function parseApplyResponse(response: Response, source: string) {
+      const responseText = await response.text();
+      try {
+        return responseText ? JSON.parse(responseText) : {};
+      } catch {
+        throw new Error(
+          `${source} returned non-JSON (${response.status}). ${responseText
+            .replace(/\s+/g, " ")
+            .slice(0, 180)}`,
+        );
+      }
+    }
+
+    const endpoint = mode === "delete" ? "/project/delete-file" : "/project/preview-write-file";
+
+    try {
+      const res = await fetch(`/api/local-agent${endpoint}`, requestInit);
+      return await parseApplyResponse(res, "Local agent proxy");
+    } catch (err: unknown) {
+      if (!/non-JSON|Unexpected token|DOCTYPE|404|500/i.test(errorMessage(err))) {
+        throw err;
+      }
+
+      const directRes = await fetch(`http://localhost:7777${endpoint}`, requestInit);
+      return parseApplyResponse(directRes, "Local agent direct endpoint");
+    }
   }
 
   function isLikelyApplyFilePath(value: string) {
@@ -3145,22 +6342,47 @@ SIZE: ${item.size || 0} bytes`;
     setShowRunner(true);
   }
 
-  async function analyze(options: { referencedUploads?: UploadedFile[] } = {}) {
+  function questionWithSelectedQuickReplies() {
+    const typed = question.trim();
+    if (!selectedQuickReplies.length) return question;
+
+    const selected = `Selected confirmations:\n${selectedQuickReplies.map((reply) => `- ${reply}`).join("\n")}`;
+    return typed ? `${typed}\n\n${selected}` : selected;
+  }
+
+  async function analyze(
+    options: {
+      referencedUploads?: UploadedFile[];
+      overrideQuestion?: string;
+      overrideUploads?: UploadedFile[];
+    } = {},
+  ) {
+    const activeQuestion = options.overrideQuestion ?? question;
+    const hasOverride = options.overrideQuestion !== undefined || options.overrideUploads !== undefined;
     const isReplyMode = messages.length > 0;
-    if (isReplyMode && !question.trim()) {
-      setAgentStatus("Please type a message before sending.");
+    if (
+      isReplyMode &&
+      !activeQuestion.trim() &&
+      selectedQuickReplies.length === 0 &&
+      !log.trim() &&
+      !code.trim() &&
+      (options.overrideUploads || uploadedFiles).length === 0 &&
+      !computerSearchResults &&
+      !connectedProjectPath
+    ) {
+      setAgentStatus("Please type a message or attach a file/image before sending.");
       return;
     }
 
-    if (!canSend) return;
+    if (!hasOverride && !canSend) return;
     if (!validateCodeBoxBeforeSubmit(code)) return;
-    const resolvedUploads = resolveReferencedUploads(options.referencedUploads);
+    const resolvedUploads = options.overrideUploads || resolveReferencedUploads(options.referencedUploads);
     if (resolvedUploads === null) return;
 
-    const submittedQuestion = question;
+    const submittedQuestion = options.overrideQuestion ?? questionWithSelectedQuickReplies();
     const submittedLog = log;
     const submittedCode = code;
-    const submittedUploadedFiles = resolvedUploads;
+    const submittedUploadedFiles = mergePersistentEvidenceUploads(resolvedUploads);
     const submittedComputerSearchResults = computerSearchResults;
     const submittedProjectContext = projectContext;
     const submittedConnectedProjectPath = connectedProjectPath;
@@ -3168,6 +6390,7 @@ SIZE: ${item.size || 0} bytes`;
     setPendingQuestion(submittedQuestion);
     setPendingUploads(submittedUploadedFiles);
     setQuestion("");
+    setSelectedQuickReplies([]);
     clearOneShotContextAfterSubmit();
     setLoading(true);
 
@@ -3175,6 +6398,7 @@ SIZE: ${item.size || 0} bytes`;
       submittedQuestion.trim() ||
       (submittedLog.trim() ? "Analyze this payment log / error." : "") ||
       (submittedCode.trim() ? "Analyze this code." : "") ||
+      (submittedUploadedFiles.some((file) => file.isImage) ? "Analyze the uploaded image(s)." : "") ||
       (submittedUploadedFiles.length ? "Analyze uploaded file(s)." : "") ||
       (submittedComputerSearchResults ? "Analyze attached computer search." : "") ||
       (submittedConnectedProjectPath ? "Analyze the connected project files." : "") ||
@@ -3213,6 +6437,81 @@ SIZE: ${item.size || 0} bytes`;
         setPendingUploads([]);
         return;
       }
+    }
+
+    if (isSpreadsheetEditRequest(userContent)) {
+      const spreadsheetUploads = submittedUploadedFiles.filter((file) =>
+        /\.(xlsx?|csv)$/i.test(file.name) || /spreadsheet|excel|csv/i.test(file.type),
+      );
+      const userMessage: ChatMessage = {
+        role: "user",
+        content: userContent,
+        attachedLog: submittedLog,
+        attachedCode: submittedCode,
+        attachedUploads: submittedUploadedFiles,
+      };
+      const updatedMessages = [...messages, userMessage];
+      const finalMessages: ChatMessage[] = [
+        ...updatedMessages,
+        {
+          role: "assistant",
+          content: spreadsheetUploads.length
+            ? "I can accept spreadsheet uploads now, but direct Excel/XLSX editing is not wired yet. The right next feature is a safe spreadsheet editor that previews cell/sheet changes and returns an updated downloadable workbook."
+            : "Attach the Excel/CSV file first. PayFix can accept spreadsheet uploads now, but direct XLSX editing still needs the safe spreadsheet editor before it can return an updated workbook.",
+        },
+      ];
+      setMessages(finalMessages);
+      saveActiveChat(finalMessages);
+      setLoading(false);
+      setPendingQuestion("");
+      setPendingUploads([]);
+      return;
+    }
+
+    const editPlan = imageEditPlan(userContent);
+    if (editPlan && submittedUploadedFiles.some((file) => file.isImage)) {
+      const userMessage: ChatMessage = {
+        role: "user",
+        content: userContent,
+        attachedLog: submittedLog,
+        attachedCode: submittedCode,
+        attachedUploads: submittedUploadedFiles,
+      };
+      const updatedMessages = [...messages, userMessage];
+      setMessages([...updatedMessages, { role: "assistant", content: `Editing the uploaded image as ${editPlan.target.label}...` }]);
+
+      try {
+        const generatedFiles = await editImagesForChat(submittedUploadedFiles, editPlan);
+        const fileList = generatedFiles.map((file) => `- ${file.name}`).join("\n");
+        const finalMessages: ChatMessage[] = [
+          ...updatedMessages,
+          {
+            role: "assistant",
+            content: `Done. I kept the uploaded image and exported ${editPlan.target.label}.\n\n${fileList}`,
+            generatedFiles,
+          },
+        ];
+
+        setMessages(finalMessages);
+        saveActiveChat(finalMessages);
+        setEditSnapshot(null);
+        setAgentStatus(`Created ${generatedFiles.length} ${editPlan.target.label} file(s).`);
+      } catch (err: unknown) {
+        const finalMessages: ChatMessage[] = [
+          ...updatedMessages,
+          { role: "assistant", content: `I could not edit that image: ${errorMessage(err)}` },
+        ];
+        setMessages(finalMessages);
+        saveActiveChat(finalMessages);
+        setEditSnapshot(null);
+        setAgentStatus(`Image edit failed: ${errorMessage(err)}`);
+      } finally {
+        setLoading(false);
+        setPendingQuestion("");
+        setPendingUploads([]);
+      }
+
+      return;
     }
 
     const conversionTarget = imageConversionTarget(userContent);
@@ -3254,6 +6553,114 @@ SIZE: ${item.size || 0} bytes`;
         saveActiveChat(finalMessages);
         setEditSnapshot(null);
         setAgentStatus(`Image conversion failed: ${errorMessage(err)}`);
+      } finally {
+        setLoading(false);
+        setPendingQuestion("");
+        setPendingUploads([]);
+      }
+
+      return;
+    }
+
+    if (
+      isImageGenerationRequest(userContent) ||
+      isImageGenerationFollowUp(userContent) ||
+      (submittedUploadedFiles.some((file) => file.isImage) && isReferenceImageEditRequest(userContent))
+    ) {
+      const userMessage: ChatMessage = {
+        role: "user",
+        content: userContent,
+        attachedLog: submittedLog,
+        attachedCode: submittedCode,
+        attachedUploads: submittedUploadedFiles,
+      };
+      const updatedMessages = [...messages, userMessage];
+      setMessages([...updatedMessages, { role: "assistant", content: "Generating image..." }]);
+      setAgentStatus("Generating downloadable image asset...");
+
+      try {
+        const generationPrompt = isImageGenerationFollowUp(userContent)
+          ? `${[...messages].reverse().find((message) => message.role === "assistant")?.content || ""}\n\nUser chose: ${userContent}. Generate the finished downloadable asset now.`
+          : userContent;
+        const referenceImages = submittedUploadedFiles.filter((file) => file.isImage && file.content);
+        const shouldEditReference = referenceImages.length > 0 && isReferenceImageEditRequest(userContent);
+        const response = await fetch("/api/generate-image", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            prompt: generationPrompt,
+            mode: shouldEditReference ? "edit" : "generate",
+            inputImages: shouldEditReference ? referenceImages : [],
+          }),
+        });
+        const data = (await response.json()) as { ok?: boolean; error?: string; files?: GeneratedFile[]; revisedPrompt?: string };
+        if (!data.ok || !data.files?.length) throw new Error(data.error || "No image was generated.");
+
+        const finalMessages: ChatMessage[] = [
+          ...updatedMessages,
+          {
+            role: "assistant",
+            content: `${shouldEditReference ? "Done. I edited the uploaded image using it as the source reference." : "Done. I generated a downloadable image asset."}\n\n${data.files.map((file) => `- ${file.name}`).join("\n")}`,
+            generatedFiles: data.files,
+          },
+        ];
+        setMessages(finalMessages);
+        saveActiveChat(finalMessages);
+        setEditSnapshot(null);
+        setAgentStatus(`Generated ${data.files.length} image asset(s).`);
+      } catch (err: unknown) {
+        const finalMessages: ChatMessage[] = [
+          ...updatedMessages,
+          { role: "assistant", content: `Image generation failed: ${errorMessage(err)}` },
+        ];
+        setMessages(finalMessages);
+        saveActiveChat(finalMessages);
+        setAgentStatus(`Image generation failed: ${errorMessage(err)}`);
+      } finally {
+        setLoading(false);
+        setPendingQuestion("");
+        setPendingUploads([]);
+      }
+
+      return;
+    }
+
+    if (submittedConnectedProjectPath && (isProjectFolderDeleteRequest(userContent) || isProjectDisconnectRequest(userContent))) {
+      const userMessage: ChatMessage = {
+        role: "user",
+        content: userContent,
+        attachedLog: submittedLog,
+        attachedCode: submittedCode,
+        attachedUploads: submittedUploadedFiles,
+      };
+      const updatedMessages = [...messages, userMessage];
+
+      try {
+        if (!isProjectDisconnectRequest(userContent)) await ensureLocalAgentRoot(submittedConnectedProjectPath);
+        const cleanupMessage = await handleEmptyProjectFolderDeleteRequest(userContent);
+        const finalMessages: ChatMessage[] = [...updatedMessages, { role: "assistant", content: cleanupMessage }];
+        setMessages(finalMessages);
+        saveActiveChat(finalMessages);
+        setEditSnapshot(null);
+        setAgentStatus(
+          /^PROJECT FOLDER DELETED/i.test(cleanupMessage)
+            ? "Deleted the connected project folder from disk."
+            : /^PROJECT FOLDER NOT EMPTY/i.test(cleanupMessage)
+              ? "Folder still contains files. Choose what to delete next."
+              : /^PROJECT FOLDER BUSY/i.test(cleanupMessage)
+                ? "Folder is busy or locked. Choose retry, force delete, or disconnect."
+                : /^PROJECT DISCONNECTED/i.test(cleanupMessage)
+                  ? "Disconnected the project from PayFix."
+                  : "The project folder is empty. Use Delete folder from disk if you want it removed.",
+        );
+      } catch (err: unknown) {
+        const finalMessages: ChatMessage[] = [
+          ...updatedMessages,
+          { role: "assistant", content: `Folder cleanup failed: ${errorMessage(err)}` },
+        ];
+        setMessages(finalMessages);
+        saveActiveChat(finalMessages);
+        setAgentStatus(`Folder cleanup failed: ${errorMessage(err)}`);
       } finally {
         setLoading(false);
         setPendingQuestion("");
@@ -3351,6 +6758,7 @@ ${submittedComputerSearchResults}`,
     submittedUploadedFiles,
     submittedComputerSearchResults,
     resetSession,
+    reuseCurrentSessionTurn = false,
   }: {
     userContent: string;
     submittedLog: string;
@@ -3358,7 +6766,36 @@ ${submittedComputerSearchResults}`,
     submittedUploadedFiles: UploadedFile[];
     submittedComputerSearchResults: string;
     resetSession: boolean;
+    reuseCurrentSessionTurn?: boolean;
   }) {
+    setAgentSessionEditSnapshot(null);
+    const runSeq = ++agentSessionRunSeqRef.current;
+    const isCurrentRun = () => agentSessionRunSeqRef.current === runSeq;
+    const setAgentSessionMessagesForRun: typeof setAgentSessionMessages = (value) => {
+      if (!isCurrentRun()) return;
+      setAgentSessionMessages(value);
+    };
+    const priorSessionMessages = resetSession ? [] : agentSessionMessages;
+    const preferredFilesForRun = resetSession ? [] : recentAgentFiles;
+    const effectiveUserContent = buildEffectiveAgentRequest({
+      userContent,
+      priorSessionMessages,
+      uploadedFilesForRun: submittedUploadedFiles,
+    });
+    const hasPriorPaxAndroidBuild = isPaxAndroidBuiltSession(priorSessionMessages);
+    const isExplicitFreshPaxBuild =
+      isPaxAndroidBuildRequest(effectiveUserContent) &&
+      !hasPriorPaxAndroidBuild &&
+      !/\b(fix|error|failed|failing|failure|validate|validation|what next|how exactly|next steps?|sync|compile|test|rerun|again|continue)\b/i.test(
+        userContent,
+      );
+    const useConnectedProjectForRun = shouldUseProjectForAgentRun({
+      userContent,
+      submittedLog,
+      submittedCode,
+      submittedUploadedFiles,
+      submittedComputerSearchResults,
+    });
     const userMessage: ChatMessage = {
       role: "user",
       content: userContent,
@@ -3366,58 +6803,310 @@ ${submittedComputerSearchResults}`,
       attachedCode: submittedCode,
       attachedUploads: submittedUploadedFiles,
     };
-    const baseSessionMessages = resetSession ? [userMessage] : [...agentSessionMessages, userMessage];
-    setAgentSessionMessages([
+    const shouldReuseVisibleTurn = reuseCurrentSessionTurn && !resetSession;
+    const baseSessionMessages = (() => {
+      if (resetSession) return [userMessage];
+      if (!shouldReuseVisibleTurn) return [...agentSessionMessages, userMessage];
+
+      const withoutWorking =
+        agentSessionMessages.at(-1)?.role === "assistant" && isWorkingAssistantMessage(agentSessionMessages.at(-1)?.content || "")
+          ? agentSessionMessages.slice(0, -1)
+          : agentSessionMessages;
+      const latest = withoutWorking.at(-1);
+      if (latest?.role === "user" && latest.content === userContent) {
+        return withoutWorking.map((message, index) =>
+          index === withoutWorking.length - 1
+            ? {
+                ...message,
+                attachedLog: submittedLog,
+                attachedCode: submittedCode,
+                attachedUploads: submittedUploadedFiles,
+              }
+            : message,
+        );
+      }
+
+      return [...withoutWorking, userMessage];
+    })();
+    setShowApplyModal(false);
+    setAgentSessionMessagesForRun([
       ...baseSessionMessages,
       {
         role: "assistant",
-        content: agentWorkingMessageForPrompt(userContent, Boolean(connectedProjectPath)),
+        content: agentWorkingMessageForPrompt(userContent, useConnectedProjectForRun),
+        agentProgress: [
+          {
+            step: "start",
+            message: useConnectedProjectForRun
+              ? "Preparing the Agent run and checking the connected project setup..."
+              : "Preparing the Agent run and checking the attached evidence...",
+            at: new Date().toISOString(),
+          },
+        ],
       },
     ]);
 
+    const runId = crypto.randomUUID();
+    let progressTimer: number | null = null;
+    const emitLocalProgress = (step: string, message: string) => {
+      if (!isCurrentRun()) return;
+      setAgentStatus(message);
+      replaceLatestAgentWorkingMessage(message, {
+        step,
+        message,
+        at: new Date().toISOString(),
+      });
+    };
+
     try {
+      if (isSketchProjectCreationRequest(userContent)) {
+        const projectRequest = parseSketchProjectCreationRequest(userContent);
+        setAgentStatus("Creating project folder and files from the sketch...");
+        setAgentSessionMessagesForRun([
+          ...baseSessionMessages,
+          {
+            role: "assistant",
+            content: "Creating the project folder, starter files, and run instructions...",
+          },
+        ]);
+
+        const response = await fetch("/api/create-project", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            ...projectRequest,
+            prompt: userContent,
+            sourceMessage: currentProjectCreationBrief(priorSessionMessages),
+          }),
+        });
+        const data = (await response.json()) as CreateProjectResponse;
+        if (!response.ok || !data.ok) {
+          throw new Error(data.error || "Project creation failed.");
+        }
+
+        const finalSessionMessages: ChatMessage[] = [
+          ...baseSessionMessages,
+          {
+            role: "assistant",
+            content:
+              data.markdown ||
+              `PROJECT CREATED\n\nPath:\n${data.path || projectRequest.parentPath}\n\nFiles created:\n${(data.files || [])
+                .map((file) => `- ${file}`)
+                .join("\n")}`,
+          },
+        ];
+        setAgentSessionMessagesForRun(finalSessionMessages);
+        setAgentStatus(`Project created: ${data.path || data.folderName || "new project"}`);
+        setEditSnapshot(null);
+        return;
+      }
+
+      if (asksForIdeWorkflowScreenshot(userContent, submittedUploadedFiles)) {
+        const workflowScreenshots = submittedUploadedFiles.filter((file) => file.isImage);
+        emitLocalProgress("read-screenshot", "Reading the IDE/menu screenshot and matching the visible options to your question...");
+
+        const response = await fetchAgentWithTimeout("/api/agent", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            runId,
+            question: `${effectiveUserContent}
+
+WORKFLOW SCREENSHOT TASK:
+Answer this as an IDE/menu navigation question, not as Visual Fix and not as a code patch.
+Read the uploaded screenshot carefully. Start by naming the visible menu/options you can actually see.
+If "Make Project" or another expected option is not visible, say that plainly.
+Give the exact visible option to click now, plus only safe fallbacks such as IDE search or a keyboard shortcut.`,
+            history: `CURRENT AGENT REQUEST - USE THIS AS THE ACTIVE TASK:
+${effectiveUserContent}
+
+This request is a workflow screenshot question. Do not inspect project files or prepare a patch.`,
+            memory: "",
+            log: "",
+            code: "",
+            computerSearchResults: "",
+            sdkInspectionContext: "",
+            uploadedFiles: workflowScreenshots,
+            projectFileList: "",
+            preferredFiles: [],
+          }),
+        });
+        const data: AgentApiResponse = await response.json();
+        if (!data.ok) throw new Error(data.error || "Agent screenshot workflow read failed.");
+
+        setAgentStatus("Answered the IDE/menu screenshot from visible evidence.");
+        setAgentSessionMessagesForRun([
+          ...baseSessionMessages,
+          {
+            role: "assistant",
+            content: data.markdown || "I could not read the IDE/menu screenshot clearly enough to answer.",
+          },
+        ]);
+        setEditSnapshot(null);
+        return;
+      }
+
       let projectFileList = "";
-      if (connectedProjectPath) {
-        setAgentStatus("PayFix Agent is connecting to the selected project and loading file inventory...");
+      if (useConnectedProjectForRun) {
+        const disconnectRequested = isProjectDisconnectRequest(userContent);
+        if (isProjectFolderDeleteRequest(userContent) || disconnectRequested) {
+          if (!disconnectRequested) await ensureLocalAgentRoot(connectedProjectPath);
+          const cleanupMessage = await handleEmptyProjectFolderDeleteRequest(userContent);
+          const finalSessionMessages: ChatMessage[] = [...baseSessionMessages, { role: "assistant", content: cleanupMessage }];
+          setAgentSessionMessagesForRun(finalSessionMessages);
+          setAgentStatus(
+            /^PROJECT FOLDER DELETED/i.test(cleanupMessage)
+              ? "Deleted the empty connected project folder."
+              : /^PROJECT FOLDER NOT EMPTY/i.test(cleanupMessage)
+                ? "Folder still contains files. Choose what to delete next."
+                : /^PROJECT FOLDER BUSY/i.test(cleanupMessage)
+                  ? "Folder is busy or locked. Choose retry, force delete, or disconnect."
+                  : /^PROJECT DISCONNECTED/i.test(cleanupMessage)
+                    ? "Disconnected the project from PayFix."
+                    : "The project folder is empty. Use the delete-folder action if you want it removed.",
+          );
+          return;
+        }
+
+        emitLocalProgress("connect-project", "Connecting to the selected project folder through the local agent...");
         await ensureLocalAgentRoot(connectedProjectPath);
 
+        emitLocalProgress("load-files", "Loading the project file inventory so PayFix can choose exact files...");
         projectFileList = await loadFileList();
         if (!projectFileList.trim()) {
           throw new Error("Could not load the project file list from the local agent.");
         }
 
-        setAgentStatus(agentWorkingMessageForPrompt(userContent, true));
+        const fileCount = projectFileList.split(/\r?\n/).filter(Boolean).length;
+        emitLocalProgress("file-inventory", `Loaded ${fileCount} project file(s). Selecting the relevant build/source files...`);
       } else {
-        setAgentStatus(agentWorkingMessageForPrompt(userContent, false));
+        emitLocalProgress("evidence-only", agentWorkingMessageForPrompt(userContent, false));
       }
 
-      const response = await fetch("/api/agent", {
+      let projectPreflightContext = "";
+      if (useConnectedProjectForRun && shouldAutoInstallAgentDependencies(effectiveUserContent)) {
+        emitLocalProgress("check-toolchain", "Checking detected build system, available validators, and missing toolchain/dependency clues...");
+        try {
+          const toolchainResponse = await fetch("/api/local-agent/project/toolchain", { cache: "no-store" });
+          const toolchainData = await toolchainResponse.json();
+          projectPreflightContext = `PROJECT PREFLIGHT / TOOLCHAIN SNAPSHOT:\n${JSON.stringify(toolchainData, null, 2).slice(0, 9000)}`;
+          emitLocalProgress(
+            "toolchain-summary",
+            toolchainData?.ok
+              ? "Toolchain snapshot loaded. PayFix will use it to choose install/build/validation steps."
+              : `Toolchain snapshot returned a warning: ${toolchainData?.error || "unknown issue"}`,
+          );
+        } catch (err: unknown) {
+          projectPreflightContext = `PROJECT PREFLIGHT / TOOLCHAIN SNAPSHOT:\nCould not load toolchain snapshot: ${errorMessage(err)}`;
+          emitLocalProgress("toolchain-warning", `Toolchain snapshot could not be loaded: ${errorMessage(err)}`);
+        }
+      }
+
+      if (/vendor sdk|local artifacts|sdk folders?|poslink|paxstore|PROJECT SETUP CONTEXT/i.test(effectiveUserContent)) {
+        emitLocalProgress("inspect-sdk", "Inspecting selected SDK/artifact folders for AAR/JAR/AIDL files, samples, docs, and Gradle hints...");
+      }
+      const sdkInspectionContext = await inspectSdkFolderForAgent(effectiveUserContent);
+      if (sdkInspectionContext) {
+        emitLocalProgress("sdk-summary", "SDK folder inspection finished. Feeding discovered libraries/docs/samples into the Agent run...");
+      }
+      const agentComputerSearchResults = [submittedComputerSearchResults, projectPreflightContext, sdkInspectionContext].filter(Boolean).join("\n\n");
+
+      if (useConnectedProjectForRun && isExplicitFreshPaxBuild) {
+        const sdkRoots = sdkPathsFromAgentPrompt(effectiveUserContent);
+        emitLocalProgress("build-files", "Building the PAX Android app files, copying SDK artifacts, and updating Gradle...");
+        const buildResponse = await fetch("/api/local-agent/project/build-pax-android", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            prompt: effectiveUserContent,
+            sdkRoots,
+          }),
+        });
+        const buildData = await buildResponse.json();
+        if (!buildResponse.ok || !buildData.ok) {
+          throw new Error(buildData.error || "PAX Android build failed.");
+        }
+
+        emitLocalProgress("validate", "Running project diagnostics after generating the PAX Android app files...");
+        const sandboxSummary = await runPostApplySandboxChecks();
+        const filesChanged = Array.isArray(buildData.filesChanged) ? buildData.filesChanged : [];
+        const copiedArtifacts = Array.isArray(buildData.copiedArtifacts) ? buildData.copiedArtifacts : [];
+        const finalSessionMessages: ChatMessage[] = [
+          ...baseSessionMessages,
+          {
+            role: "assistant",
+            content: `PAX ANDROID APP BUILT\n\nPayFix created/updated the connected Android project instead of only inspecting it.\n\nProject:\n${buildData.projectRoot}\n\nPackage/namespace:\n${buildData.namespace}\n\nFiles created or updated:\n${filesChanged.map((file: string) => `- ${file}`).join("\n") || "- No files reported."}\n\nSDK artifacts copied into app/libs:\n${copiedArtifacts.map((file: string) => `- ${file}`).join("\n") || "- No AAR/JAR files were found in the selected SDK folders."}\n\nWhat PayFix wired:\n- MainActivity starter checkout screen\n- PaymentServiceBridge placeholder tied to detected SDK artifacts\n- Gradle app/libs dependency loading for .aar/.jar files\n- AndroidManifest fallback if missing\n\nWhat you do next in Android Studio:\n1. Click Sync Gradle.\n2. Build the app module.\n3. Run it on the PAX A-series device.\n4. Open PaymentServiceBridge and replace the placeholder with the exact POSLink/BroadPOS Intent or AIDL call from the copied vendor sample/docs.\n\nValidation / diagnostics:\n${sandboxSummary}`,
+          },
+        ];
+        setAgentSessionMessagesForRun(finalSessionMessages);
+        setEditSnapshot(null);
+        setAgentStatus("PAX Android app files created. Review the build report and sync Gradle in Android Studio.");
+        return;
+      }
+
+      progressTimer = window.setInterval(async () => {
+        try {
+          if (!isCurrentRun()) return;
+          const progressResponse = await fetch(`/api/agent?runId=${encodeURIComponent(runId)}`, { cache: "no-store" });
+          const progressData = (await progressResponse.json()) as AgentProgressResponse;
+          if (!isCurrentRun()) return;
+          if (!progressData.ok || !progressData.progress?.message) return;
+          setAgentStatus(progressData.progress.message);
+          if (progressData.progress.step === "failed") return;
+          replaceLatestAgentWorkingMessage(progressData.progress.message, progressData.progress);
+        } catch {
+          // Progress polling should never fail the Agent run.
+        }
+      }, 900);
+
+      const response = await fetchAgentWithTimeout("/api/agent", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          question: userContent,
-          history: `${recentConversationForAgent()}\n\nAGENT SESSION:\n${baseSessionMessages
+          runId,
+          question: effectiveUserContent,
+          history: `CURRENT AGENT REQUEST - USE THIS AS THE ACTIVE TASK:
+${effectiveUserContent}
+
+Older chat/session context is background only. Do not continue an older patch if it conflicts with the current request.
+
+RECENT CHAT:
+${recentConversationForAgent()}
+
+AGENT SESSION:
+${baseSessionMessages
             .map((message) => `${message.role.toUpperCase()}: ${message.content}`)
             .join("\n\n")}`,
           memory: compressedAgentMemory(),
           log: submittedLog,
-          code: submittedCode,
-          computerSearchResults: submittedComputerSearchResults,
+          code: `${submittedCode}
+
+EFFECTIVE ACTIVE REQUEST:
+${effectiveUserContent}`,
+          computerSearchResults: agentComputerSearchResults,
+          sdkInspectionContext,
           uploadedFiles: submittedUploadedFiles,
           projectFileList,
+          preferredFiles: preferredFilesForRun,
         }),
       });
 
       const data: AgentApiResponse = await response.json();
       if (!data.ok) throw new Error(data.error || "Agent run failed.");
+      if (!isCurrentRun()) return;
 
       if (data.dependencyProposal?.needed && data.dependencyProposal.packageName) {
         setDependencyProposal(data.dependencyProposal);
       }
+      if (data.filesRead?.length) {
+        setRecentAgentFiles(data.filesRead.map((file) => file.file));
+      } else if (data.selectedFiles?.length) {
+        setRecentAgentFiles(data.selectedFiles);
+      }
 
       const inspectedNames = data.filesRead?.map((file) => file.name).join(", ");
       setAgentStatus(
-        !connectedProjectPath
+        !useConnectedProjectForRun
           ? "Evidence investigation complete. Connect a project to inspect or patch code."
           : data.patchReady
           ? `Project investigation complete. Patch verified after inspecting: ${inspectedNames || "selected files"}`
@@ -3426,29 +7115,89 @@ ${submittedComputerSearchResults}`,
             : "Project investigation complete. See the response for inspected evidence and next steps.",
       );
 
-      const finalSessionMessages: ChatMessage[] = [
-        ...baseSessionMessages,
-        { role: "assistant", content: data.markdown || "PayFix investigation finished without a response." },
-      ];
-      setAgentSessionMessages(finalSessionMessages);
+      const assistantMessage: ChatMessage = {
+        role: "assistant",
+        content: data.markdown || "PayFix investigation finished without a response.",
+        agentPatchData: agentResponseHasApplyablePatch(data) ? data : undefined,
+      };
+      let finalSessionMessages: ChatMessage[] = [...baseSessionMessages, assistantMessage];
+      setAgentSessionMessagesForRun(finalSessionMessages);
       setEditSnapshot(null);
+      if (agentResponseHasApplyablePatch(data)) {
+        setApplyPatchSet([]);
+        setApplyPreviewKey("");
+        setLastVerifiedAgentPatch(data);
+      } else {
+        setLastVerifiedAgentPatch(null);
+      }
 
-      loadAgentPatchIntoApplyModal(data);
+      if (useConnectedProjectForRun && shouldAutoApplyAgentPatch(effectiveUserContent)) {
+        try {
+          const applied = await autoApplyAgentPatch(data, userContent);
+          if (applied) {
+            const installMessage = await autoInstallAgentDependencyProposal(data.dependencyProposal, effectiveUserContent);
+            finalSessionMessages = [
+              ...finalSessionMessages,
+              {
+                role: "assistant",
+                content:
+                  "PATCH APPLIED BY AGENT\n\nPayFix applied the verified patch for your current request and ran the available checks. If a rollback snapshot was returned, Undo is available from the applied patch message.",
+              },
+              ...(installMessage ? [installMessage] : []),
+            ];
+            setAgentSessionMessagesForRun(finalSessionMessages);
+            return;
+          }
+        } catch (err: unknown) {
+          const message = agentRunErrorMessage(err);
+          setAgentStatus(`Agent auto-apply failed: ${message}`);
+          finalSessionMessages = [
+            ...finalSessionMessages,
+            {
+              role: "assistant",
+              content: `AUTO-APPLY BLOCKED\n\nPayFix prepared a patch, but applying it failed safely before completion:\n${message}\n\nThe patch was not written. Ask PayFix to revise the patch or inspect the failure details.`,
+            },
+          ];
+          setAgentSessionMessagesForRun(finalSessionMessages);
+        }
+      }
+
+      if (data.patchReady) {
+        setShowApplyModal(false);
+        setAgentStatus(
+          shouldAutoApplyAgentPatch(userContent)
+            ? "Agent prepared a patch, but it was not auto-applied. Use the Agent action prompts to continue."
+            : "Agent prepared a patch. Use the Agent action prompts to explain, revise, or apply it.",
+        );
+      }
+
+      if (!data.patchReady) {
+        const installMessage = await autoInstallAgentDependencyProposal(data.dependencyProposal, effectiveUserContent);
+        if (installMessage) {
+          finalSessionMessages = [...finalSessionMessages, installMessage];
+          setAgentSessionMessagesForRun(finalSessionMessages);
+        }
+      }
     } catch (err: unknown) {
+      const message = agentRunErrorMessage(err);
       const finalSessionMessages: ChatMessage[] = [
         ...baseSessionMessages,
-        { role: "assistant", content: `PayFix investigation failed: ${errorMessage(err)}` },
+        { role: "assistant", content: `PayFix investigation failed: ${message}` },
       ];
-      setAgentSessionMessages(finalSessionMessages);
+      setAgentSessionMessagesForRun(finalSessionMessages);
       setEditSnapshot(null);
-      setAgentStatus(`PayFix investigation failed: ${errorMessage(err)}`);
+      setAgentStatus(`PayFix investigation failed: ${message}`);
       throw err;
+    } finally {
+      if (progressTimer) {
+        window.clearInterval(progressTimer);
+      }
     }
   }
 
   async function runAgent() {
     const isReplyMode = messages.length > 0;
-    if (isReplyMode && !question.trim() && !log.trim() && !code.trim() && uploadedFiles.length === 0) {
+    if (isReplyMode && !question.trim() && selectedQuickReplies.length === 0 && !log.trim() && !code.trim() && uploadedFiles.length === 0) {
       setAgentStatus("Please type a message or attach evidence before starting an investigation.");
       return;
     }
@@ -3456,11 +7205,12 @@ ${submittedComputerSearchResults}`,
     if (!canSend) return;
     if (!validateCodeBoxBeforeSubmit(code)) return;
 
-    const submittedQuestion = question;
+    const submittedQuestion = questionWithSelectedQuickReplies();
     const submittedLog = log;
     const submittedCode = code;
-    const submittedUploadedFiles = uploadedFiles;
+    const submittedUploadedFiles = mergePersistentEvidenceUploads(uploadedFiles);
     const submittedComputerSearchResults = computerSearchResults;
+    setAgentSessionInitialDraft("");
     const userContent =
       submittedQuestion.trim() ||
       (submittedLog.trim() ? "Investigate this payment log / error." : "") ||
@@ -3469,19 +7219,59 @@ ${submittedComputerSearchResults}`,
       (submittedComputerSearchResults ? "Investigate attached computer search." : "") ||
       "Investigate the connected project.";
 
+    if (
+      isRegularChatOnlyAgentRequest(userContent, submittedUploadedFiles, {
+        log: submittedLog,
+        code: submittedCode,
+        computerSearchResults: submittedComputerSearchResults,
+      })
+    ) {
+      const redirectMessage = regularChatRedirectMessage(userContent, submittedUploadedFiles);
+      setAgentSessionOpen(true);
+      setAgentSessionMessages([
+        {
+          role: "assistant",
+          content: redirectMessage,
+        },
+      ]);
+      setAgentSessionUploads(submittedUploadedFiles);
+      setAgentSessionFreshUploads([]);
+      setAgentStatus("This request is better handled in Regular Chat.");
+      setQuestion("");
+      setSelectedQuickReplies([]);
+      clearOneShotContextAfterSubmit();
+      return;
+    }
+
+    const useConnectedProjectForRun = shouldUseProjectForAgentRun({
+      userContent,
+      submittedLog,
+      submittedCode,
+      submittedUploadedFiles,
+      submittedComputerSearchResults,
+    });
+
     resetApplyModal();
     setAppliedPatchNotice(null);
     setAgentSessionOpen(true);
     setAgentSessionMessages([]);
     setAgentSessionUploads(submittedUploadedFiles);
+    setAgentSessionFreshUploads([]);
+    setRecentAgentFiles([]);
+    setLastVerifiedAgentPatch(null);
     setPendingQuestion(submittedQuestion);
     setPendingUploads(submittedUploadedFiles);
     setQuestion("");
+    setSelectedQuickReplies([]);
     clearOneShotContextAfterSubmit();
     setLoading(true);
     setAgentLoading(true);
     setDependencyProposal(null);
-    setAgentStatus(connectedProjectPath ? "PayFix Agent is indexing project files..." : "PayFix Agent is preparing an evidence investigation...");
+    setAgentStatus(
+      useConnectedProjectForRun
+        ? "PayFix Agent is indexing project files..."
+        : "PayFix Agent is preparing an evidence investigation...",
+    );
 
     try {
       await runAgentPromptInSession({
@@ -3503,7 +7293,857 @@ ${submittedComputerSearchResults}`,
   }
 
   async function runAgentSessionFollowUp(prompt: string) {
+    agentSessionRunSeqRef.current += 1;
     setAgentLoading(true);
+    resetApplyModal();
+    setAppliedPatchNotice(null);
+    let submittedUploadedFiles = activeAgentSessionUploadsForRun(prompt);
+    const hasFreshImageUploads = agentSessionFreshUploads.some((file) => file.isImage);
+    if (agentSessionFreshUploads.length && !submittedUploadedFiles.some((file) => file.isImage)) {
+      const scopedFreshUploads = scopedAgentSessionUploadsForPrompt(prompt, agentSessionFreshUploads);
+      if (scopedFreshUploads.length !== agentSessionFreshUploads.length) {
+        setAgentSessionFreshUploads(scopedFreshUploads);
+      }
+    }
+    const isProjectBuilderSession = agentSessionMessages.some((message) => /^PROJECT CREATION BRIEF:/i.test(message.content));
+    const flattenedMainContext = messages.flatMap((message) => [message, ...(message.agentSessionMessages || [])]);
+    const intentContextMessages = [
+      ...flattenedMainContext.slice(-30),
+      ...agentSessionMessages,
+      ...(agentSessionEditSnapshot?.messages || []),
+    ];
+    const latestVisibleAssistantForIntent = latestActionableAssistantContext(agentSessionMessages);
+    const previousAssistantForIntent = latestVisibleAssistantForIntent || latestActionableAssistantContext(intentContextMessages);
+    const showImmediateWorkingTurn = (message: string, attachedUploads = submittedUploadedFiles) => {
+      const userMessage: ChatMessage = {
+        role: "user",
+        content: prompt,
+        attachedUploads,
+      };
+      const workingMessage: ChatMessage = {
+        role: "assistant",
+        content: message,
+        agentProgress: [
+          {
+            step: "start",
+            message,
+            at: new Date().toISOString(),
+          },
+        ],
+      };
+      setAgentSessionMessages((current) => {
+        const latest = current.at(-1);
+        const previous = current.at(-2);
+        const latestIsReplaceableWorkingTurn =
+          latest?.role === "assistant" && (isWorkingAssistantMessage(latest.content) || Boolean(latest.agentProgress?.length));
+        if (
+          latestIsReplaceableWorkingTurn &&
+          previous?.role === "user" &&
+          previous.content === prompt
+        ) {
+          return [
+            ...current.slice(0, -2),
+            { ...previous, attachedUploads },
+            workingMessage,
+          ];
+        }
+
+        return [...current, userMessage, workingMessage];
+      });
+    };
+    showImmediateWorkingTurn("PayFix is reading your latest request and attached evidence...");
+
+    const fallbackIntent = classifyAgentFollowUpIntent({
+      prompt,
+      hasImages: submittedUploadedFiles.some((file) => file.isImage),
+      hasProject: Boolean(connectedProjectPath),
+      isPaxAndroidBuiltSession: isPaxAndroidBuiltSession(),
+      previousAssistant: previousAssistantForIntent,
+    });
+    const followUpIntent = await classifyAgentFollowUpTurn({
+      prompt,
+      submittedUploadedFiles,
+      previousAssistant: previousAssistantForIntent,
+    });
+    if (!followUpIntent.useImages && submittedUploadedFiles.some((file) => file.isImage) && !hasFreshImageUploads) {
+      submittedUploadedFiles = submittedUploadedFiles.filter((file) => !file.isImage);
+      showImmediateWorkingTurn("PayFix is reading your latest request...", submittedUploadedFiles);
+    }
+    if (fallbackIntent.route !== followUpIntent.route) {
+      setAgentStatus(`PayFix routed this turn as ${followUpIntent.route}: ${followUpIntent.reason}`);
+    }
+
+    if (asksCommandLocationHelp(prompt)) {
+      showImmediateWorkingTurn("Answering where to run the pasted command...");
+      setAgentStatus("Explaining the correct project folder for the pasted command.");
+
+      setAgentSessionMessages((current) => {
+        const latest = current.at(-1);
+        const withoutWorking =
+          latest?.role === "assistant" && isWorkingAssistantMessage(latest.content) ? current.slice(0, -1) : current;
+        return [...withoutWorking, { role: "assistant", content: commandLocationHelpMessage(prompt) }];
+      });
+      setAgentSessionFreshUploads([]);
+      setAgentLoading(false);
+      setPendingQuestion("");
+      setPendingUploads([]);
+      return true;
+    }
+
+    if (hasTerminalCommandOutput(prompt)) {
+      showImmediateWorkingTurn("Reading the latest terminal output as the current blocker...");
+      setAgentStatus("Diagnosing the fresh terminal output before using older project context...");
+
+      try {
+        const previousContext = formatRecentAgentContext(intentContextMessages, 10, 1600);
+        const response = await fetchAgentWithTimeout("/api/agent", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            question: `The user pasted fresh terminal/IDE/build output. Treat CURRENT USER OUTPUT as the source of truth.
+Do not replay older validation, uploaded logs, previous app setup steps, or stale suggestions unless they directly explain the new output.
+Diagnose the first/current blocker visible in the current output, then give the exact next step to try.
+Treat successful lines in CURRENT USER OUTPUT as already proven. Do not ask the user to rerun those same checks unless the output is incomplete.
+If a later command in CURRENT USER OUTPUT exits silently or behaves differently, focus on that command and give the smallest diagnostic step for that silent/different behavior.
+If the current output supersedes a previous error, say that plainly.
+If the fix is an environment command, show where to run it and how to verify it.
+If PayFix can run a connected-project validation/check, say exactly what it can run and what still requires user/admin permission.
+Keep the answer compact and conversational.
+
+CURRENT USER OUTPUT:
+${prompt}
+
+RECENT AGENT CONTEXT, SECONDARY ONLY:
+${previousContext}`,
+            history: previousContext,
+            memory: "",
+            log: "",
+            code: prompt,
+            computerSearchResults: "",
+            sdkInspectionContext: "",
+            uploadedFiles: [],
+            projectFileList: "",
+            preferredFiles: [],
+            forceFocusedAnswer: true,
+          }),
+        });
+        const data: AgentApiResponse = await response.json();
+        if (!data.ok) throw new Error(data.error || "Could not diagnose that terminal output.");
+        setAgentSessionMessages((current) => {
+          const latest = current.at(-1);
+          const withoutWorking =
+            latest?.role === "assistant" && isWorkingAssistantMessage(latest.content) ? current.slice(0, -1) : current;
+          return [...withoutWorking, { role: "assistant", content: data.markdown || "I could not diagnose that terminal output clearly yet." }];
+        });
+        setAgentStatus("Answered from the latest terminal output.");
+      } catch (err: unknown) {
+        const message = errorMessage(err);
+        setAgentSessionMessages((current) => {
+          const latest = current.at(-1);
+          const withoutWorking =
+            latest?.role === "assistant" && isWorkingAssistantMessage(latest.content) ? current.slice(0, -1) : current;
+          return [...withoutWorking, { role: "assistant", content: `I understood this as fresh terminal output, but could not diagnose it yet:\n\n${message}` }];
+        });
+        setAgentStatus(`Could not diagnose terminal output: ${message}`);
+      } finally {
+        setAgentSessionFreshUploads([]);
+        setAgentLoading(false);
+        setPendingQuestion("");
+        setPendingUploads([]);
+      }
+
+      return true;
+    }
+
+    if (asksToRunReferencedCommands(prompt)) {
+      showImmediateWorkingTurn("Running the referenced project checks through the local agent...");
+      setAgentStatus("Running supported project validation/checks through the local agent...");
+
+      try {
+        if (!connectedProjectPath) {
+          throw new Error("No project folder is connected to this Agent session.");
+        }
+
+        await ensureLocalAgentRoot(connectedProjectPath);
+        const fileList = await loadFileList();
+        const fileCount = fileList.split(/\r?\n/).filter(Boolean).length;
+        const sandboxSummary = await runPostApplySandboxChecks();
+        const inferredCommand =
+          previousAssistantForIntent.match(/(?:^|\n)\s*((?:"[^"]*gradlew(?:\.bat)?[^"]*"|\.\/gradlew|gradlew(?:\.bat)?|npm|pnpm|yarn|mvn|dotnet|cargo|pytest|go test)[^\n]*)/i)?.[1]?.trim() ||
+          previousAssistantForIntent.match(/\b((?:gradlew(?:\.bat)?|\.\/gradlew)[^\n]*)/i)?.[1]?.trim() ||
+          "the previous validation/build checks";
+
+        const answer = `COMMAND CHECK RUN
+
+I treated your message as a request to run/check the previous commands, not as uploaded evidence.
+
+Connected project:
+\`${connectedProjectPath}\`
+
+Project inventory:
+- Loaded ${fileCount || 0} project file(s) from the local agent.
+
+Referenced command/check:
+\`${inferredCommand}\`
+
+What PayFix ran:
+- Supported connected-project validation/build/test checks through the local agent.
+
+Result:
+${sandboxSummary}
+
+Note:
+- PayFix can run supported project validation through the local agent.
+- Admin/system certificate commands such as writing to a JBR/JDK truststore may still require your approval, a certificate file, or an elevated prompt.`;
+
+        setAgentSessionMessages((current) => {
+          const latest = current.at(-1);
+          const withoutWorking =
+            latest?.role === "assistant" && isWorkingAssistantMessage(latest.content) ? current.slice(0, -1) : current;
+          return [...withoutWorking, { role: "assistant", content: answer }];
+        });
+        setAgentStatus("Ran the referenced project checks through the local agent.");
+      } catch (err: unknown) {
+        const message = errorMessage(err);
+        const answer = `COMMAND CHECK NOT RUN
+
+I understood your request as: run/check the commands from the previous answer.
+
+PayFix could not run them yet:
+${message}
+
+What to do:
+1. Confirm the project folder is connected in this Agent workspace.
+2. Restart payfix-agent if the project is connected but file loading still fails.
+3. Send the same request again.
+
+I did not treat the attachment as a log comparison.`;
+
+        setAgentSessionMessages((current) => {
+          const latest = current.at(-1);
+          const withoutWorking =
+            latest?.role === "assistant" && isWorkingAssistantMessage(latest.content) ? current.slice(0, -1) : current;
+          return [...withoutWorking, { role: "assistant", content: answer }];
+        });
+        setAgentStatus(`Could not run referenced checks: ${message}`);
+      } finally {
+        setAgentSessionFreshUploads([]);
+        setAgentLoading(false);
+        setPendingQuestion("");
+        setPendingUploads([]);
+      }
+
+      return true;
+    }
+
+    if (asksGradleTrustCheck(prompt)) {
+      showImmediateWorkingTurn("Running the Gradle/JDK trust check through the connected project...");
+      setAgentStatus("Running local validation to confirm whether the Gradle/JDK certificate blocker is still present...");
+
+      try {
+        const answer = await gradleTrustCheckMessage();
+        setAgentSessionMessages((current) => {
+          const latest = current.at(-1);
+          const withoutWorking =
+            latest?.role === "assistant" && isWorkingAssistantMessage(latest.content) ? current.slice(0, -1) : current;
+          return [...withoutWorking, { role: "assistant", content: answer }];
+        });
+        setAgentStatus("Trust check finished.");
+      } catch (err: unknown) {
+        const message = errorMessage(err);
+        setAgentSessionMessages((current) => {
+          const latest = current.at(-1);
+          const withoutWorking =
+            latest?.role === "assistant" && isWorkingAssistantMessage(latest.content) ? current.slice(0, -1) : current;
+          return [
+            ...withoutWorking,
+            {
+              role: "assistant",
+              content: `TRUST CHECK NOT RUN
+
+I understood this as a Gradle/JDK trust-check request, but PayFix could not complete the local check.
+
+Reason:
+${message}
+
+Next:
+A. Reconnect the project folder and run the trust check again.
+B. Restart payfix-agent if the project is connected but local checks fail to start.
+C. Paste the latest Gradle output if local validation is unavailable.`,
+            },
+          ];
+        });
+        setAgentStatus(`Trust check failed: ${message}`);
+      } finally {
+        setAgentSessionFreshUploads([]);
+        setAgentLoading(false);
+        setPendingQuestion("");
+        setPendingUploads([]);
+      }
+
+      return true;
+    }
+
+    if (isMavenLocalFallbackRequest(prompt)) {
+      showImmediateWorkingTurn("Checking the connected project and local artifacts for a Maven/offline fallback...");
+      setAgentStatus("Inspecting missing Maven coordinates and available local artifact files...");
+
+      try {
+        const answer = await mavenLocalFallbackMessage(prompt, previousAssistantForIntent);
+        setAgentSessionMessages((current) => {
+          const latest = current.at(-1);
+          const withoutWorking =
+            latest?.role === "assistant" && isWorkingAssistantMessage(latest.content) ? current.slice(0, -1) : current;
+          return [...withoutWorking, { role: "assistant", content: answer }];
+        });
+        setAgentStatus("Prepared the Maven/local artifact fallback check.");
+      } catch (err: unknown) {
+        const message = errorMessage(err);
+        setAgentSessionMessages((current) => {
+          const latest = current.at(-1);
+          const withoutWorking =
+            latest?.role === "assistant" && isWorkingAssistantMessage(latest.content) ? current.slice(0, -1) : current;
+          return [
+            ...withoutWorking,
+            {
+              role: "assistant",
+              content: `MAVEN LOCAL FALLBACK CHECK FAILED
+
+I understood this as a Maven/local artifact fallback request, but PayFix could not inspect enough local state yet.
+
+Reason:
+${message}
+
+Next:
+A. Reconnect the project folder and run Prepare offline fallback again.
+B. Attach/select the local artifact folder that contains .pom/.jar/.aar files.
+C. Use the certificate trust fix instead if you have the corporate/root CA file.`,
+            },
+          ];
+        });
+        setAgentStatus(`Could not prepare Maven/local fallback: ${message}`);
+      } finally {
+        setAgentSessionFreshUploads([]);
+        setAgentLoading(false);
+        setPendingQuestion("");
+        setPendingUploads([]);
+      }
+
+      return true;
+    }
+
+    if (followUpIntent.route === "screenshot-review") {
+      const screenshotFiles = submittedUploadedFiles.filter((file) => file.isImage);
+      showImmediateWorkingTurn("Looking at your screenshot in context...");
+      setAgentStatus("Reading the screenshot against your latest question and recent Agent context...");
+
+      try {
+        const previousContext = formatRecentAgentContext(intentContextMessages, 10, 1400);
+        const response = await fetchAgentWithTimeout("/api/agent", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            question: `The user attached screenshot evidence for the latest follow-up.
+Current user note: "${prompt}"
+
+Use the screenshots as the current evidence and answer the user's latest question in the context of the recent Agent conversation below.
+Do not compare logs. Do not inspect source files. Do not prepare a patch. Do not say no screenshot was provided.
+Do not write a generic "Evidence review". Talk to the user directly.
+For each screenshot:
+- say what setting/page it appears to show
+- say what it proves or does not prove for the user's latest question
+- say the exact next step, without repeating checks the screenshot/output already proves
+If the screenshots show Android Studio HTTP Proxy or Gradle JDK settings, tell the user whether each setting looks correct for the previous Gradle SSL/PKIX/Maven Central issue.
+If the screenshot is about a command producing no output, focus on why that command may be silent and what one diagnostic command should be run next.
+
+RECENT AGENT CONTEXT:
+${previousContext}`,
+            history: previousContext,
+            memory: "",
+            log: "",
+            code: "",
+            computerSearchResults: "",
+            sdkInspectionContext: "",
+            uploadedFiles: screenshotFiles,
+            projectFileList: "",
+            preferredFiles: [],
+            forceImageAnswer: true,
+          }),
+        });
+        const data: AgentApiResponse = await response.json();
+        if (!data.ok) throw new Error(data.error || "Could not analyze the screenshots.");
+        setAgentSessionMessages((current) => {
+          const latest = current.at(-1);
+          const withoutWorking =
+            latest?.role === "assistant" && isWorkingAssistantMessage(latest.content) ? current.slice(0, -1) : current;
+          return [...withoutWorking, { role: "assistant", content: data.markdown || "I could not read the screenshots clearly enough to answer." }];
+        });
+        setAgentStatus("Answered the screenshot follow-up.");
+        setAgentSessionFreshUploads([]);
+      } catch (err: unknown) {
+        const message = errorMessage(err);
+        setAgentSessionMessages((current) => {
+          const latest = current.at(-1);
+          const withoutWorking =
+            latest?.role === "assistant" && isWorkingAssistantMessage(latest.content) ? current.slice(0, -1) : current;
+          return [...withoutWorking, { role: "assistant", content: `Could not analyze those screenshots yet:\n\n${message}` }];
+        });
+        setAgentStatus(`Could not analyze screenshot follow-up: ${message}`);
+      } finally {
+        setAgentLoading(false);
+        setPendingQuestion("");
+        setPendingUploads([]);
+      }
+
+      return true;
+    }
+
+    if (followUpIntent.route === "focused-follow-up") {
+      showImmediateWorkingTurn("Answering your focused follow-up from the current Agent context...");
+      setAgentStatus("Answering the current focused question without replaying the whole project checklist...");
+
+      try {
+        const focusedImageUploads = submittedUploadedFiles.filter((file) => file.isImage);
+        const backgroundTextUploads = submittedUploadedFiles
+          .filter((file) => !file.isImage && file.content.trim())
+          .slice(0, 4)
+          .map((file) => `--- ${file.name} ---\n${file.content.slice(0, 2200)}`)
+          .join("\n\n");
+        const previousContext = formatRecentAgentContext(intentContextMessages, 12, 1800);
+        const selectedOption = selectedPreviousOption(prompt, previousAssistantForIntent);
+        const focusedQuestion = selectedOption
+          ? `The user replied "${prompt}" to select a labeled option from the previous answer.
+
+SELECTED OPTION:
+${selectedOption.letter}. ${selectedOption.option}
+
+Answer/action ONLY this selected option. Do not reinterpret ${selectedOption.letter} using older context. Do not switch to another option.`
+          : `Answer the user's focused follow-up question directly.
+Current user question: "${prompt}"`;
+        const response = await fetchAgentWithTimeout("/api/agent", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            question: `${focusedQuestion}
+
+Use the recent Agent context and attached evidence below. Do not replay the full project next-step checklist unless the user explicitly asks for next steps.
+If image evidence is attached, use the screenshot as the source of truth. Do not claim a field, dropdown, or menu is visible unless it is actually visible in the screenshot.
+If the user asks "where exactly" or "what do I click" and the expected control is not visible, say "I do not see that control in this screenshot" and give the best visible alternative or the exact next screenshot needed.
+If the user asks for a bypass, workaround, or temporary way around the current error, answer that workaround question only. Explain what can be bypassed, what cannot, the safest temporary option, and how to verify it.
+If the user asks PayFix to do a Maven/Gradle local-artifact workaround, do not just give manual commands. Say whether PayFix can patch repository order now, whether artifact files/folders are needed, and offer the exact next Agent action.
+If the user asks PayFix to run/check/confirm previously mentioned commands but there is no connected project available in RECENT AGENT CONTEXT, do not analyze uploads/logs. Say that PayFix needs the project folder connected before it can run commands, name the command you believe they mean from context if visible, and tell them the exact one-step action to connect/reopen the project.
+If the user replies with only a label such as A, B, C, "option A", etc., interpret it as selecting the matching labeled choice from the recent Agent context. State which exact option text was selected, then continue that answer/action. Do not reinterpret the label from older context.
+If the user asks about a specific field, option, button, setting, screen, message, or UI element:
+- name the thing you think they mean
+- answer what it is, why it appears, or exactly what value/action belongs there
+- say when to leave it blank, choose auto/default, or avoid touching it
+- keep it short and concrete
+If you offer optional next actions, do not write "If you want, I can". Only offer choices when useful. Use as many labeled choices as the situation needs:
+Choose one:
+A. <specific action>
+B. <specific action>
+C. <specific action, if needed>
+Never end with a dangling unfinished "if", "or", "and", or partial bullet.
+
+BACKGROUND TEXT ATTACHMENTS, IF ANY:
+${backgroundTextUploads || "No text attachment is needed for this focused follow-up."}
+
+RECENT AGENT CONTEXT:
+${previousContext}`,
+            history: previousContext,
+            memory: "",
+            log: "",
+            code: "",
+            computerSearchResults: "",
+            sdkInspectionContext: "",
+            uploadedFiles: focusedImageUploads,
+            projectFileList: "",
+            preferredFiles: [],
+            forceImageAnswer: focusedImageUploads.length > 0,
+            forceFocusedAnswer: focusedImageUploads.length === 0,
+            selectedOption: selectedOption || null,
+          }),
+        });
+        const data: AgentApiResponse = await response.json();
+        if (!data.ok) throw new Error(data.error || "Could not answer that follow-up.");
+        setAgentSessionMessages((current) => {
+          const latest = current.at(-1);
+          const withoutWorking =
+            latest?.role === "assistant" && isWorkingAssistantMessage(latest.content) ? current.slice(0, -1) : current;
+          return [...withoutWorking, { role: "assistant", content: data.markdown || "I could not answer that focused question clearly yet." }];
+        });
+        setAgentStatus("Answered the focused follow-up.");
+        setAgentSessionFreshUploads([]);
+      } catch (err: unknown) {
+        const message = errorMessage(err);
+        setAgentSessionMessages((current) => {
+          const latest = current.at(-1);
+          const withoutWorking =
+            latest?.role === "assistant" && isWorkingAssistantMessage(latest.content) ? current.slice(0, -1) : current;
+          return [...withoutWorking, { role: "assistant", content: `Could not answer that focused question yet:\n\n${message}` }];
+        });
+        setAgentStatus(`Could not answer focused follow-up: ${message}`);
+      } finally {
+        setAgentLoading(false);
+        setPendingQuestion("");
+        setPendingUploads([]);
+      }
+
+      return true;
+    }
+
+    if (followUpIntent.route === "build-error") {
+      showImmediateWorkingTurn("Checking the current build error, running validation, and preparing the next safe fix...");
+      setAgentStatus("Running project validation first, then PayFix will patch the exact Android files.");
+
+      try {
+        const fixedKnownGradleIssue = await fixKnownGradleFoojayFailure(prompt);
+        if (fixedKnownGradleIssue) {
+          setAgentSessionFreshUploads([]);
+          return true;
+        }
+
+        const sslNetworkAnswer = gradleSslNetworkAnswer(prompt);
+        if (sslNetworkAnswer) {
+          setAgentSessionMessages((current) => {
+            const latest = current.at(-1);
+            const withoutWorking =
+              latest?.role === "assistant" && isWorkingAssistantMessage(latest.content) ? current.slice(0, -1) : current;
+            return [...withoutWorking, { role: "assistant", content: sslNetworkAnswer }];
+          });
+          setAgentStatus("Identified Gradle SSL/Maven network blocker.");
+          setAgentSessionFreshUploads([]);
+          return true;
+        }
+
+        const sandboxSummary = await runPostApplySandboxChecks();
+        if (shouldReturnEnvironmentBlockerInsteadOfPatch(prompt, sandboxSummary)) {
+          setAgentSessionMessages((current) => {
+            const latest = current.at(-1);
+            const withoutWorking =
+              latest?.role === "assistant" && isWorkingAssistantMessage(latest.content) ? current.slice(0, -1) : current;
+            return [...withoutWorking, { role: "assistant", content: gradleEnvironmentBlockerMessage(prompt, sandboxSummary) }];
+          });
+          setAgentStatus("Gradle validation is blocked by Java certificate trust, not app source code.");
+          setAgentSessionFreshUploads([]);
+          return true;
+        }
+        await runAgentPromptInSession({
+          userContent: prompt,
+          submittedLog: "",
+          submittedCode: "",
+          submittedUploadedFiles,
+          submittedComputerSearchResults: `PAX ANDROID FOLLOW-UP VALIDATION OUTPUT:
+${sandboxSummary}
+
+The user is continuing after PayFix generated a PAX Android app. Treat this as a real build-fix request, not a fresh evidence investigation. Use the validation output, the connected project, and the generated app context to patch exact files. If the user pasted an Android Studio/Gradle/runtime error, prioritize that error. End with exactly what changed and exactly what to do next in Android Studio.`,
+          resetSession: false,
+          reuseCurrentSessionTurn: true,
+        });
+        setAgentSessionFreshUploads([]);
+      } catch (err: unknown) {
+        const message = errorMessage(err);
+        setAgentSessionMessages((current) => [
+          ...current,
+          {
+            role: "assistant",
+            content: `Could not continue the PAX Android fix yet:\n\n${message}\n\nPaste the first Android Studio/Gradle error block or screenshot and PayFix will patch from that evidence.`,
+          },
+        ]);
+        setAgentStatus(`Could not continue PAX Android fix: ${message}`);
+      } finally {
+        setAgentLoading(false);
+        setPendingQuestion("");
+        setPendingUploads([]);
+      }
+
+      return true;
+    }
+
+    if (followUpIntent.route === "project-error") {
+      showImmediateWorkingTurn("Checking the connected project error and looking for the exact file/config to fix...");
+      setAgentStatus("Checking the connected project for IDE/build errors before preparing a fix...");
+
+      try {
+        const fixedKnownGradleIssue = await fixKnownGradleFoojayFailure(prompt);
+        if (fixedKnownGradleIssue) {
+          setAgentSessionFreshUploads([]);
+          return true;
+        }
+
+        const sslNetworkAnswer = gradleSslNetworkAnswer(prompt);
+        if (sslNetworkAnswer) {
+          setAgentSessionMessages((current) => {
+            const latest = current.at(-1);
+            const withoutWorking =
+              latest?.role === "assistant" && isWorkingAssistantMessage(latest.content) ? current.slice(0, -1) : current;
+            return [...withoutWorking, { role: "assistant", content: sslNetworkAnswer }];
+          });
+          setAgentStatus("Identified Gradle SSL/Maven network blocker.");
+          setAgentSessionFreshUploads([]);
+          return true;
+        }
+
+        const sandboxSummary = await runPostApplySandboxChecks();
+        if (shouldReturnEnvironmentBlockerInsteadOfPatch(prompt, sandboxSummary)) {
+          setAgentSessionMessages((current) => {
+            const latest = current.at(-1);
+            const withoutWorking =
+              latest?.role === "assistant" && isWorkingAssistantMessage(latest.content) ? current.slice(0, -1) : current;
+            return [...withoutWorking, { role: "assistant", content: gradleEnvironmentBlockerMessage(prompt, sandboxSummary) }];
+          });
+          setAgentStatus("Project validation is blocked by Java certificate trust, not source code.");
+          setAgentSessionFreshUploads([]);
+          return true;
+        }
+        await runAgentPromptInSession({
+          userContent: prompt,
+          submittedLog: "",
+          submittedCode: "",
+          submittedUploadedFiles,
+          submittedComputerSearchResults: `PROJECT ERROR FOLLOW-UP VALIDATION OUTPUT:
+${sandboxSummary}
+
+The user is asking PayFix to find or fix an IDE/build/runtime error in the connected project. Treat screenshots, pasted error text, and this validation output as active evidence. This can be any IDE or platform: VS Code, Visual Studio, Android Studio, IntelliJ/Rider, Eclipse, Xcode, Gradle, npm, .NET, Python, Java, Kotlin, Rust, Go, PHP, Ruby, Flutter, or another folder-based project.
+
+Required behavior:
+- Identify the exact failing tool/command and exact likely file(s).
+- If safe, prepare a patch instead of only explaining.
+- If not safe, name the exact missing evidence or missing tool.
+- After the fix, give exact next steps in the relevant IDE/build tool.`,
+          resetSession: false,
+          reuseCurrentSessionTurn: true,
+        });
+        setAgentSessionFreshUploads([]);
+      } catch (err: unknown) {
+        const message = errorMessage(err);
+        setAgentSessionMessages((current) => [
+          ...current,
+          {
+            role: "assistant",
+            content: `Could not run the project error loop yet:\n\n${message}\n\nPaste the first IDE/build error block or attach a screenshot, and PayFix will inspect the connected project and patch from that evidence.`,
+          },
+        ]);
+        setAgentStatus(`Could not run project error loop: ${message}`);
+      } finally {
+        setAgentLoading(false);
+        setPendingQuestion("");
+        setPendingUploads([]);
+      }
+
+      return true;
+    }
+
+    if (isPaxAndroidBuiltSession() && followUpIntent.route === "exact-next-steps") {
+      const userMessage: ChatMessage = {
+        role: "user",
+        content: prompt,
+        attachedUploads: submittedUploadedFiles,
+      };
+      const buildReport = latestPaxAndroidBuildReport();
+      let latestValidation = "";
+      let liveSdkArtifacts: string[] = [];
+      if (connectedProjectPath) {
+        setAgentStatus("Checking the current project state before giving next steps...");
+        latestValidation = await runPostApplySandboxChecks();
+        const fileList = await loadFileList();
+        liveSdkArtifacts = sdkArtifactsFromProjectFileList(fileList);
+      }
+      setAgentSessionMessages((current) => [
+        ...current,
+        userMessage,
+        {
+          role: "assistant",
+          content: paxAndroidExactNextStepsMessage(buildReport, {
+            latestValidation,
+            userSaysNoErrors: userSaysErrorsAreGone(prompt),
+            liveSdkArtifacts,
+          }),
+        },
+      ]);
+      setAgentStatus("Explained the exact Android Studio next steps for this generated PAX app.");
+      setAgentLoading(false);
+      setPendingQuestion("");
+      setPendingUploads([]);
+      return true;
+    }
+
+    if (connectedProjectPath && followUpIntent.route === "exact-next-steps") {
+      setAgentStatus("Preparing exact project-specific next steps from the connected project context...");
+
+      try {
+        await runAgentPromptInSession({
+          userContent: prompt,
+          submittedLog: "",
+          submittedCode: "",
+          submittedUploadedFiles,
+          submittedComputerSearchResults: `EXACT NEXT STEPS FOLLOW-UP:
+The user is asking what to do next after the current Agent/project work. Continue from the current conversation and connected project.
+
+Required behavior:
+- Give concrete IDE/build-tool steps, not vague advice.
+- Include exact menu paths when the IDE is known from the project or user message.
+- Include exact files/folders to open.
+- Include expected result after each major step.
+- Include what error/screenshot/output to send back if a step fails.
+- If a validation/build error is present in recent conversation, prioritize fixing that blocker first.`,
+          resetSession: false,
+        });
+        setAgentSessionFreshUploads([]);
+      } catch (err: unknown) {
+        const message = errorMessage(err);
+        setAgentSessionMessages((current) => [
+          ...current,
+          {
+            role: "assistant",
+            content: `Could not prepare exact next steps yet:\n\n${message}\n\nReconnect the project or paste the latest IDE/build screen, then ask again.`,
+          },
+        ]);
+        setAgentStatus(`Could not prepare exact next steps: ${message}`);
+      } finally {
+        setAgentLoading(false);
+        setPendingQuestion("");
+        setPendingUploads([]);
+      }
+
+      return true;
+    }
+
+    if (isProjectBuilderSession && asksToDeleteGeneratedProject(prompt)) {
+      const userMessage: ChatMessage = {
+        role: "user",
+        content: prompt,
+        attachedUploads: submittedUploadedFiles,
+      };
+      setAgentSessionMessages((current) => [
+        ...current,
+        userMessage,
+        { role: "assistant", content: "Deleting the generated project folder PayFix created in this builder session..." },
+      ]);
+      setAgentStatus("Deleting the generated project folder...");
+
+      try {
+        const targetPath = latestGeneratedProjectPath(agentSessionMessages);
+        if (!targetPath) {
+          throw new Error("I could not find the generated project path in this builder session.");
+        }
+
+        const response = await fetch("/api/create-project", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            action: "deleteGeneratedProject",
+            targetPath,
+            allowLegacyPayfixProject: true,
+          }),
+        });
+        const data = (await response.json()) as CreateProjectResponse;
+        if (!response.ok || !data.ok) {
+          throw new Error(data.error || "Could not delete the generated project.");
+        }
+
+        if (connectedProjectPath && connectedProjectPath.toLowerCase() === targetPath.toLowerCase()) {
+          setConnectedProjectPath("");
+          setProjectPath("");
+          setProjectContext("");
+          setLoadedProjectFiles([]);
+          setProjectMatches([]);
+          setProjectMemory(null);
+          setProjectMap(null);
+        }
+
+        setAgentSessionMessages((current) => [
+          ...current.filter((message) => message.content !== "Deleting the generated project folder PayFix created in this builder session..."),
+          {
+            role: "assistant",
+            content: data.markdown || `GENERATED PROJECT DELETED\n\nDeleted folder:\n${targetPath}`,
+          },
+        ]);
+        setAgentStatus("Generated project folder deleted.");
+      } catch (err: unknown) {
+        const message = errorMessage(err);
+        setAgentSessionMessages((current) => [
+          ...current.filter((item) => item.content !== "Deleting the generated project folder PayFix created in this builder session..."),
+          { role: "assistant", content: `Could not delete the generated project: ${message}` },
+        ]);
+        setAgentStatus(`Could not delete generated project: ${message}`);
+      } finally {
+        setAgentLoading(false);
+        setPendingQuestion("");
+        setPendingUploads([]);
+      }
+
+      return true;
+    }
+
+    if (isProjectBuilderSession && asksToAddMissingJs(prompt)) {
+      const userMessage: ChatMessage = {
+        role: "user",
+        content: prompt,
+        attachedUploads: submittedUploadedFiles,
+      };
+      setAgentSessionMessages((current) => [
+        ...current,
+        userMessage,
+        { role: "assistant", content: "Adding the missing static JavaScript file to the generated project..." },
+      ]);
+      setAgentStatus("Adding app.js to the generated static project...");
+
+      try {
+        const targetPath = latestGeneratedProjectPath(agentSessionMessages);
+        if (!targetPath) {
+          throw new Error("I could not find the generated project path in this builder session.");
+        }
+
+        const response = await fetch("/api/create-project", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            action: "ensureStaticJs",
+            targetPath,
+            sourceMessage: currentProjectCreationBrief(agentSessionMessages),
+          }),
+        });
+        const data = (await response.json()) as CreateProjectResponse;
+        if (!response.ok || !data.ok) {
+          throw new Error(data.error || "Could not add app.js.");
+        }
+
+        setAgentSessionMessages((current) => [
+          ...current.filter((message) => message.content !== "Adding the missing static JavaScript file to the generated project..."),
+          {
+            role: "assistant",
+            content: data.markdown || `STATIC JS ADDED\n\nPath:\n${targetPath}\n\nFiles updated:\n- app.js\n- index.html`,
+          },
+        ]);
+        setAgentStatus("Added app.js to the generated static project.");
+      } catch (err: unknown) {
+        const message = errorMessage(err);
+        setAgentSessionMessages((current) => [
+          ...current.filter((item) => item.content !== "Adding the missing static JavaScript file to the generated project..."),
+          { role: "assistant", content: `Could not add the missing JavaScript file: ${message}` },
+        ]);
+        setAgentStatus(`Could not add app.js: ${message}`);
+      } finally {
+        setAgentLoading(false);
+        setPendingQuestion("");
+        setPendingUploads([]);
+      }
+
+      return true;
+    }
+
+    if (isRegularChatOnlyAgentRequest(prompt, submittedUploadedFiles, { previousAssistant: previousAssistantForIntent })) {
+      const redirectMessage = regularChatRedirectMessage(prompt, submittedUploadedFiles);
+      setAgentSessionMessages((current) => [...current, { role: "assistant", content: redirectMessage }]);
+      setAgentStatus("This belongs in Regular Chat. Agent mode is reserved for project work, patches, validation, installs, and generated apps.");
+      setAgentLoading(false);
+      return false;
+    }
+
+    setPendingQuestion(prompt);
+    setPendingUploads(submittedUploadedFiles);
+    showImmediateWorkingTurn(agentWorkingMessageForPrompt(prompt, Boolean(connectedProjectPath)));
     setAgentStatus(agentWorkingMessageForPrompt(prompt, Boolean(connectedProjectPath)));
 
     try {
@@ -3511,15 +8151,158 @@ ${submittedComputerSearchResults}`,
         userContent: prompt,
         submittedLog: "",
         submittedCode: "",
-        submittedUploadedFiles: agentSessionUploads,
+        submittedUploadedFiles,
         submittedComputerSearchResults: "",
         resetSession: false,
+        reuseCurrentSessionTurn: true,
+      });
+      setAgentSessionFreshUploads([]);
+    } catch {
+      // runAgentPromptInSession already updates the visible Agent session.
+    } finally {
+      setAgentLoading(false);
+      setPendingQuestion("");
+      setPendingUploads([]);
+    }
+
+    return true;
+  }
+
+  async function sendAgentRedirectToRegularChat(prompt: string) {
+    const submittedUploadedFiles = activeAgentSessionUploadsForRun(prompt);
+    setAgentSessionOpen(false);
+    setAgentStatus("Sending redirected Agent question to Regular Chat...");
+
+    await analyze({
+      overrideQuestion: prompt,
+      overrideUploads: submittedUploadedFiles,
+    });
+  }
+
+  function agentPromptNeedsProjectBeforeRun(prompt: string) {
+    return /\b(create|build|generate)\b[\s\S]{0,80}\b(full runnable project|full project|project from the previous build guide|folder\/files|folder and files)\b/i.test(
+      prompt,
+    );
+  }
+
+  async function startAgentFromActionPrompt(prompt: string) {
+    setAgentSessionOpen(true);
+    setAgentSessionMessages([]);
+    setAgentSessionUploads([]);
+    setAgentSessionFreshUploads([]);
+    setRecentAgentFiles([]);
+    setLastVerifiedAgentPatch(null);
+    setDependencyProposal(null);
+
+    if (agentPromptNeedsProjectBeforeRun(prompt)) {
+      setAgentSessionInitialDraft(prompt);
+      setAgentSessionSetupRevision((value) => value + 1);
+      setAgentLoading(false);
+      setAgentStatus(
+        connectedProjectPath
+          ? "Confirm the project and SDK folders, then click Continue Investigation."
+          : "Connect a project folder first, then click Continue Investigation.",
+      );
+      setAgentSessionMessages([
+        {
+          role: "assistant",
+          content:
+            "Project and SDK setup required before Agent builds files.\n\nConfirm the project/root folder, add any extracted SDK or local artifact folders, choose the IDE/build target if needed, then click Continue Investigation. PayFix works with VS Code, Visual Studio, Android Studio, IntelliJ/Rider, Eclipse, Xcode exports, and plain repo folders.",
+        },
+      ]);
+      return;
+    }
+
+    setAgentSessionInitialDraft("");
+    setAgentLoading(true);
+    setAgentStatus(agentWorkingMessageForPrompt(prompt, Boolean(connectedProjectPath)));
+
+    try {
+      await runAgentPromptInSession({
+        userContent: prompt,
+        submittedLog: log,
+        submittedCode: code,
+        submittedUploadedFiles: mergePersistentEvidenceUploads(uploadedFiles),
+        submittedComputerSearchResults: computerSearchResults,
+        resetSession: true,
       });
     } catch {
       // runAgentPromptInSession already updates the visible Agent session.
     } finally {
       setAgentLoading(false);
     }
+  }
+
+  function startAgentFromGeneratedFile(file: GeneratedFile, sourceMessage: string) {
+    const designUpload: UploadedFile = {
+      name: file.name,
+      type: file.type,
+      size: file.size,
+      content: file.content,
+      isImage: /^image\//i.test(file.type),
+    };
+    const setupPrompt = `PROJECT CREATION BRIEF:
+The user wants to turn this generated visual plan/sketch into a real app/program from scratch.
+
+Generated file: ${file.name}
+
+Source assistant context:
+${sourceMessage.slice(0, 2500)}
+
+When the user replies, ask for or confirm:
+- target parent path
+- new folder name
+- app type/stack if ambiguous
+
+Then create the folder, files, and runnable program in that location. Prefer the connected project path as the parent if it is available and the user agrees.`;
+
+    setAgentSessionOpen(true);
+    setAgentSessionUploads([designUpload]);
+    setAgentSessionFreshUploads([designUpload]);
+    setAgentSessionMessages([
+      {
+        role: "user",
+        content: setupPrompt,
+        attachedUploads: [designUpload],
+      },
+      {
+        role: "assistant",
+        content:
+          "I can turn this sketch into a real project. Send the target parent path and folder name, plus any preferred stack. Example: `C:\\Users\\mekstein\\source\\repos`, folder `checkout-map-demo`, Next.js app`.",
+      },
+    ]);
+    setRecentAgentFiles([]);
+    setLastVerifiedAgentPatch(null);
+    setDependencyProposal(null);
+    setAgentStatus("Agent workspace opened. Provide the target path and folder name to generate the project.");
+  }
+
+  function editAgentSessionMessage(messageIndex: number) {
+    const message = agentSessionMessages[messageIndex];
+    if (!message || message.role !== "user") return;
+
+    setAgentSessionEditSnapshot({
+      messages: agentSessionMessages,
+      uploads: agentSessionUploads,
+      status: agentStatus,
+    });
+    setAgentSessionMessages(agentSessionMessages.slice(0, messageIndex));
+    setAgentSessionUploads(dedupeUploadedFiles(message.attachedUploads || []));
+    setAgentSessionFreshUploads(dedupeUploadedFiles(message.attachedUploads || []));
+    setAgentLoading(false);
+    resetApplyModal();
+    setAppliedPatchNotice(null);
+    setAgentStatus("Editing Agent message. The later investigation responses were cleared.");
+  }
+
+  function cancelAgentSessionEdit() {
+    if (!agentSessionEditSnapshot) return;
+
+    setAgentSessionMessages(agentSessionEditSnapshot.messages);
+    setAgentSessionUploads(agentSessionEditSnapshot.uploads);
+    setAgentSessionFreshUploads([]);
+    setAgentStatus(agentSessionEditSnapshot.status || "Agent edit canceled.");
+    setAgentSessionEditSnapshot(null);
   }
 
   async function runApplyAgentFollowUp(prompt: string) {
@@ -3554,13 +8337,34 @@ ${prompt}`;
     setMessages([...baseMessages, { role: "assistant", content: agentWorkingMessageForPrompt(prompt, true) }]);
 
     try {
+      const disconnectRequested = isProjectDisconnectRequest(prompt);
+      if (isProjectFolderDeleteRequest(prompt) || disconnectRequested) {
+        if (!disconnectRequested) await ensureLocalAgentRoot(connectedProjectPath);
+        const cleanupMessage = await handleEmptyProjectFolderDeleteRequest(prompt);
+        const finalMessages = [...baseMessages, { role: "assistant" as const, content: cleanupMessage }];
+        setMessages(finalMessages);
+        saveActiveChat(finalMessages);
+        setAgentStatus(
+          /^PROJECT FOLDER DELETED/i.test(cleanupMessage)
+            ? "Deleted the empty connected project folder."
+            : /^PROJECT FOLDER NOT EMPTY/i.test(cleanupMessage)
+              ? "Folder still contains files. Choose what to delete next."
+              : /^PROJECT FOLDER BUSY/i.test(cleanupMessage)
+                ? "Folder is busy or locked. Choose retry, force delete, or disconnect."
+                : /^PROJECT DISCONNECTED/i.test(cleanupMessage)
+                  ? "Disconnected the project from PayFix."
+                  : "The project folder is empty. Use the delete-folder action if you want it removed.",
+        );
+        return;
+      }
+
       await ensureLocalAgentRoot(connectedProjectPath);
       const projectFileList = await loadFileList();
       if (!projectFileList.trim()) {
         throw new Error("Could not load the project file list from the local agent.");
       }
 
-      const response = await fetch("/api/agent", {
+      const response = await fetchAgentWithTimeout("/api/agent", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -3599,13 +8403,14 @@ ${prompt}`;
             : "Patch investigation follow-up complete. See the response for details.",
       );
     } catch (err: unknown) {
+      const message = agentRunErrorMessage(err);
       const finalMessages: ChatMessage[] = [
         ...baseMessages,
-        { role: "assistant", content: `Patch investigation follow-up failed: ${errorMessage(err)}` },
+        { role: "assistant", content: `Patch investigation follow-up failed: ${message}` },
       ];
       setMessages(finalMessages);
       saveActiveChat(finalMessages);
-      setAgentStatus(`Patch investigation follow-up failed: ${errorMessage(err)}`);
+      setAgentStatus(`Patch investigation follow-up failed: ${message}`);
     } finally {
       setApplyAgentFollowUpLoading(false);
     }
@@ -3627,7 +8432,7 @@ ${prompt}`;
       ? `\n\nNEXT STEPS\n${timeline.recommendedNextSteps.slice(0, 4).map((step) => `- ${step}`).join("\n")}`
       : "";
 
-    return `${emvOnly ? "EMV/TLV TROUBLESHOOTING OPENED" : "PAYMENT TIMELINE OPENED"}
+    return `${emvOnly ? "EMV/TLV TROUBLESHOOTING OPENED" : "PAYMENT TRACE OPENED"}
 
 ${timeline.summary}${rootCause}${findings}${nextSteps}`;
   }
@@ -3648,16 +8453,16 @@ ${timeline.summary}${rootCause}${findings}${nextSteps}`;
       setCode("");
       setUploadedFiles([]);
     }
-    setAgentStatus("Building payment trace timeline...");
+    setAgentStatus("Building Payment Trace: device read, EMV/TLV, SDK event, app request, gateway response, final decision...");
 
     const userContent =
       submittedQuestion.trim() ||
-      (submittedLog.trim() ? "Build a payment trace timeline from this payment log / error." : "") ||
-      (submittedCode.trim() ? "Build a payment trace timeline from this code." : "") ||
-      (submittedUploadedFiles.length ? "Build a payment trace timeline from uploaded file(s)." : "") ||
-      (shouldUseSavedSearchContext ? "Build a payment trace timeline from attached computer search." : "") ||
-      (shouldUseProjectContext ? "Build a payment trace timeline from the connected project files." : "") ||
-      "Build a payment trace timeline from attached context.";
+      (submittedLog.trim() ? "Build a Payment Trace from this payment log / error." : "") ||
+      (submittedCode.trim() ? "Build a Payment Trace from this code." : "") ||
+      (submittedUploadedFiles.length ? "Build a Payment Trace from uploaded file(s)." : "") ||
+      (shouldUseSavedSearchContext ? "Build a Payment Trace from attached computer search." : "") ||
+      (shouldUseProjectContext ? "Build a Payment Trace from the connected project files." : "") ||
+      "Build a Payment Trace from attached context.";
 
     const projectQuery = submittedQuestion.trim() || userContent;
     let projectFilesForApi: ProjectFileContent[] = loadedProjectFiles;
@@ -3742,11 +8547,11 @@ ${shouldUseProjectContext ? fullProjectFiles || "No project file content was loa
       }
       setAgentStatus(
         data.emvOnly
-          ? "Timeline opened EMV/TLV troubleshooting for this device evidence."
-          : `Timeline built: ${data.timeline.events.length} event(s), ${data.timeline.anomalies.length} anomaly(s).`,
+          ? "Payment Trace opened EMV/TLV troubleshooting for this device evidence."
+          : `Payment Trace built: ${data.timeline.events.length} event(s), ${data.timeline.anomalies.length} anomaly(s).`,
       );
     } catch (err: unknown) {
-      setAgentStatus(`Timeline failed: ${errorMessage(err)}`);
+      setAgentStatus(`Payment Trace failed: ${errorMessage(err)}`);
     } finally {
       setTimelineLoading(false);
     }
@@ -3798,134 +8603,167 @@ ${shouldUseProjectContext ? fullProjectFiles || "No project file content was loa
   }
 
   return (
-    <main className="h-screen overflow-hidden bg-[#eef3f8] text-slate-950">
-      <div className="grid h-screen grid-cols-[1fr_190px]">
+    <main className="pf-shell h-screen overflow-hidden text-[var(--pf-text)]">
+      <div className="grid h-screen grid-cols-[288px_minmax(0,1fr)]">
+        <Sidebar
+          savedChats={savedChats}
+          onNewChat={newChat}
+          onOpenChat={openSavedChat}
+          onDeleteRequest={setChatToDelete}
+        />
+
         <section className="flex h-screen min-h-0 flex-col overflow-hidden">
-          <header className="relative z-[120] shrink-0 overflow-visible border-b border-slate-200/80 bg-white/95 px-6 py-3 shadow-sm backdrop-blur">
+          <header className="relative z-[120] shrink-0 overflow-visible border-b border-[var(--pf-border)] bg-[var(--pf-bg-elevated)]/80 px-5 py-2.5 backdrop-blur-xl">
             <div className="flex items-center justify-between gap-4">
-              <div>
-                <div className="flex items-center gap-3">
-                  <h2 className="text-xl font-bold tracking-tight">Debug Console</h2>
-                  <span className="rounded-full bg-blue-50 px-2.5 py-1 text-[11px] font-bold uppercase text-blue-600">
-                    Workspace
-                  </span>
+              <div className="min-w-0">
+                <div className="flex flex-wrap items-center gap-2">
+                  <h2 className="text-base font-bold tracking-tight">Debug Console</h2>
+                  <span className="pf-badge pf-badge-live">Workspace</span>
+                  {connectedProjectPath ? (
+                    <span className="pf-badge max-w-[220px] truncate border-violet-500/25 bg-violet-500/10 text-violet-300" title={connectedProjectPath}>
+                      {connectedProjectPath.split("\\").pop() || "Project"}
+                    </span>
+                  ) : null}
                 </div>
-                <p className="mt-0.5 text-sm text-slate-500">
-                  Search files, attach logs/images, connect projects, then ask PayFix.
+                <p className="mt-0.5 truncate text-xs text-[var(--pf-text-muted)]">
+                  Attach context · connect a repo · trace payments · run the agent
                 </p>
               </div>
 
-              <div className="flex min-w-0 items-center gap-2">
+              <div className="flex min-w-0 shrink-0 items-center gap-1.5">
                 <button
                   type="button"
                   onClick={() => setAboutOpen(true)}
-                  className="inline-flex h-9 items-center gap-2 rounded-full border border-slate-200 bg-white px-3 text-sm font-semibold text-slate-700 shadow-sm transition hover:border-blue-200 hover:bg-blue-50"
+                  className="pf-btn-ghost h-8 px-3 text-xs"
                   title="What PayFix can do"
                 >
-                  <HelpCircle size={16} />
+                  <HelpCircle size={15} />
                   About
                 </button>
                 <button
                   type="button"
                   onClick={() => setHelpOpen(true)}
-                  className="inline-flex h-9 items-center gap-2 rounded-full border border-slate-200 bg-white px-3 text-sm font-semibold text-slate-700 shadow-sm transition hover:border-blue-200 hover:bg-blue-50"
+                  className="pf-btn-ghost h-8 px-3 text-xs"
                   title="How to use PayFix"
                 >
-                  <HelpCircle size={16} />
+                  <HelpCircle size={15} />
                   Help
                 </button>
                 <div ref={toolsMenuRef} className="relative z-[130]">
                   <button
                     type="button"
                     onClick={() => setToolsOpen((open) => !open)}
-                    className="inline-flex h-9 items-center gap-2 rounded-full border border-slate-200 bg-white px-3 text-sm font-semibold text-slate-700 shadow-sm transition hover:border-blue-200 hover:bg-blue-50"
+                    className="pf-btn-ghost h-8 px-3 text-xs"
                     title="Open PayFix tools"
                   >
-                    <Wrench size={16} />
+                    <Wrench size={15} />
                     Tools
-                    <ChevronDown size={14} />
+                    <ChevronDown size={13} />
                   </button>
 
                   {toolsOpen && (
-                    <div className="absolute right-0 top-11 z-[140] w-80 overflow-hidden rounded-2xl border border-slate-200 bg-white p-2 shadow-2xl shadow-slate-950/25">
+                    <div className="pf-panel absolute right-0 top-10 z-[140] w-80 overflow-hidden p-2">
                       {[
                         {
-                          label: "EMV Decoder",
-                          description: "Decode TLV/EMV tags, signals, outcomes, and terminal evidence.",
-                          icon: CreditCard,
-                          action: openEmvDecoderFromCurrentContext,
+                          title: "Manage Project",
+                          tools: [
+                            {
+                              label: "Project IQ",
+                              description: "Validate, inspect runtime ports, view Git state, and map project files.",
+                              icon: BrainCircuit,
+                              action: openProjectIq,
+                              disabled: !connectedProjectPath,
+                            },
+                          ],
                         },
                         {
-                          label: "Webhook Lab",
-                          description: "Replay gateway webhooks, test signatures, and compare payloads to logs.",
-                          icon: Webhook,
-                          action: () => setWebhookLabOpen(true),
+                          title: "Inspect App",
+                          tools: [
+                            {
+                              label: "Inspect Localhost",
+                              description: "Screenshot a running app and inspect DOM, console, network, and layout issues.",
+                              icon: Search,
+                              action: inspectRunningApp,
+                            },
+                          ],
                         },
                         {
-                          label: "Device Lab",
-                          description: "Inspect connected payment devices, COM/IP reachability, and capture output.",
-                          icon: Usb,
-                          action: scanDevices,
+                          title: "Payment Tools",
+                          tools: [
+                            {
+                              label: "EMV Decoder",
+                              description: "Decode TLV/EMV tags, signals, outcomes, and terminal evidence.",
+                              icon: CreditCard,
+                              action: openEmvDecoderFromCurrentContext,
+                            },
+                            {
+                              label: "Webhook Lab",
+                              description: "Replay gateway webhooks, test signatures, and compare payloads to logs.",
+                              icon: Webhook,
+                              action: () => setWebhookLabOpen(true),
+                            },
+                            {
+                              label: "Device Lab",
+                              description: "Inspect connected payment devices, COM/IP reachability, and capture output.",
+                              icon: Usb,
+                              action: scanDevices,
+                            },
+                          ],
                         },
-                        {
-                          label: "Inspect Localhost",
-                          description: "Screenshot a running app and inspect DOM, console, network, and layout issues.",
-                          icon: Search,
-                          action: inspectRunningApp,
-                        },
-                        {
-                          label: "Project IQ",
-                          description: "Open project memory, clickable map, sandbox checks, and watch mode.",
-                          icon: BrainCircuit,
-                          action: openProjectIq,
-                          disabled: !connectedProjectPath,
-                        },
-                      ].map((tool) => {
-                        const Icon = tool.icon;
-                        return (
-                          <button
-                            key={tool.label}
-                            type="button"
-                            onClick={() => {
-                              if (tool.disabled) return;
-                              setToolsOpen(false);
-                              tool.action();
-                            }}
-                            disabled={tool.disabled}
-                            title={tool.description}
-                            className="group flex w-full items-start gap-3 rounded-xl px-3 py-3 text-left transition hover:bg-blue-50 disabled:cursor-not-allowed disabled:bg-slate-50"
-                          >
-                            <span
-                              className={`mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-xl transition group-hover:bg-white ${
-                                tool.disabled ? "bg-slate-100 text-slate-400" : "bg-blue-50 text-blue-600"
-                              }`}
-                            >
-                              <Icon size={16} />
-                            </span>
-                            <span className="min-w-0">
-                              <span className={`block text-sm font-bold ${tool.disabled ? "text-slate-500" : "text-slate-800"}`}>
-                                {tool.label}
-                              </span>
-                              <span className="mt-0.5 block text-xs font-medium leading-5 text-slate-500">
-                                {tool.disabled ? "Connect a project first to use this tool." : tool.description}
-                              </span>
-                            </span>
-                          </button>
-                        );
-                      })}
+                      ].map((group) => (
+                        <div key={group.title} className="py-1">
+                          <div className="px-3 pb-1 pt-2 pf-section-label">
+                            {group.title}
+                          </div>
+                          {group.tools.map((tool) => {
+                            const Icon = tool.icon;
+                            const disabled = "disabled" in tool ? tool.disabled : false;
+                            return (
+                              <button
+                                key={tool.label}
+                                type="button"
+                                onClick={() => {
+                                  if (disabled) return;
+                                  setToolsOpen(false);
+                                  tool.action();
+                                }}
+                                disabled={disabled}
+                                title={tool.description}
+                                className="group flex w-full items-start gap-3 rounded-[var(--pf-radius-sm)] px-3 py-2.5 text-left transition hover:bg-sky-500/10 disabled:cursor-not-allowed disabled:opacity-50"
+                              >
+                                <span
+                                  className={`mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg transition ${
+                                    disabled ? "bg-white/5 text-[var(--pf-text-faint)]" : "bg-sky-500/15 text-sky-400 group-hover:bg-sky-500/25"
+                                  }`}
+                                >
+                                  <Icon size={16} />
+                                </span>
+                                <span className="min-w-0">
+                                  <span className={`block text-sm font-semibold ${disabled ? "text-[var(--pf-text-faint)]" : "text-[var(--pf-text)]"}`}>
+                                    {tool.label}
+                                  </span>
+                                  <span className="mt-0.5 block text-xs font-medium leading-5 text-[var(--pf-text-muted)]">
+                                    {disabled ? "Connect a project first to use this tool." : tool.description}
+                                  </span>
+                                </span>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      ))}
                     </div>
                   )}
                 </div>
                 {lastRollback && (
                   <button
                     type="button"
-                    onClick={rollbackLastAppliedChange}
+                    onClick={openRollbackOptions}
                     disabled={rollbackLoading}
-                    className="inline-flex h-9 items-center gap-2 rounded-full border border-amber-200 bg-amber-50 px-3 text-sm font-semibold text-amber-800 shadow-sm transition hover:border-amber-300 hover:bg-amber-100 disabled:cursor-not-allowed disabled:opacity-60"
-                    title={`Restore ${lastRollback.relative || lastRollback.file} to the version before the last Apply`}
+                    className="pf-btn-ghost h-8 border-amber-500/30 bg-amber-500/10 px-3 text-xs text-amber-300 hover:bg-amber-500/15 disabled:cursor-not-allowed disabled:opacity-60"
+                    title="Choose which PayFix rollback snapshot to restore"
                   >
-                    <RotateCcw size={16} />
-                    {rollbackLoading ? "Rolling back..." : "Rollback"}
+                    <RotateCcw size={15} />
+                    {rollbackLoading ? "Loading..." : "Undo"}
                   </button>
                 )}
 
@@ -3934,7 +8772,7 @@ ${shouldUseProjectContext ? fullProjectFiles || "No project file content was loa
           </header>
 
           {agentStatus && (
-            <div className="pointer-events-none fixed right-[206px] top-20 z-[110] max-w-[520px]">
+            <div className="pointer-events-none fixed left-[304px] top-16 z-[110] max-w-[520px]">
               {(() => {
                 const tone = statusTone(agentStatus);
 
@@ -3972,9 +8810,9 @@ ${shouldUseProjectContext ? fullProjectFiles || "No project file content was loa
           )}
 
           {liveCaptureEvent && (
-            <div className="pointer-events-none fixed bottom-28 right-[206px] z-[150] w-[min(520px,calc(100vw-240px))]">
-              <div className="pointer-events-auto overflow-hidden rounded-2xl border border-amber-200 bg-white shadow-2xl shadow-slate-950/20">
-                <div className="flex items-start gap-3 bg-amber-50 px-4 py-3 text-amber-950">
+            <div className="pointer-events-none fixed bottom-28 left-[304px] z-[150] w-[min(520px,calc(100vw-330px))]">
+              <div className="pointer-events-auto overflow-hidden rounded-[var(--pf-radius)] border border-amber-500/30 bg-[var(--pf-surface)] shadow-2xl">
+                <div className="flex items-start gap-3 bg-amber-500/10 px-4 py-3 text-amber-100">
                   <ShieldAlert size={20} className="mt-0.5 shrink-0 text-amber-600" />
                   <div className="min-w-0 flex-1">
                     <div className="text-sm font-black">Live Capture flagged this save</div>
@@ -4037,6 +8875,14 @@ ${shouldUseProjectContext ? fullProjectFiles || "No project file content was loa
             agentLoading={agentLoading}
             question={question}
             setQuestion={setQuestion}
+            quickReplyOptions={quickReplyOptions}
+            selectedQuickReplies={selectedQuickReplies}
+            toggleQuickReply={(value) =>
+              setSelectedQuickReplies((current) =>
+                current.includes(value) ? current.filter((item) => item !== value) : [...current, value],
+              )
+            }
+            clearSelectedQuickReplies={() => setSelectedQuickReplies([])}
             log={log}
             setLog={setLog}
             code={code}
@@ -4065,6 +8911,7 @@ ${shouldUseProjectContext ? fullProjectFiles || "No project file content was loa
             clearAttachments={clearAttachments}
             cancelEditMessage={cancelEditMessage}
             loadProjectContext={loadProjectContext}
+            importBrowserCapture={importBrowserCapture}
             analyze={analyze}
             runAgent={runAgent}
             buildTimeline={buildTimeline}
@@ -4088,6 +8935,8 @@ ${shouldUseProjectContext ? fullProjectFiles || "No project file content was loa
                 uploadedFiles={uploadedFiles}
                 log={log}
                 code={code}
+                rollbackTarget={lastRollback}
+                rollbackLoading={rollbackLoading}
                 chatEndRef={chatEndRef}
                 onOpenCodeLog={setCodeLogPreview}
                 onEditMessage={editUserMessage}
@@ -4100,25 +8949,256 @@ ${shouldUseProjectContext ? fullProjectFiles || "No project file content was loa
                   setProjectPreviewReference(reference);
                   setProjectPreviewOpen(true);
                 }}
-                onOpenAgentSession={(sessionMessages) => {
+                onOpenAgentSession={(sessionMessages, summaryMessage) => {
                   setAgentSessionMessages(sessionMessages);
                   const sessionUploads = sessionMessages.flatMap((message) => message.attachedUploads || []);
-                  setAgentSessionUploads(sessionUploads);
+                  setAgentSessionUploads(dedupeUploadedFiles(sessionUploads));
+                  setAgentSessionFreshUploads([]);
+                  const restoredPatch = isAgentApiResponse(summaryMessage?.agentPatchData)
+                    ? summaryMessage.agentPatchData
+                    : null;
+                  setLastVerifiedAgentPatch(restoredPatch);
                   setAgentSessionOpen(true);
-                  setAgentStatus("PayFix investigation reopened.");
+                  setAgentStatus(
+                    restoredPatch?.patchReady
+                      ? "PayFix investigation reopened with a pending verified patch."
+                      : "PayFix investigation reopened.",
+                  );
                 }}
+                onStartAgentPrompt={startAgentFromActionPrompt}
+                onCreateCodeFromGeneratedFile={startAgentFromGeneratedFile}
+                onRollbackLastApply={openRollbackOptions}
               />
             )}
           </Composer>
         </section>
-
-        <Sidebar
-          savedChats={savedChats}
-          onNewChat={newChat}
-          onOpenChat={openSavedChat}
-          onDeleteRequest={setChatToDelete}
-        />
       </div>
+
+      {rollbackOptionsOpen && (
+        <div className="fixed inset-0 z-[360] flex items-center justify-center bg-slate-950/70 p-4">
+          <div className="flex max-h-[calc(100vh-48px)] w-full max-w-3xl flex-col overflow-hidden rounded-2xl bg-white shadow-2xl">
+            <div className="flex items-start justify-between gap-4 border-b border-slate-200 px-6 py-5">
+              <div>
+                <div className="text-xs font-black uppercase tracking-wide text-amber-600">Undo options</div>
+                <h3 className="mt-1 text-2xl font-bold text-slate-950">Restore PayFix changes</h3>
+                <p className="mt-1 text-sm text-slate-500">
+                  Choose one file snapshot or select multiple recent snapshots to roll back together.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setRollbackOptionsOpen(false)}
+                className="flex h-11 w-11 items-center justify-center rounded-full bg-slate-100 text-slate-600 transition hover:bg-slate-200"
+                title="Close"
+              >
+                <X size={18} />
+              </button>
+            </div>
+
+            <div className="min-h-0 flex-1 overflow-auto bg-slate-50 p-6">
+              <div className="mb-4 flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  onClick={() => rollbackSnapshots[0] && setSelectedRollbackIds([rollbackSnapshots[0].id])}
+                  className="rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs font-black text-slate-700 transition hover:bg-slate-100"
+                >
+                  Select latest
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setSelectedRollbackIds(latestRollbackBatchIds())}
+                  className="rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs font-black text-slate-700 transition hover:bg-slate-100"
+                >
+                  Select latest batch
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    setSelectedRollbackIds(
+                      visibleRollbackSnapshots.map((snapshot) => snapshot.id),
+                    )
+                  }
+                  className="rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs font-black text-slate-700 transition hover:bg-slate-100"
+                >
+                  Select visible
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setSelectedRollbackIds([])}
+                  className="rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs font-black text-slate-700 transition hover:bg-slate-100"
+                >
+                  Clear
+                </button>
+              </div>
+
+              <div className="space-y-3">
+                {visibleRollbackGroups.map((group) => {
+                  const expanded = expandedRollbackFiles.includes(group.key);
+                  const latestSnapshot = group.snapshots[0];
+                  if (!latestSnapshot) return null;
+                  const checked = selectedRollbackIds.includes(latestSnapshot.id);
+
+                  return (
+                    <div key={group.key} className="space-y-2">
+                      <label
+                        className={`flex cursor-pointer items-start gap-3 rounded-2xl border p-4 transition ${
+                          checked
+                            ? "border-amber-300 bg-amber-50 shadow-sm"
+                            : "border-slate-200 bg-white hover:border-amber-200 hover:bg-amber-50/50"
+                        }`}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={(event) => {
+                            setSelectedRollbackIds((current) =>
+                              event.target.checked
+                                ? [...current, latestSnapshot.id]
+                                : current.filter((id) => id !== latestSnapshot.id),
+                            );
+                          }}
+                          className="mt-1 h-4 w-4 rounded border-slate-300 text-amber-600 focus:ring-amber-500"
+                        />
+                        <div className="min-w-0 flex-1">
+                          <div className="break-all font-mono text-sm font-black text-slate-950">
+                            {latestSnapshot.relative || latestSnapshot.file}
+                          </div>
+                          <div className="mt-2 flex flex-wrap gap-2 text-xs font-bold">
+                            <span className="rounded-full bg-white px-2.5 py-1 text-slate-600 ring-1 ring-slate-200">
+                              {latestSnapshot.fileExisted === false ? "Delete created file" : "Restore previous content"}
+                            </span>
+                            <span className="rounded-full bg-white px-2.5 py-1 text-slate-600 ring-1 ring-slate-200">
+                              {new Date(latestSnapshot.createdAt).toLocaleString()}
+                            </span>
+                            {group.snapshots.length > 1 && (
+                              <span className="rounded-full bg-amber-100 px-2.5 py-1 text-amber-800 ring-1 ring-amber-200">
+                                {group.snapshots.length - 1} older
+                              </span>
+                            )}
+                          </div>
+                          <div className="mt-3 rounded-xl bg-white/70 p-3 text-sm leading-6 text-slate-700 ring-1 ring-slate-200">
+                            <div className="mb-1 text-[10px] font-black uppercase tracking-wide text-slate-400">
+                              What this undo affects
+                            </div>
+                            {rollbackSnapshotReason(latestSnapshot, true)}
+                          </div>
+                        </div>
+                      </label>
+
+                      {expanded && (
+                        <div className="ml-7 space-y-2 rounded-2xl border border-slate-200 bg-white p-3">
+                          {group.snapshots.slice(1).map((snapshot) => {
+                            const olderChecked = selectedRollbackIds.includes(snapshot.id);
+
+                            return (
+                              <label
+                                key={snapshot.id}
+                                className={`flex cursor-pointer items-start gap-3 rounded-xl p-3 transition ${
+                                  olderChecked ? "bg-amber-50 ring-1 ring-amber-200" : "bg-slate-50 hover:bg-slate-100"
+                                }`}
+                              >
+                                <input
+                                  type="checkbox"
+                                  checked={olderChecked}
+                                  onChange={(event) => {
+                                    setSelectedRollbackIds((current) =>
+                                      event.target.checked
+                                        ? [...current, snapshot.id]
+                                        : current.filter((id) => id !== snapshot.id),
+                                    );
+                                  }}
+                                  className="mt-1 h-4 w-4 rounded border-slate-300 text-amber-600 focus:ring-amber-500"
+                                />
+                                <div className="min-w-0 flex-1">
+                                  <div className="flex flex-wrap items-center gap-2 text-xs font-bold">
+                                    <span className="rounded-full bg-white px-2.5 py-1 text-slate-600 ring-1 ring-slate-200">
+                                      Older version
+                                    </span>
+                                    <span className="rounded-full bg-white px-2.5 py-1 text-slate-600 ring-1 ring-slate-200">
+                                      {new Date(snapshot.createdAt).toLocaleString()}
+                                    </span>
+                                    <span className="rounded-full bg-white px-2.5 py-1 text-slate-600 ring-1 ring-slate-200">
+                                      {snapshot.fileExisted === false ? "Delete created file" : "Restore previous content"}
+                                    </span>
+                                  </div>
+                                  <p className="mt-2 text-sm leading-6 text-slate-600">
+                                    {rollbackSnapshotReason(snapshot, false)}
+                                  </p>
+                                </div>
+                              </label>
+                            );
+                          })}
+                        </div>
+                      )}
+
+                      {group.snapshots.length > 1 && (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setExpandedRollbackFiles((current) =>
+                              current.includes(group.key)
+                                ? current.filter((key) => key !== group.key)
+                                : [...current, group.key],
+                            )
+                          }
+                          className="ml-7 rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-black text-slate-600 transition hover:border-amber-300 hover:bg-amber-50"
+                        >
+                          {expanded ? "Hide older versions" : `Show ${group.snapshots.length - 1} older version(s)`}
+                        </button>
+                      )}
+                    </div>
+                  );
+                })}
+
+                {rollbackGroups.length > 8 && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowAllRollbackSnapshots((value) => !value);
+                      setExpandedRollbackFiles([]);
+                    }}
+                    className="w-full rounded-2xl border border-dashed border-slate-300 bg-white p-4 text-sm font-black text-slate-600 transition hover:border-amber-300 hover:bg-amber-50"
+                  >
+                    {showAllRollbackSnapshots
+                      ? "Show recent snapshots only"
+                      : `Show ${rollbackGroups.length - 8} older file(s)`}
+                  </button>
+                )}
+
+                {!rollbackSnapshots.length && (
+                  <div className="rounded-2xl border border-dashed border-slate-300 bg-white p-6 text-sm font-semibold text-slate-500">
+                    No PayFix rollback snapshots are available.
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-200 bg-white px-6 py-4">
+              <div className="text-sm font-semibold text-slate-500">
+                {selectedRollbackIds.length} selected
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  onClick={() => setRollbackOptionsOpen(false)}
+                  className="rounded-xl border border-slate-300 bg-white px-4 py-2 text-sm font-bold text-slate-700 transition hover:bg-slate-50"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={() => applyRollbackSnapshots()}
+                  disabled={!selectedRollbackIds.length || rollbackLoading}
+                  className="inline-flex items-center gap-2 rounded-xl bg-amber-600 px-4 py-2 text-sm font-black text-white shadow-sm transition hover:bg-amber-500 disabled:cursor-not-allowed disabled:bg-slate-300"
+                >
+                  <RotateCcw size={16} />
+                  {rollbackLoading ? "Restoring..." : "Restore selected"}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {imagePickerOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/70 p-6">
@@ -4188,10 +9268,10 @@ ${shouldUseProjectContext ? fullProjectFiles || "No project file content was loa
               <div>
                 <div className="flex items-center gap-2 text-lg font-bold">
                   <FileText size={20} className="text-blue-600" />
-                  What should Timeline trace?
+                  What should Payment Trace inspect?
                 </div>
                 <p className="mt-1 text-sm text-slate-500">
-                  Select a previous log, upload, message, or project source to rebuild the payment timeline.
+                  Select a previous log, upload, message, or project source to rebuild the payment-specific trace.
                 </p>
               </div>
               <button
@@ -4271,10 +9351,18 @@ ${shouldUseProjectContext ? fullProjectFiles || "No project file content was loa
       {dependencyProposal?.needed && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/70 p-6">
           <div className="w-full max-w-xl rounded-2xl bg-white p-6 shadow-2xl">
+            {(() => {
+              const packageNames = dependencyPackageNames(dependencyProposal);
+              const packageLabel = packageNames.join(", ");
+
+              return (
+                <>
             <div className="flex items-start justify-between gap-4">
               <div>
                 <div className="text-xs font-bold uppercase tracking-wide text-indigo-600">Agent Dependency Check</div>
-                <h3 className="mt-1 text-xl font-bold text-slate-950">Missing package detected</h3>
+                <h3 className="mt-1 text-xl font-bold text-slate-950">
+                  Missing package{packageNames.length === 1 ? "" : "s"} detected
+                </h3>
               </div>
               <button
                 type="button"
@@ -4287,8 +9375,10 @@ ${shouldUseProjectContext ? fullProjectFiles || "No project file content was loa
             </div>
 
             <div className="mt-5 rounded-2xl border border-slate-200 bg-slate-50 p-4">
-              <div className="text-sm font-bold text-slate-500">Package</div>
-              <div className="mt-1 font-mono text-lg font-bold text-slate-950">{dependencyProposal.packageName}</div>
+              <div className="text-sm font-bold text-slate-500">
+                Package{packageNames.length === 1 ? "" : "s"}
+              </div>
+              <div className="mt-1 font-mono text-lg font-bold text-slate-950">{packageLabel}</div>
               <div className="mt-2 inline-flex rounded-full border border-indigo-200 bg-indigo-50 px-3 py-1 text-xs font-bold text-indigo-700">
                 {dependencyProposal.devDependency ? "devDependency" : "dependency"}
               </div>
@@ -4305,13 +9395,85 @@ ${shouldUseProjectContext ? fullProjectFiles || "No project file content was loa
               </button>
               <button
                 type="button"
-                onClick={installProposedDependency}
-                disabled={dependencyInstalling}
+                onClick={requestInstallProposedDependency}
+                disabled={dependencyInstalling || dependencyProposal.installable === false}
                 className="rounded-xl bg-indigo-600 px-5 py-2 font-semibold text-white transition hover:bg-indigo-500 disabled:cursor-not-allowed disabled:bg-slate-300"
+                title={dependencyProposal.installable === false ? dependencyProposal.installCommand : undefined}
               >
-                {dependencyInstalling ? "Installing..." : "Install Package"}
+                {dependencyProposal.installable === false
+                  ? "Manual Install"
+                  : dependencyInstalling
+                    ? "Installing..."
+                    : packageNames.length === 1
+                      ? "Install Package"
+                      : "Install All"}
               </button>
             </div>
+                </>
+              );
+            })()}
+          </div>
+        </div>
+      )}
+
+      {dependencyConfirmOpen && dependencyProposal?.needed && (
+        <div className="fixed inset-0 z-[320] flex items-center justify-center bg-slate-950/70 p-6 backdrop-blur-sm">
+          <div className="w-full max-w-lg overflow-hidden rounded-3xl bg-white shadow-2xl ring-1 ring-slate-200">
+            <div className="border-b border-slate-200 bg-gradient-to-br from-white to-indigo-50 px-6 py-5">
+              <div className="text-xs font-black uppercase tracking-wide text-indigo-600">Confirm Dependency Install</div>
+              <h3 className="mt-1 text-xl font-black text-slate-950">Install missing packages?</h3>
+              <p className="mt-1 break-all text-sm text-slate-500">{connectedProjectPath || "Connected project"}</p>
+            </div>
+
+            {(() => {
+              const packageNames = dependencyPackageNames(dependencyProposal);
+              const packageLabel = packageNames.join(", ");
+              const installCommand =
+                dependencyProposal.installCommand ||
+                `${dependencyProposal.ecosystem === "node" || !dependencyProposal.ecosystem ? "npm install" : "Install"} ${packageLabel}`;
+
+              return (
+                <div className="p-6">
+                  <div className="rounded-2xl border border-indigo-100 bg-indigo-50 p-4">
+                    <div className="text-xs font-black uppercase tracking-wide text-indigo-700">
+                      Package{packageNames.length === 1 ? "" : "s"}
+                    </div>
+                    <div className="mt-2 break-words font-mono text-sm font-black text-slate-950">{packageLabel}</div>
+                    <div className="mt-3 inline-flex rounded-full bg-white px-3 py-1 text-xs font-black text-indigo-700 ring-1 ring-indigo-100">
+                      {dependencyProposal.ecosystem || "node"} / {dependencyProposal.devDependency ? "devDependency" : "dependency"}
+                    </div>
+                  </div>
+
+                  <div className="mt-4 rounded-2xl border border-slate-200 bg-slate-950 p-4 text-xs text-slate-100">
+                    <div className="font-black uppercase tracking-wide text-slate-400">Command</div>
+                    <pre className="mt-2 whitespace-pre-wrap break-words font-mono text-emerald-200">{installCommand}</pre>
+                  </div>
+
+                  <p className="mt-4 text-sm leading-6 text-slate-600">
+                    PayFix will run this through the local agent in the connected project. This can update package files and
+                    lockfiles.
+                  </p>
+
+                  <div className="mt-5 flex flex-wrap justify-end gap-3">
+                    <button
+                      type="button"
+                      onClick={() => setDependencyConfirmOpen(false)}
+                      className="rounded-xl border border-slate-200 bg-white px-5 py-2 font-bold text-slate-700 transition hover:bg-slate-50"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      type="button"
+                      onClick={installProposedDependency}
+                      disabled={dependencyInstalling}
+                      className="rounded-xl bg-indigo-600 px-5 py-2 font-black text-white transition hover:bg-indigo-500 disabled:cursor-not-allowed disabled:bg-slate-300"
+                    >
+                      {dependencyInstalling ? "Installing..." : packageNames.length === 1 ? "Install Package" : "Install All"}
+                    </button>
+                  </div>
+                </div>
+              );
+            })()}
           </div>
         </div>
       )}
@@ -4411,20 +9573,37 @@ ${shouldUseProjectContext ? fullProjectFiles || "No project file content was loa
 
       {agentSessionOpen && (
         <AgentSessionModal
+          key={`agent-session-${agentSessionSetupRevision}`}
           messages={agentSessionMessages}
           loading={agentLoading}
           status={agentStatus}
           connectedProjectPath={connectedProjectPath}
-          uploads={agentSessionUploads}
+          initialDraft={agentSessionInitialDraft}
+          setupOpenRevision={agentSessionSetupRevision}
+          uploads={agentSessionFreshUploads}
+          dependencyProposal={dependencyProposal}
+          dependencyInstalling={dependencyInstalling}
+          rollbackTarget={lastRollback}
+          rollbackLoading={rollbackLoading}
           onClose={closeAgentSessionAndSave}
           onSend={runAgentSessionFollowUp}
+          onSendToRegularChat={sendAgentRedirectToRegularChat}
+          onConnectProjectPath={connectProjectPath}
           onUpload={handleAgentSessionUpload}
           onRemoveUpload={removeAgentSessionUpload}
+          onEditMessage={editAgentSessionMessage}
+          onCancelEdit={cancelAgentSessionEdit}
+          canApplyVerifiedPatch={Boolean(latestApplyableAgentPatch())}
+          onApplyVerifiedPatch={applyLastVerifiedAgentPatch}
+          onInstallDependency={requestInstallProposedDependency}
+          onRunValidation={runAgentSessionValidation}
+          onRollbackLastApply={openRollbackOptions}
         />
       )}
 
       {showColorEditor && (
         <ColorToolModal
+          uploadedFiles={uploadedFiles}
           cssFileName={cssFileName}
           setCssFileName={setCssFileName}
           cssSelector={cssSelector}
@@ -4441,6 +9620,8 @@ ${shouldUseProjectContext ? fullProjectFiles || "No project file content was loa
           onFindCssFile={findCssFile}
           onPreviewCssColor={previewCssColor}
           onApplyCssColor={applyCssColor}
+          onRunVisualFixAgent={runVisualFixAgent}
+          onUploadEvidence={handleUpload}
         />
       )}
 
@@ -4469,9 +9650,9 @@ ${shouldUseProjectContext ? fullProjectFiles || "No project file content was loa
               <div>
                 <div className="flex items-center gap-2 text-xs font-bold uppercase tracking-wide text-blue-600">
                   <BrainCircuit size={16} />
-                  Project IQ
+                  Manage Project
                 </div>
-                <h3 className="mt-1 text-2xl font-bold text-slate-950">Project Memory, Map, Runner, Watch</h3>
+                <h3 className="mt-1 text-2xl font-bold text-slate-950">Fix, Validate, Inspect, Manage</h3>
                 <p className="mt-1 break-all text-sm text-slate-500">{connectedProjectPath}</p>
               </div>
 
@@ -4486,64 +9667,115 @@ ${shouldUseProjectContext ? fullProjectFiles || "No project file content was loa
             </div>
 
             <div className="min-h-0 flex-1 overflow-auto bg-slate-100 p-6">
-              <div className="mb-5 flex flex-wrap gap-3">
-                <button
-                  type="button"
-                  onClick={openProjectIq}
-                  disabled={projectIqLoading}
-                  className="inline-flex h-10 items-center gap-2 rounded-xl bg-blue-600 px-4 text-sm font-bold text-white shadow-sm transition hover:bg-blue-500 disabled:bg-slate-300"
-                >
-                  <BrainCircuit size={16} />
-                  Refresh IQ
-                </button>
-                <button
-                  type="button"
-                  onClick={runSandboxRunner}
-                  disabled={projectIqLoading}
-                  className="inline-flex h-10 items-center gap-2 rounded-xl bg-slate-950 px-4 text-sm font-bold text-white shadow-sm transition hover:bg-slate-800 disabled:bg-slate-300"
-                >
-                  <PlayCircle size={16} />
-                  Run Sandbox Checks
-                </button>
-                <button
-                  type="button"
-                  onClick={refreshWatchMode}
-                  disabled={projectIqLoading}
-                  className="inline-flex h-10 items-center gap-2 rounded-xl border border-slate-300 bg-white px-4 text-sm font-bold text-slate-700 shadow-sm transition hover:bg-slate-50"
-                >
-                  <Radio size={16} />
-                  Refresh Watch
-                </button>
-                <button
-                  type="button"
-                  onClick={liveCaptureEnabled ? () => setLiveCaptureEnabled(false) : startLiveCapture}
-                  disabled={projectIqLoading}
-                  className={`inline-flex h-10 items-center gap-2 rounded-xl px-4 text-sm font-bold shadow-sm transition disabled:bg-slate-300 ${
-                    liveCaptureEnabled
-                      ? "border border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100"
-                      : "bg-indigo-600 text-white hover:bg-indigo-500"
-                  }`}
-                >
-                  <Activity size={16} />
-                  {liveCaptureEnabled ? "Live Capture On" : "Capture Live Moves"}
-                </button>
-                <button
-                  type="button"
-                  onClick={clearWatchMode}
-                  disabled={projectIqLoading}
-                  className="inline-flex h-10 items-center gap-2 rounded-xl border border-rose-200 bg-white px-4 text-sm font-bold text-rose-700 shadow-sm transition hover:bg-rose-50"
-                >
-                  <X size={16} />
-                  Clear Watch
-                </button>
-                <button
-                  type="button"
-                  onClick={downloadWatchSnapshot}
-                  className="inline-flex h-10 items-center gap-2 rounded-xl border border-slate-300 bg-white px-4 text-sm font-bold text-slate-700 shadow-sm transition hover:bg-blue-50"
-                >
-                  <FileText size={16} />
-                  Watch Snapshot
-                </button>
+              <div className="mb-5 grid gap-3 xl:grid-cols-[1fr_auto]">
+                <div className="rounded-2xl border border-slate-200 bg-white p-3 shadow-sm">
+                  <div className="mb-2 px-1 text-[10px] font-black uppercase tracking-wide text-slate-400">
+                    Core Workflow
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      onClick={runAgent}
+                      disabled={agentLoading || projectIqLoading || (!canSend && !connectedProjectPath)}
+                      className="inline-flex h-10 items-center gap-2 rounded-xl bg-blue-600 px-4 text-sm font-bold text-white shadow-sm transition hover:bg-blue-500 disabled:bg-slate-300"
+                    >
+                      <BrainCircuit size={16} />
+                      Fix Code
+                    </button>
+                    <button
+                      type="button"
+                      onClick={runSandboxRunner}
+                      disabled={projectIqLoading}
+                      className="inline-flex h-10 items-center gap-2 rounded-xl bg-slate-950 px-4 text-sm font-bold text-white shadow-sm transition hover:bg-slate-800 disabled:bg-slate-300"
+                    >
+                      <PlayCircle size={16} />
+                      Validate
+                    </button>
+                    <button
+                      type="button"
+                      onClick={inspectRunningApp}
+                      disabled={projectIqLoading}
+                      className="inline-flex h-10 items-center gap-2 rounded-xl border border-slate-300 bg-white px-4 text-sm font-bold text-slate-700 shadow-sm transition hover:bg-blue-50"
+                    >
+                      <Search size={16} />
+                      Inspect App
+                    </button>
+                    <button
+                      type="button"
+                      onClick={refreshToolchainDoctor}
+                      disabled={projectIqLoading}
+                      className="inline-flex h-10 items-center gap-2 rounded-xl border border-slate-300 bg-white px-4 text-sm font-bold text-slate-700 shadow-sm transition hover:bg-blue-50"
+                    >
+                      <Wrench size={16} />
+                      Toolchain Doctor
+                    </button>
+                  </div>
+                </div>
+
+                <div className="rounded-2xl border border-slate-200 bg-white p-3 shadow-sm">
+                  <div className="mb-2 px-1 text-[10px] font-black uppercase tracking-wide text-slate-400">
+                    Project Controls
+                  </div>
+                  <div className="flex flex-wrap justify-start gap-2 xl:justify-end">
+                    <button
+                      type="button"
+                      onClick={openProjectIq}
+                      disabled={projectIqLoading}
+                      className="inline-flex h-10 items-center gap-2 rounded-xl border border-slate-300 bg-white px-4 text-sm font-bold text-slate-700 shadow-sm transition hover:bg-blue-50 disabled:bg-slate-100"
+                    >
+                      <BrainCircuit size={16} />
+                      Refresh
+                    </button>
+                    <button
+                      type="button"
+                      onClick={refreshPorts}
+                      disabled={projectIqLoading}
+                      className="inline-flex h-10 items-center gap-2 rounded-xl border border-slate-300 bg-white px-4 text-sm font-bold text-slate-700 shadow-sm transition hover:bg-blue-50"
+                    >
+                      <Activity size={16} />
+                      Ports
+                    </button>
+                    <button
+                      type="button"
+                      onClick={liveCaptureEnabled ? () => setLiveCaptureEnabled(false) : startLiveCapture}
+                      disabled={projectIqLoading}
+                      className={`inline-flex h-10 items-center gap-2 rounded-xl px-4 text-sm font-bold shadow-sm transition disabled:bg-slate-300 ${
+                        liveCaptureEnabled
+                          ? "border border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100"
+                          : "bg-indigo-600 text-white hover:bg-indigo-500"
+                      }`}
+                    >
+                      <Activity size={16} />
+                      {liveCaptureEnabled ? "Live Capture On" : "Live Capture"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={refreshWatchMode}
+                      disabled={projectIqLoading}
+                      className="inline-flex h-10 items-center gap-2 rounded-xl border border-slate-300 bg-white px-4 text-sm font-bold text-slate-700 shadow-sm transition hover:bg-slate-50"
+                    >
+                      <Radio size={16} />
+                      Watch
+                    </button>
+                    <button
+                      type="button"
+                      onClick={downloadWatchSnapshot}
+                      className="inline-flex h-10 items-center gap-2 rounded-xl border border-slate-300 bg-white px-4 text-sm font-bold text-slate-700 shadow-sm transition hover:bg-blue-50"
+                    >
+                      <FileText size={16} />
+                      Snapshot
+                    </button>
+                    <button
+                      type="button"
+                      onClick={clearWatchMode}
+                      disabled={projectIqLoading}
+                      className="inline-flex h-10 items-center gap-2 rounded-xl border border-rose-200 bg-white px-4 text-sm font-bold text-rose-700 shadow-sm transition hover:bg-rose-50"
+                    >
+                      <X size={16} />
+                      Clear
+                    </button>
+                  </div>
+                </div>
               </div>
 
               <div className="grid grid-cols-1 gap-5 xl:grid-cols-[360px_1fr]">
@@ -4810,6 +10042,88 @@ ${shouldUseProjectContext ? fullProjectFiles || "No project file content was loa
                   <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
                     <div className="flex items-center justify-between gap-3">
                       <div>
+                        <div className="text-xs font-bold uppercase tracking-wide text-slate-400">Toolchain Doctor</div>
+                        <h4 className="mt-1 font-bold text-slate-950">Project language validators</h4>
+                      </div>
+                      <span
+                        className={`rounded-full px-3 py-1 text-xs font-bold ${
+                          toolchainDoctorResult?.ok
+                            ? toolchainDoctorResult.missing?.length
+                              ? "bg-amber-50 text-amber-700"
+                              : "bg-emerald-50 text-emerald-700"
+                            : "bg-slate-100 text-slate-500"
+                        }`}
+                      >
+                        {toolchainDoctorResult?.ok
+                          ? toolchainDoctorResult.missing?.length
+                            ? `${toolchainDoctorResult.missing.length} missing`
+                            : "Ready"
+                          : "Not checked"}
+                      </span>
+                    </div>
+
+                    <div className="mt-4 space-y-3">
+                      {toolchainDoctorResult?.items?.length ? (
+                        toolchainDoctorResult.items.map((item) => (
+                          <article
+                            key={item.id}
+                            className={`rounded-xl border p-3 ${
+                              item.available ? "border-emerald-200 bg-emerald-50" : "border-amber-200 bg-amber-50"
+                            }`}
+                          >
+                            <div className="flex flex-wrap items-start justify-between gap-3">
+                              <div className="min-w-0">
+                                <div className="flex flex-wrap items-center gap-2">
+                                  <span className="font-bold text-slate-950">{item.label}</span>
+                                  <span className="rounded-full bg-white px-2 py-1 text-[11px] font-black text-slate-600">
+                                    {item.available ? "available" : "missing tools"}
+                                  </span>
+                                </div>
+                                <div className="mt-2 text-xs font-semibold text-slate-700">
+                                  Required: {item.requiredCommands.join(", ")}
+                                </div>
+                                {item.version ? (
+                                  <div className="mt-1 break-all font-mono text-[11px] text-slate-600">{item.version}</div>
+                                ) : null}
+                                {!item.available ? (
+                                  <p className="mt-2 text-xs leading-5 text-amber-900">{item.installHint}</p>
+                                ) : null}
+                              </div>
+
+                              {!item.available && item.installCommand ? (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    void navigator.clipboard?.writeText(item.installCommand || "");
+                                    setCopiedKey(`toolchain-${item.id}`);
+                                    setAgentStatus(`Copied install command for ${item.label}. Run it in an elevated terminal if needed.`);
+                                  }}
+                                  className="shrink-0 rounded-xl bg-slate-950 px-3 py-2 text-xs font-black text-white transition hover:bg-slate-800"
+                                  title={item.installUrl || item.installHint}
+                                >
+                                  {copiedKey === `toolchain-${item.id}` ? "Copied" : "Copy Install"}
+                                </button>
+                              ) : null}
+                            </div>
+                          </article>
+                        ))
+                      ) : toolchainDoctorResult?.ok ? (
+                        <p className="text-sm text-slate-500">
+                          No language-specific project files were detected yet.
+                        </p>
+                      ) : (
+                        <p className="text-sm text-amber-700">
+                          {toolchainDoctorResult?.error
+                            ? "Toolchain Doctor is unavailable. Restart payfix-agent, then run this check again."
+                            : "Run Toolchain Doctor to check required validators."}
+                        </p>
+                      )}
+                    </div>
+                  </section>
+
+                  <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+                    <div className="flex items-center justify-between gap-3">
+                      <div>
                         <div className="text-xs font-bold uppercase tracking-wide text-slate-400">Sandbox Runner</div>
                         <h4 className="mt-1 font-bold text-slate-950">TypeScript, lint, tests, build</h4>
                       </div>
@@ -4844,6 +10158,101 @@ ${shouldUseProjectContext ? fullProjectFiles || "No project file content was loa
                       ))}
                       {!sandboxRunnerResult && (
                         <p className="text-sm text-slate-500">Run sandbox checks before applying risky code changes.</p>
+                      )}
+                    </div>
+                  </section>
+
+                  <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+                    <div className="flex items-center justify-between gap-3">
+                      <div>
+                        <div className="text-xs font-bold uppercase tracking-wide text-slate-400">Runtime Ports</div>
+                        <h4 className="mt-1 font-bold text-slate-950">Local servers and listeners</h4>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={refreshPorts}
+                        disabled={projectIqLoading}
+                        className="rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs font-bold text-slate-700 transition hover:bg-blue-50 disabled:bg-slate-100"
+                      >
+                        Refresh
+                      </button>
+                    </div>
+
+                    <div className="mt-4 space-y-3">
+                      {portManagerResult?.ports?.length ? (
+                        portManagerResult.ports
+                          .slice(0, 12)
+                          .map((port) => {
+                            const primaryProcess = port.processes?.[0];
+                            const candidate = port.projectCandidates?.[0];
+                            const canControl = Boolean(port.devServerLikely && !port.currentAgent);
+
+                            return (
+                              <article
+                                key={`${port.port}-${primaryProcess?.processId || "unknown"}`}
+                                className={`rounded-xl border p-3 ${
+                                  port.currentAgent
+                                    ? "border-blue-200 bg-blue-50"
+                                    : port.devServerLikely
+                                      ? "border-emerald-200 bg-emerald-50"
+                                      : "border-slate-200 bg-slate-50"
+                                }`}
+                              >
+                                <div className="flex flex-wrap items-start justify-between gap-3">
+                                  <div className="min-w-0">
+                                    <div className="flex flex-wrap items-center gap-2">
+                                      <span className="font-mono text-sm font-black text-slate-950">:{port.port}</span>
+                                      <span className="rounded-full bg-white px-2 py-1 text-[11px] font-bold text-slate-600">
+                                        {port.currentAgent ? "PayFix Agent" : port.devServerLikely ? "Dev server" : "Listener"}
+                                      </span>
+                                      {primaryProcess?.processId ? (
+                                        <span className="rounded-full bg-white px-2 py-1 text-[11px] font-bold text-slate-500">
+                                          PID {primaryProcess.processId}
+                                        </span>
+                                      ) : null}
+                                    </div>
+                                    <div className="mt-2 truncate text-xs font-semibold text-slate-700">
+                                      {primaryProcess?.name || "Unknown process"}
+                                    </div>
+                                    <div className="mt-1 break-all text-[11px] leading-4 text-slate-500">
+                                      {candidate?.root || primaryProcess?.commandLine || primaryProcess?.executablePath || "No command line available."}
+                                    </div>
+                                  </div>
+
+                                  {canControl ? (
+                                    <div className="flex shrink-0 flex-wrap gap-2">
+                                      <button
+                                        type="button"
+                                        onClick={() => stopPort(port.port)}
+                                        disabled={projectIqLoading}
+                                        className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-rose-200 bg-white px-3 text-xs font-black text-rose-700 transition hover:bg-rose-50 disabled:bg-slate-100"
+                                      >
+                                        <Square size={13} />
+                                        Stop
+                                      </button>
+                                      {connectedProjectPath ? (
+                                        <button
+                                          type="button"
+                                          onClick={() => restartPort(port.port)}
+                                          disabled={projectIqLoading}
+                                          className="inline-flex h-8 items-center gap-1.5 rounded-lg bg-slate-950 px-3 text-xs font-black text-white transition hover:bg-slate-800 disabled:bg-slate-300"
+                                        >
+                                          <PlayCircle size={13} />
+                                          Restart
+                                        </button>
+                                      ) : null}
+                                    </div>
+                                  ) : null}
+                                </div>
+                              </article>
+                            );
+                          })
+                      ) : portManagerResult?.ok ? (
+                        <p className="text-sm text-slate-500">No dev-server-like listening ports were found.</p>
+                      ) : (
+                        <p className="text-sm text-amber-700">
+                          {portManagerResult?.error || "Run Scan Ports to inspect local listeners."}
+                        </p>
                       )}
                     </div>
                   </section>
@@ -4974,3 +10383,4 @@ ${shouldUseProjectContext ? fullProjectFiles || "No project file content was loa
     </main>
   );
 }
+

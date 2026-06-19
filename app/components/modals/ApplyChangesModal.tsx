@@ -7,8 +7,8 @@ type ApplyChangesModalProps = {
   agentFollowUpLoading: boolean;
   applyFilePath: string;
   setApplyFilePath: (value: string) => void;
-  applyMode: "insert" | "replace" | "overwrite";
-  setApplyMode: (value: "insert" | "replace" | "overwrite") => void;
+  applyMode: "insert" | "replace" | "overwrite" | "delete";
+  setApplyMode: (value: "insert" | "replace" | "overwrite" | "delete") => void;
   applySearchContent: string;
   setApplySearchContent: (value: string) => void;
   applyNewContent: string;
@@ -234,7 +234,7 @@ export default function ApplyChangesModal({
             <div className="rounded-2xl bg-white p-4 shadow-sm ring-1 ring-slate-200">
               <div className="text-[11px] font-black uppercase tracking-wide text-slate-400">Scope</div>
               <div className="mt-1 text-sm font-black text-slate-950">
-                {hasPatchSet ? `${patchSetFiles.length} files` : `${changedLineCount} changed lines`}
+                {applyMode === "delete" ? "Delete file" : hasPatchSet ? `${patchSetFiles.length} files` : `${changedLineCount} changed lines`}
               </div>
             </div>
           </div>
@@ -272,17 +272,22 @@ export default function ApplyChangesModal({
                 Mode
                 <select
                   value={applyMode}
-                  onChange={(e) => setApplyMode(e.target.value as "insert" | "replace" | "overwrite")}
+                  onChange={(e) => setApplyMode(e.target.value as "insert" | "replace" | "overwrite" | "delete")}
                   className="mt-1 block w-full rounded-xl border border-slate-300 bg-white p-3 text-sm normal-case tracking-normal"
                 >
                   <option value="insert">Insert / append</option>
                   <option value="replace">Replace exact block</option>
+                  <option value="delete">Delete file</option>
                 </select>
               </label>
             </div>
 
-            <div className="mt-3 rounded-xl bg-blue-50 p-3 text-sm leading-6 text-blue-900 ring-1 ring-blue-100">
-              {applyMode === "replace"
+            <div className={`mt-3 rounded-xl p-3 text-sm leading-6 ring-1 ${
+              applyMode === "delete" ? "bg-rose-50 text-rose-900 ring-rose-100" : "bg-blue-50 text-blue-900 ring-blue-100"
+            }`}>
+              {applyMode === "delete"
+                ? "Delete mode removes the selected file from disk. PayFix stores a rollback snapshot so Undo can restore it."
+                : applyMode === "replace"
                 ? "Replace mode only works when the exact current code block is found in the file."
                 : "Insert mode appends the snippet, or places browser scripts before </body> in HTML files."}
             </div>
@@ -296,12 +301,14 @@ export default function ApplyChangesModal({
               />
             )}
 
-            <textarea
-              value={applyNewContent}
-              onChange={(e) => setApplyNewContent(e.target.value)}
-              placeholder={applyMode === "overwrite" ? "New full file content" : "Snippet or replacement code"}
-              className="mt-3 h-28 w-full rounded-xl border border-slate-300 p-3 font-mono text-sm"
-            />
+            {applyMode !== "delete" && (
+              <textarea
+                value={applyNewContent}
+                onChange={(e) => setApplyNewContent(e.target.value)}
+                placeholder={applyMode === "overwrite" ? "New full file content" : "Snippet or replacement code"}
+                className="mt-3 h-28 w-full rounded-xl border border-slate-300 p-3 font-mono text-sm"
+              />
+            )}
 
             <div className="mt-3 flex flex-wrap items-center gap-3">
               <button onClick={onPreview} className="rounded-xl bg-purple-600 px-5 py-2 text-sm font-bold text-white shadow-sm transition hover:bg-purple-500">
@@ -312,7 +319,7 @@ export default function ApplyChangesModal({
                 disabled={!canApply}
                 className="rounded-xl bg-blue-600 px-5 py-2 text-sm font-bold text-white shadow-sm transition hover:bg-blue-500 disabled:cursor-not-allowed disabled:bg-slate-300 disabled:text-slate-500"
               >
-                {hasPatchSet ? "Apply This File" : "Apply Changes"}
+                {applyMode === "delete" ? "Delete File" : hasPatchSet ? "Apply This File" : "Apply Changes"}
               </button>
               {hasPatchSet && (
                 <button
@@ -341,9 +348,9 @@ export default function ApplyChangesModal({
           <div className="mt-4 rounded-2xl bg-slate-950 p-4 text-white shadow-lg ring-1 ring-slate-800">
             <div className="flex flex-wrap items-start justify-between gap-3">
               <div>
-                <div className="text-xs font-black uppercase tracking-wide text-blue-300">Agent Follow-up</div>
+                <div className="text-xs font-black uppercase tracking-wide text-blue-300">Patch Follow-up</div>
                 <div className="mt-1 text-sm text-slate-300">
-                  Ask PayFix to revise this patch, inspect another file, add another change, or explain the risk.
+                  Optional: ask PayFix to revise this preview, inspect another file, add another change, or explain the risk.
                 </div>
               </div>
               <span className="rounded-full bg-white/10 px-3 py-1 text-[11px] font-black text-slate-300">
@@ -369,10 +376,10 @@ export default function ApplyChangesModal({
                 disabled={agentFollowUpLoading || !followUpPrompt.trim()}
                 className="rounded-xl bg-blue-600 px-5 py-2 text-sm font-black text-white shadow-sm transition hover:bg-blue-500 disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-slate-400"
               >
-                {agentFollowUpLoading ? "Agent working..." : "Ask Agent"}
+                {agentFollowUpLoading ? "PayFix working..." : "Ask PayFix"}
               </button>
               <div className="text-xs text-slate-400">
-                This does not apply anything automatically. New changes still come back as a reviewable preview.
+                This is only for changing or explaining the patch. Apply Changes writes the current preview.
               </div>
             </div>
           </div>

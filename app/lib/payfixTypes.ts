@@ -7,7 +7,15 @@ export type ChatMessage = {
   generatedFiles?: GeneratedFile[];
   isAgentSessionSummary?: boolean;
   agentSessionMessages?: ChatMessage[];
+  agentPatchData?: unknown;
   patchAlreadyApplied?: boolean;
+  agentProgress?: AgentProgressStep[];
+};
+
+export type AgentProgressStep = {
+  step: string;
+  message: string;
+  at: string;
 };
 
 export type UploadedFile = {
@@ -16,6 +24,8 @@ export type UploadedFile = {
   size: number;
   content: string;
   isImage: boolean;
+  width?: number;
+  height?: number;
 };
 
 export type GeneratedFile = {
@@ -29,7 +39,17 @@ export type SavedChat = {
   id: string;
   title: string;
   createdAt: string;
+  lastActivityAt?: string;
   messages: ChatMessage[];
+  projectPath?: string;
+  connectedProjectPath?: string;
+  projectContext?: string;
+  computerSearchResults?: string;
+  computerSearchPreview?: string;
+  searchFolder?: string;
+  searchFileName?: string;
+  searchText?: string;
+  lastConnectedAt?: string;
 };
 
 export type RunnerMode = "html" | "css" | "js" | "unsupported";
