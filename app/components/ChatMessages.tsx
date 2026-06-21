@@ -290,6 +290,23 @@ function messageActionPrompts(content: string) {
     /Sandbox checks found failures|SANDBOX CHECKS[\s\S]*\bFAIL\b|PROJECT VALIDATION[\s\S]*\bFAIL\b|VALIDATION[\s\S]*\bFAIL\b|Build failed with an exception|Plugin \[id:/i.test(
       content,
     );
+  const isActionDiscoveryResponse =
+    /\b(what should i do|how do i fix|what are my options|what can be run|how can this be automated|next actions?|do next|recommended next)\b/i.test(
+      content,
+    ) ||
+    /\b(run analysis|search project|fix automatically|generate patch|run build|execute tests|trace issue)\b/i.test(content);
+  const isLargeProjectWork =
+    /\b(refactor|feature implementation|implement feature|multi-file|multiple files|long-running|large change|full app|full project|generated project|from scratch|dependency install|build loop|debug loop|migration|rewrite|codebase-wide)\b/i.test(
+      content,
+    );
+  const isSketchOrVisualPlan =
+    /\b(sketch|wireframe|mockup|prototype|ui concept|diagram|flowchart|app map|site map|sitemap|screen map|user flow|ux flow|dashboard design|visual plan)\b/i.test(
+      content,
+    );
+  const isSpreadsheetContext =
+    /\b(excel|spreadsheet|workbook|worksheet|xlsx|xls|csv|formula|formulas|macro|macros|vba|pivot|named range|#REF!|#VALUE!|#N\/A|cell|sheet)\b/i.test(
+      content,
+    );
 
   if (
     !hasBuiltPaxAndroidApp &&
@@ -377,6 +394,99 @@ function messageActionPrompts(content: string) {
       prompt:
         "Diagnose why the local PayFix agent is unreachable or outdated. Check the expected endpoints, connected project, and exact restart steps.",
     });
+  }
+
+  if (isActionDiscoveryResponse) {
+    if (/\b(error|failure|failed|exception|stack trace|traceback|root cause|debug|issue)\b/i.test(content)) {
+      actions.push({
+        label: "Run analysis",
+        prompt:
+          "Run a focused Agent analysis for the current issue. Use the latest request, attachments, connected project, and prior context. Identify the first concrete blocker and next safe action.",
+      });
+    }
+    if (/\b(project|repo|repository|codebase|file|files|source|component|class|function|dependency|SDK|artifact)\b/i.test(content)) {
+      actions.push({
+        label: "Search project",
+        prompt:
+          "Search the connected project for the exact files, symbols, configs, and dependency references related to the current issue. Report exact matches before proposing a patch.",
+      });
+    }
+    if (/\b(fix|patch|change|update|modify|repair|safe patch|source change|config change)\b/i.test(content)) {
+      actions.push({
+        label: "Generate patch",
+        prompt:
+          "Generate a safe patch preview for the current issue. Inspect exact files first, avoid unrelated changes, show changed lines, and run validation if applied.",
+      });
+    }
+    if (/\b(build|compile|gradle|maven|npm|pnpm|yarn|dotnet|cargo|pytest|validation|test|tests|lint|typecheck)\b/i.test(content)) {
+      actions.push({
+        label: /\b(test|tests)\b/i.test(content) && !/\bbuild|compile|gradle|maven\b/i.test(content) ? "Execute tests" : "Run build",
+        prompt:
+          "Run the right build/test/validation checks for the connected project. Show exact commands, exit status, important output, and the next concrete blocker or success state.",
+      });
+    }
+    if (/\b(trace|timeline|flow|request path|payment|transaction|emv|tlv|gateway|network|sequence)\b/i.test(content)) {
+      actions.push({
+        label: "Trace issue",
+        prompt:
+          "Trace the current issue end to end. Build a concise timeline from available evidence, identify the first proven divergence, and recommend the next action.",
+      });
+    }
+    if (isSpreadsheetContext) {
+      actions.push({
+        label: "Analyze workbook",
+        prompt:
+          "Analyze the attached spreadsheet/workbook. Inspect sheets, formulas, broken references, named ranges, pivots, macros/VBA if present, and explain the concrete issue before asking for more information.",
+      });
+    }
+  }
+
+  if (isLargeProjectWork) {
+    actions.push({
+      label: "Open Agent session",
+      prompt:
+        "Open a dedicated Agent session for this larger project task. Keep context isolated, inspect the connected project, track steps clearly, prepare safe changes, and validate before reporting completion.",
+    });
+  }
+
+  if (isSketchOrVisualPlan) {
+    actions.push(
+      {
+        label: "Make modern",
+        prompt:
+          "Revise the latest sketch/design to feel more modern and production-ready. Preserve the product concept while improving hierarchy, spacing, and polish.",
+      },
+      {
+        label: "Improve UX",
+        prompt:
+          "Improve the latest sketch/design for UX clarity. Preserve the concept, make the workflow clearer, reduce clutter, and explain the key changes.",
+      },
+      {
+        label: "Create code",
+        prompt:
+          "Create a runnable app/project from the latest generated sketch/design. Ask for or use target parent path, folder name, stack, and assets, then create files and validation steps.",
+      },
+    );
+  }
+
+  if (isSpreadsheetContext) {
+    actions.push(
+      {
+        label: "Analyze workbook",
+        prompt:
+          "Analyze the attached spreadsheet/workbook. Inspect sheets, formulas, broken references, named ranges, pivots, macros/VBA if present, and explain the concrete issue before asking for more information.",
+      },
+      {
+        label: "Run formulas",
+        prompt:
+          "Evaluate or recalculate the spreadsheet formulas available from the uploaded workbook/CSV evidence, then list formula errors, broken references, and expected outputs.",
+      },
+      {
+        label: "Fix references",
+        prompt:
+          "Find broken spreadsheet references, missing sheets, bad named ranges, formula errors, or pivot source issues in the current workbook evidence and prepare a safe fix plan.",
+      },
+    );
   }
 
   const seen = new Set<string>();

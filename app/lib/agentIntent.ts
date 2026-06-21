@@ -229,6 +229,32 @@ export function asksToRunReferencedCommands(text: string) {
   return asksRun && (referencesExplicitCommand || referencesPriorAction);
 }
 
+export function asksToExecutePreviousAction(text: string, previousAssistant = "") {
+  const trimmed = text.trim();
+  if (!trimmed || !previousAssistant.trim() || trimmed.length > 420) return false;
+
+  const asksInformationOnly =
+    /\b(what|where|which|why|how|explain|clarify|mean|means|where exactly|what exactly|which one|what do i click|where do i click)\b/i.test(
+      trimmed,
+    ) && !/\b(do it|do this|do that|run those|run them|apply it|apply that|fix it|patch it|install it|generate it|build it|execute it)\b/i.test(
+      trimmed,
+    );
+  if (asksInformationOnly) return false;
+
+  const asksExecution =
+    /\b(can you|could you|please|go ahead|proceed|continue|do it|do this|do that|run it|run those|run them|execute|execute it|apply(?: the)? changes?|apply it|make(?: the)? update|fix this for me|fix it|patch it|install it|generate it|create it|build it|wire it|implement it|update it|retry|rerun|re-run|validate it|check it|confirm it)\b/i.test(
+      trimmed,
+    ) ||
+    /^(?:yes|y|ok|okay|sure|do it|go|proceed|continue|apply|patch|install|generate|build|fix|run|validate|retry|rerun|check|confirm)$/i.test(
+      trimmed,
+    );
+  if (!asksExecution) return false;
+
+  return /\b(command|commands?|run|execute|apply|patch|install|generate|create|build|wire|implement|update|fix|validation|validate|test|lint|dependency|package|artifact|file|folder|project|diff|preview|option|choose one|next action|next step)\b/i.test(
+    previousAssistant,
+  );
+}
+
 function asksToRecallPreviousCommand(text: string, previousAssistant = "") {
   const trimmed = text.trim();
   if (!trimmed || !previousAssistant.trim() || trimmed.length > 260) return false;
@@ -469,6 +495,7 @@ function isScreenshotVerificationOfPreviousInstructions(prompt: string, hasImage
 export function classifyAgentFollowUpIntent(input: AgentFollowUpIntentInput): AgentFollowUpIntent {
   const { prompt, hasImages, hasProject, isPaxAndroidBuiltSession, previousAssistant } = input;
   const asksForReferencedRun = asksToRunReferencedCommands(prompt);
+  const asksForPreviousExecution = asksToExecutePreviousAction(prompt, previousAssistant);
 
   if (!prompt.trim() && hasImages) {
     return {
@@ -534,6 +561,24 @@ export function classifyAgentFollowUpIntent(input: AgentFollowUpIntentInput): Ag
     return {
       route: "focused-follow-up",
       reason: "The user says a prior step is already done and asks what remains, so answer the changed situation instead of replaying the same step.",
+    };
+  }
+
+  if (asksForPreviousExecution && (hasProject || isPaxAndroidBuiltSession) && !userReportsErrorsGone(prompt)) {
+    const previousLooksLikeBuildOrValidation =
+      /\b(Gradle|gradlew|build|sync|compile|PKIX|SSL handshake|Could not resolve|BUILD FAILED|CONFIGURE FAILED|Maven|truststore|JDK|JBR|settings\.gradle|build\.gradle)\b/i.test(
+        previousAssistant,
+      );
+    return {
+      route: isPaxAndroidBuiltSession || previousLooksLikeBuildOrValidation ? "build-error" : "project-error",
+      reason: "The user is asking PayFix to execute the most recent actionable Agent step.",
+    };
+  }
+
+  if (asksForPreviousExecution && !userReportsErrorsGone(prompt)) {
+    return {
+      route: "focused-follow-up",
+      reason: "The user is asking PayFix to execute the previous action, but no connected project state was provided.",
     };
   }
 

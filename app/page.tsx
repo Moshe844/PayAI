@@ -1472,9 +1472,9 @@ export default function Home() {
 
     return `This belongs in Regular Chat, not Agent mode.
 
-Regular Chat is the right place for reading, explaining, comparing, or summarizing logs, screenshots, uploaded images, gateway responses, TLV/EMV evidence, and general questions.
+Regular Chat is the right place for reading, explaining, comparing, or summarizing logs, screenshots, uploaded images, gateway responses, TLV/EMV evidence, general questions, drafts, concepts, and mockups.
 
-Use Agent mode when you want PayFix to change files, inspect a connected project, prepare/apply a patch, install dependencies, run validation, create a new project, or launch Visual Fix against real project code. If the question is random or not related to the current project/action, ask it in Regular Chat.
+Use Agent mode when you want PayFix to change project files, inspect a connected repository, prepare/apply a patch, install dependencies, run commands/builds/tests, create a new project, or launch Visual Fix against real project code. Regular Chat should not claim it modified files, ran commands, or accessed repos; it should offer Open in Agent for those actions.
 
 Send this in Regular Chat:
 ${prompt}${fileText}`;
@@ -6456,8 +6456,22 @@ This is a machine/network trust problem around Maven Central, not a missing app 
         {
           role: "assistant",
           content: spreadsheetUploads.length
-            ? "I can accept spreadsheet uploads now, but direct Excel/XLSX editing is not wired yet. The right next feature is a safe spreadsheet editor that previews cell/sheet changes and returns an updated downloadable workbook."
-            : "Attach the Excel/CSV file first. PayFix can accept spreadsheet uploads now, but direct XLSX editing still needs the safe spreadsheet editor before it can return an updated workbook.",
+            ? `I can work with this spreadsheet evidence now.
+
+What I can do from the upload:
+- Analyze sheets, visible formulas, CSV values, formula errors, broken references, named ranges, pivots, and macro/VBA evidence when it is readable.
+- Explain what is wrong and give exact formula or workbook changes.
+- Route heavier workbook repair into Agent so it can inspect files, prepare a safe change plan, and export results when the workbook editor is available.
+
+Useful next actions:
+A. Analyze workbook
+B. Run formulas / check outputs
+C. Debug macro or VBA
+D. Fix broken references
+E. Export results`
+            : `Attach the Excel/CSV file first.
+
+Once attached, PayFix can analyze sheets, formulas, macros/VBA evidence, pivots, broken references, and expected outputs before asking follow-up questions.`,
         },
       ];
       setMessages(finalMessages);

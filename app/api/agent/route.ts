@@ -1263,9 +1263,9 @@ function regularChatRedirectMarkdown(prompt: string, uploadedFiles: UploadedFile
 
   return `This belongs in Regular Chat, not Agent mode.
 
-Regular Chat is the right place for reading, explaining, comparing, or summarizing logs, screenshots, uploaded images, gateway responses, TLV/EMV evidence, and general questions.
+Regular Chat is the right place for reading, explaining, comparing, or summarizing logs, screenshots, uploaded images, gateway responses, TLV/EMV evidence, general questions, drafts, concepts, and mockups.
 
-Use Agent mode when you want PayFix to change files, inspect a connected project, prepare/apply a patch, install dependencies, run validation, create a new project, or launch Visual Fix against real project code.
+Use Agent mode when you want PayFix to change project files, inspect a connected repository, prepare/apply a patch, install dependencies, run commands/builds/tests, create a new project, or launch Visual Fix against real project code. Regular Chat must not claim it modified files, ran commands, or accessed repositories; it should offer Open in Agent for those actions.
 
 Send this in Regular Chat:
 ${prompt}${attached}`;
@@ -2953,7 +2953,7 @@ function buildDeleteFileFallback({
 function explicitDeleteFileNames(text: string) {
   if (!/\b(delete|remove)\b/i.test(text)) return [];
 
-  const extensions = "html|tsx?|jsx?|css|scss|json|md|txt|log|xml|csv|py|cs|java|php|rb|go|rs";
+  const extensions = "html|tsx?|jsx?|css|scss|json|md|txt|log|xml|csv|tsv|xlsx?|xls|py|cs|java|php|rb|go|rs";
   const quoted = [...text.matchAll(new RegExp(`["'\`]([^"'\`\\r\\n]+\\.(?:${extensions}))["'\`]`, "gi"))].map(
     (match) => match[1],
   );
@@ -7055,14 +7055,18 @@ ${PAYFIX_REVISION_STANDARD}
 Workflow:
 1. Use only inspected file content, uploaded files, logs, and computer search.
 2. Resolve vague references from RECENT CONVERSATION when the latest request says things like "do it", "fix it", "complete it", "that file", or "the script".
-3. Decide whether a code patch is actually needed.
-4. If a patch is needed, return one exact patch.
+3. Classify the latest user turn as information, recommendation, execution, or project change before responding.
+4. Detect the connected project's framework, language, build system, package manager, and test framework from inspected files/diagnostics before recommending commands or edits.
+5. Decide whether a code patch is actually needed.
+6. If a patch is needed, return one exact patch.
 
 Trust rules:
 - rootCause.status must be "found" only when exact inspected file content proves it.
 - rootCause.evidence must quote or summarize exact inspected lines, STRUCTURAL SCAN output, validation output, uploaded logs, or screenshot evidence.
 - rootCause.exactReferences must use "FullPath:line" or "relative/path:line" when source code evidence exists.
 - PROJECT DIAGNOSTICS is the source of truth when commands ran. If any command failed, focus on the first concrete failed command and its exact file/line output before doing broad speculation.
+- If the user uploads command output or a terminal screenshot, compare it with the most recent command/instruction in RECENT CONVERSATION. Detect no output, hanging/silent commands, missing JAVA_HOME/PATH/tooling, failed executions, and successful executions before asking follow-up questions.
+- If the user asks PayFix to run/check/build/validate a command that can be performed by the local agent against the connected project, treat it as an execution request. Report exact commands tried, exit status, important output, and what remains blocked. If it requires admin rights, a certificate file, credentials, GUI-only interaction, or system-folder writes, say that exact boundary.
 - When the user asks vaguely like "fix the bugs", "still broken", or "make it work", continue from the latest failed validation/diagnostic output. Do not repeat already-fixed issues unless diagnostics still prove them.
 - When the user provides an IDE/build error screenshot or asks "check for more errors", "fix this error", "what exactly next", or similar with a connected project, behave like an active project agent: run with diagnostics evidence, inspect exact files, prepare a patch when safe, then give exact next IDE/build steps.
 - For Gradle/Maven/npm/dotnet/cargo/go/python/flutter/composer/ruby failures, treat command output as stronger evidence than generic file selection. Prioritize config/build files named by the diagnostic output, repository/plugin/dependency errors, and generated source files affected by the latest task.
@@ -7075,6 +7079,7 @@ Trust rules:
 - If PROJECT DIAGNOSTICS says "Toolchain missing", say validation is incomplete for that language/tool until the missing command is installed. Do not claim the project is fully validated.
 - For missing delimiter reports, name the exact missing token and the exact line from STRUCTURAL SCAN or PROJECT FILES.
 - If the request is a feature request rather than a bug, use rootCause.status="not_applicable".
+- For project changes, always include affected files, planned changes, validation, and rollback/undo expectations in the answer or structured fields. If no patch is produced, explain the exact missing permission/file/tool/evidence.
 - investigation.filesScanned must list inspected project files.
 - investigation.filesIgnored should list obvious nearby/project files you did not inspect when they appeared unnecessary, or an empty array if unknown.
 - investigation.searchTermsUsed should list the terms you used mentally to select files.
@@ -7093,6 +7098,12 @@ Image reasoning rules:
 - Do not say the uploaded image is SVG/PDF/etc. unless UPLOADED FILES says that is its actual MIME type or extension.
 - If text inside a screenshot mentions another filename, for example "file.svg", treat that as text shown inside the screenshot, not as the uploaded file name.
 - If the user asks "what is this image?", answer what the whole screenshot shows, not only the smallest icon inside it.
+
+Spreadsheet/workbook rules:
+- Treat XLSX, XLS, CSV, spreadsheet screenshots, formulas, macro/VBA text, named ranges, and pivot-table evidence as first-class context.
+- If the user uploads a workbook/spreadsheet and says "it's not working", inspect formulas, visible cell errors, broken references, missing sheets, macro/VBA failures, named ranges, pivots, and expected outputs before asking for more information.
+- If binary workbook contents cannot be fully parsed from available evidence, say exactly what was readable and what workbook/parser/export evidence is missing. Do not pretend to recalculate invisible formulas.
+- Offer useful actions only when relevant: Analyze workbook, Run formulas, Debug macro, Generate formula, Create pivot table, Fix broken references, Export results.
 
 Patch rules:
 - The agent never writes files directly. It only prepares a preview. In answer/findings/explanation, say "prepared", "would add", "would update", or "previewed"; never say "I added", "I changed", "I replaced", or imply the code was already written.
@@ -7128,6 +7139,9 @@ Vendor SDK / generated app rules:
 - Do not claim to read full binary contents of .aar/.jar/.apk files. You may identify and reference those artifacts by exact path/name/size.
 - For generated Android/POS apps, prefer copying needed vendor libraries into app/libs, adding Gradle fileTree or explicit dependency entries, adding manifest permissions from docs, and creating bridge classes based on readable AIDL/sample/docs evidence.
 - For any other generated app or SDK integration, apply the same pattern generically: identify the project type/build system, inspect vendor SDK/docs/samples, copy or reference only needed artifacts, update package/build/config files, create integration wrapper/bridge files, run validation, and report exact remaining blockers.
+- For sketch-to-application work, infer whether a backend is required from the design. Auth/login/signup, registration, payments, dashboards, user management, file uploads, API integrations, reports, inventory, saved data, and CRUD usually need backend/server choices. Marketing, landing, brochure, portfolio, and informational pages usually do not.
+- When a backend is required, recommend compatible server options for the chosen frontend/mobile/desktop stack rather than showing every stack. Examples: Next.js API routes for Next.js, Express/Nest/ASP.NET/FastAPI for React/Vue/Angular, Firebase/Node/ASP.NET/FastAPI for mobile, ASP.NET for Blazor/WPF/WinForms.
+- Support frontend, backend, desktop, and mobile generated-project targets. Do not limit generated apps to HTML/CSS/JS, React, or Next.js.
 - Do not force PAX/Android assumptions onto non-PAX projects. Use the connected project's actual stack, IDE/build files, and SDK artifacts.
 - If an SDK folder is missing or unreadable, ask for the extracted SDK folder path. If the user only has a zip, tell them to extract it first. Multiple SDK/artifact roots are allowed.
 - If the user says "build it", "go ahead", "create the full app", or similar, treat it as an action request, not a passive investigation. Prepare the safest concrete patch you can against the connected project.

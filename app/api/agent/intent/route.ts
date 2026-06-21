@@ -92,14 +92,17 @@ Critical behavior:
 - First decide whether the latest turn is an information question, recommendation question, execution request, or project-change request. Do not route an information question into a patch/log-comparison flow.
 - Treat short clarification turns like "what now", "where exactly", "please clarify", "what do I click", "which option", and "what exactly should I do" as dependent follow-ups. Resolve them against PREVIOUS ASSISTANT MESSAGE and RECENT CONVERSATION instead of starting a fresh task.
 - Treat terse replies like "yes", "ok", "run", "check", "confirm", "verify", "fix", "apply", "continue", "again", "same", "this", "that", "those", "why", "where", "which", and "no" as contextual turns. Decide whether they refer to the previous answer, the current uploaded screenshots/files, the current project error, or a new action. Never route those terse replies to log/evidence comparison unless the previous/current context is actually log comparison.
-- If the previous assistant listed commands or checks and the latest user says "run those", "check them", "confirm", "do it", or similar, route to build-error/project-error with shouldRunProjectValidation=true when a project is connected.
+- If the previous assistant listed commands, checks, patches, installs, generated files, or other executable actions and the latest user says "run those", "check them", "confirm", "do it", "go ahead", "proceed", "please execute", "make the update", "install it", "patch it", "generate it", or similar, route to build-error/project-error with shouldRunProjectValidation=true when a project is connected.
 - If the user says they already completed a step ("already whitelisted", "already imported", "already added the SDK folder", "already connected", "I did that") and asks what remains, route focused-follow-up unless they explicitly ask PayFix to run validation/build/fix files.
 - If the latest turn is a new project request, answer/action the current turn. Do not let stale history override the latest request.
 - If the latest turn is a random/general question unrelated to project work, screenshots/files/log evidence, validation, dependencies, generated apps, or specialized PayFix tools, do not route it into project work.
 - Do not route simple human follow-up questions to build-error just because older context contains a build failure.
 - Do not use images just because old images exist. useImages=true only when the latest prompt references images/screenshots/visible UI or cannot be answered without them.
 - If the latest prompt asks to implement, remove, add, patch, build, install, wire, validate, or fix project files, choose generic/project-error/build-error as appropriate.
-- If the latest prompt asks what something means or where something is, choose focused-follow-up.`,
+- If the latest prompt asks what something means or where something is, choose focused-follow-up.
+- If the user asks "what should I do", "how do I fix this", "what are my options", "what can be run", or "how can this be automated", classify from the current context: focused-follow-up for explanation/options, build-error/project-error when the natural next step is executable validation/patching, and exact-next-steps when they only need workflow steps.
+- Larger tasks such as refactors, feature implementation, multi-file changes, generated apps, dependency installs, or long-running build/debug loops should remain in Agent mode and may recommend a dedicated Agent session.
+- Sketches, wireframes, mockups, UI concepts, and diagrams are visual-generation/design flows. Follow-up edits to the latest design should stay connected to that latest generated visual.`,
         },
         {
           role: "user",

@@ -144,6 +144,55 @@ const cases: Case[] = [
     hasProject: true,
     previousAssistant:
       "Quick workaround: use mavenLocal() with manually installed artifacts. Run mvn install:install-file for the required jars and poms.",
+    expected: "project-error",
+  },
+  {
+    name: "proceed executes previous patch action",
+    prompt: "proceed",
+    hasProject: true,
+    previousAssistant:
+      "Next action: patch the connected Gradle project to prefer mavenLocal() only if the local artifact folder has the required pom/jar files.",
+    expected: "build-error",
+  },
+  {
+    name: "make the update executes previous file patch action",
+    prompt: "make the update",
+    hasProject: true,
+    previousAssistant:
+      "I can update app/build.gradle.kts to add the local file repository before remote repositories and then run validation.",
+    expected: "build-error",
+  },
+  {
+    name: "install it executes previous dependency action",
+    prompt: "install it",
+    hasProject: true,
+    previousAssistant:
+      "The missing dependency is zod. Install it with npm install zod, then run npm test.",
+    expected: "project-error",
+  },
+  {
+    name: "are you able to do this resolves to previous agent action",
+    prompt: "are you able to do this for me?",
+    hasProject: true,
+    previousAssistant:
+      "PayFix can inspect the connected project, create the patch, and run validation if you want it to proceed.",
+    expected: "project-error",
+  },
+  {
+    name: "please execute latest build commands routes to build-error",
+    prompt: "please execute it",
+    hasProject: true,
+    isPaxAndroidBuiltSession: true,
+    previousAssistant:
+      "Run these checks next: .\\gradlew.bat --stop, then .\\gradlew.bat build. This verifies the current Gradle blocker.",
+    expected: "build-error",
+  },
+  {
+    name: "where exactly remains information, not execution",
+    prompt: "where exactly do I run it?",
+    hasProject: true,
+    previousAssistant:
+      "Run .\\gradlew.bat --no-daemon --info --stacktrace dependencies --configuration debugRuntimeClasspath from the project root.",
     expected: "focused-follow-up",
   },
   {

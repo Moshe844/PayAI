@@ -136,13 +136,22 @@ function asksToRunReferencedCommandsText(content: string) {
   const normalized = compactAgentDisplayText(content);
   if (!normalized || normalized.length > 360) return false;
 
-  const asksRun = /\b(can you|could you|please|go ahead|run|rerun|execute|try|check|confirm|verify|validate|do)\b/i.test(normalized);
+  const asksRun =
+    /\b(can you|could you|please|go ahead|proceed|continue|run|rerun|execute|try|check|confirm|verify|validate|do|apply|patch|install|generate|build|fix)\b/i.test(
+      normalized,
+    );
   const referencesExplicitCommand =
-    /\b(those|these|them|that|it|the)\s+(commands?|checks?|steps?|validation|build|tests?)\b/i.test(normalized);
+    /\b(those|these|them|that|it|the)\s+(commands?|checks?|steps?|validation|build|tests?|patch|fix|update|install|dependency|action)\b/i.test(
+      normalized,
+    );
   const referencesPriorAction =
     /\b(those|these|them|that|it)\b/i.test(normalized) && /\b(for me|to confirm|again|now|please)\b/i.test(normalized);
+  const directPreviousAction =
+    /\b(do it|do this|do that|apply it|patch it|install it|generate it|build it|fix it|make the update|please execute|execute it)\b/i.test(
+      normalized,
+    );
 
-  return asksRun && (referencesExplicitCommand || referencesPriorAction);
+  return asksRun && (referencesExplicitCommand || referencesPriorAction || directPreviousAction);
 }
 
 function isPlainFocusedQuestionText(content: string) {
@@ -203,7 +212,33 @@ type AgentAction = {
   kind?: "applyVerifiedPatch" | "installDependency" | "runValidation";
 };
 
-const PROJECT_STACK_OPTIONS = ["Next.js app", "Vite React app", "Static HTML app"];
+const PROJECT_STACK_OPTIONS = [
+  "Next.js app",
+  "Vite React app",
+  "Static HTML app",
+  "Vue",
+  "Nuxt",
+  "Angular",
+  "Svelte",
+  "SvelteKit",
+  "React Native",
+  "Flutter",
+  "Electron",
+  "Blazor",
+  "ASP.NET Core",
+  "Laravel",
+  "FastAPI",
+  "Django",
+  "Spring Boot",
+  "Go Gin",
+  "Ruby on Rails",
+  "Tauri",
+  "WPF",
+  "WinForms",
+  "Avalonia",
+  "MAUI",
+];
+const BACKEND_STACK_OPTIONS = ["Auto-detect", "None", "Node.js/Express", "NestJS", "ASP.NET Core API", "FastAPI", "Django", "Laravel", "Spring Boot", "Go Gin", "Ruby on Rails", "Firebase"];
 const IDE_TARGET_OPTIONS = [
   "Auto-detect from project",
   "Android Studio",
@@ -781,6 +816,30 @@ function latestGeneratedProjectWasDeleted(messages: ChatMessage[]) {
   return Boolean(lifecycleMessage && /\bGENERATED PROJECT DELETED\b/i.test(lifecycleMessage.content));
 }
 
+function sketchLikelyNeedsBackend(messages: ChatMessage[]) {
+  const source = messages
+    .slice(-8)
+    .map((message) => message.content)
+    .join("\n")
+    .toLowerCase();
+  if (/\b(marketing|landing page|brochure|portfolio|informational|static site|coming soon|one-page site)\b/i.test(source)) {
+    return false;
+  }
+  return /\b(login|sign ?up|signup|registration|register|auth|account|user management|payment|checkout|dashboard|admin|inventory|stock|orders?|purchase orders?|reporting|reports|file upload|uploads?|api integration|database|crud|forms? with saved data)\b/i.test(
+    source,
+  );
+}
+
+function backendOptionsForFrontend(frontend: string) {
+  const normalized = frontend.toLowerCase();
+  if (/next/.test(normalized)) return ["Auto-detect", "Built-in API Routes", "Express", "ASP.NET Core API", "FastAPI"];
+  if (/vue|nuxt/.test(normalized)) return ["Auto-detect", "Express", "NestJS", "Laravel", "ASP.NET Core API"];
+  if (/flutter|react native|maui/.test(normalized)) return ["Auto-detect", "Firebase", "ASP.NET Core API", "Node.js/Express", "FastAPI"];
+  if (/angular/.test(normalized)) return ["Auto-detect", "NestJS", "ASP.NET Core API", "Spring Boot", "Express"];
+  if (/blazor|wpf|winforms|avalonia|asp\.net/.test(normalized)) return ["Auto-detect", "ASP.NET Core API", "Built-in API Routes"];
+  return BACKEND_STACK_OPTIONS;
+}
+
 function agentMessageView(content: string): AgentMessageView | null {
   if (/^ENVIRONMENT BLOCKER: GRADLE CERTIFICATE TRUST/i.test(content)) {
     const latestNoteChanges = cleanAgentLines(extractSection(content, ["What your latest note changes"]), 2);
@@ -1144,6 +1203,16 @@ function agentActionPrompts(content: string): AgentAction[] {
     actions.push(executionAction);
   }
 
+  actions.push(...actionDiscoveryActions(content, actions));
+
+  const dedicatedAction = dedicatedSessionAction(content, actions);
+  if (dedicatedAction) {
+    actions.push(dedicatedAction);
+  }
+
+  actions.push(...sketchFollowUpActions(content, actions));
+  actions.push(...spreadsheetFollowUpActions(content, actions));
+
   if (patchReady) {
     actions.push({
       label: "Apply verified patch",
@@ -1367,6 +1436,170 @@ function environmentBlockerActions(content: string, actions: AgentAction[]): Age
   return detectedActions;
 }
 
+function actionDiscoveryActions(content: string, actions: AgentAction[]): AgentAction[] {
+  const detectedActions: AgentAction[] = [];
+  const asksOrListsOptions =
+    /\b(what should i do|how do i fix|what are my options|what can be run|how can this be automated|options|next actions?|do next|recommended next)\b/i.test(
+      content,
+    ) ||
+    /\b(run analysis|search project|fix automatically|generate patch|run build|execute tests|trace issue)\b/i.test(content);
+
+  if (!asksOrListsOptions) return detectedActions;
+
+  if (/\b(error|failure|failed|exception|stack trace|traceback|root cause|debug|diagnos|investigat|issue)\b/i.test(content)) {
+    detectedActions.push({
+      label: "Run analysis",
+      displayPrompt: "Run analysis",
+      prompt:
+        "Run a focused Agent analysis for the current issue. Use the latest request, attachments, connected project, and prior context. Identify the first concrete blocker, exact files/evidence, and the next safe action. Do not replay stale setup steps.",
+    });
+  }
+
+  if (/\b(project|repo|repository|codebase|file|files|source|component|class|function|import|dependency|SDK|artifact)\b/i.test(content)) {
+    detectedActions.push({
+      label: "Search project",
+      displayPrompt: "Search project",
+      prompt:
+        "Search the connected project for the files, symbols, configs, and dependency references related to the current issue. Report exact matches and the likely source file before proposing any patch.",
+    });
+  }
+
+  if (/\b(fix|patch|change|update|modify|repair|safe patch|source change|config change)\b/i.test(content)) {
+    detectedActions.push({
+      label: "Generate patch",
+      displayPrompt: "Generate patch",
+      prompt:
+        "Generate a safe patch preview for the current issue. Inspect exact files first, avoid unrelated changes, show the diff/changed lines, and run validation if the patch is applied.",
+    });
+  }
+
+  if (/\b(build|compile|gradle|maven|npm|pnpm|yarn|dotnet|cargo|go test|pytest|validation|test|tests|lint|typecheck)\b/i.test(content)) {
+    const testOnly = /\b(test|tests)\b/i.test(content) && !/\bbuild|compile|gradle|maven\b/i.test(content);
+    detectedActions.push({
+      label: testOnly ? "Execute tests" : "Run build",
+      displayPrompt: testOnly ? "Execute tests" : "Run build",
+      prompt:
+        "Run the right build/test/validation checks for the connected project. Show exact commands, exit status, important output, and the next concrete blocker or success state.",
+    });
+  }
+
+  if (/\b(trace|timeline|flow|request path|payment|transaction|emv|tlv|gateway|network|sequence)\b/i.test(content)) {
+    detectedActions.push({
+      label: "Trace issue",
+      displayPrompt: "Trace issue",
+      prompt:
+        "Trace the current issue end to end. Build a concise timeline from available logs, screenshots, files, and project evidence, then identify the first proven divergence and next action.",
+    });
+  }
+
+  if (isSpreadsheetContext(content)) {
+    detectedActions.push({
+      label: "Analyze workbook",
+      displayPrompt: "Analyze workbook",
+      prompt:
+        "Analyze the attached spreadsheet/workbook in the current context. Inspect sheets, formulas, references, named ranges, pivots, macros/VBA when available, and explain the first concrete issue plus the safest next action.",
+    });
+  }
+
+  return detectedActions.filter((action) => !hasActionLabel(actions, action.label)).slice(0, 3);
+}
+
+function dedicatedSessionAction(content: string, actions: AgentAction[]): AgentAction | null {
+  if (hasActionLabel(actions, "Open Agent session")) return null;
+  if (
+    !/\b(refactor|feature|implement|multi-file|multiple files|long-running|large change|full app|full project|generated project|from scratch|dependency install|build loop|debug loop|migration|rewrite|codebase-wide)\b/i.test(
+      content,
+    )
+  ) {
+    return null;
+  }
+
+  return {
+    label: "Open Agent session",
+    displayPrompt: "Open dedicated Agent session",
+    prompt:
+      "Open a dedicated Agent session for this larger project task. Keep the context isolated, inspect the connected project, track steps clearly, prepare safe changes, and validate before reporting completion.",
+  };
+}
+
+function sketchFollowUpActions(content: string, actions: AgentAction[]): AgentAction[] {
+  if (
+    !/\b(sketch|wireframe|mockup|prototype|ui concept|diagram|flowchart|app map|site map|sitemap|screen map|user flow|ux flow|dashboard design|visual plan)\b/i.test(
+      content,
+    )
+  ) {
+    return [];
+  }
+
+  const variants: AgentAction[] = [
+    {
+      label: "Make modern",
+      displayPrompt: "Make modern",
+      prompt:
+        "Revise the latest generated sketch/design to feel more modern and production-ready. Preserve the same product concept and improve hierarchy, spacing, and polish.",
+    },
+    {
+      label: "Improve UX",
+      displayPrompt: "Improve UX",
+      prompt:
+        "Improve the latest generated sketch/design for UX clarity. Preserve the concept, make the workflow clearer, reduce clutter, and explain the key changes.",
+    },
+    {
+      label: "Mobile friendly",
+      displayPrompt: "Mobile friendly",
+      prompt:
+        "Revise the latest generated sketch/design into a mobile-friendly version with clear navigation, responsive layout, and readable controls.",
+    },
+    {
+      label: "Create code",
+      displayPrompt: "Create code from sketch",
+      prompt:
+        "Create a runnable app/project from the latest generated sketch/design. Ask for or use the target parent path, folder name, stack, and any assets, then create files and validation steps.",
+    },
+  ];
+
+  return variants.filter((action) => !hasActionLabel(actions, action.label)).slice(0, 4);
+}
+
+function isSpreadsheetContext(content: string) {
+  return /\b(excel|spreadsheet|workbook|worksheet|xlsx|xls|csv|formula|formulas|macro|macros|vba|pivot|named range|#REF!|#VALUE!|#N\/A|cell|sheet)\b/i.test(
+    content,
+  );
+}
+
+function spreadsheetFollowUpActions(content: string, actions: AgentAction[]): AgentAction[] {
+  if (!isSpreadsheetContext(content)) return [];
+
+  const variants: AgentAction[] = [
+    {
+      label: "Analyze workbook",
+      displayPrompt: "Analyze workbook",
+      prompt:
+        "Analyze the attached spreadsheet/workbook. Inspect sheets, formulas, broken references, named ranges, pivots, macros/VBA if present, and explain the concrete issue before asking for more information.",
+    },
+    {
+      label: "Run formulas",
+      displayPrompt: "Run formulas",
+      prompt:
+        "Evaluate or recalculate the spreadsheet formulas that are available from the uploaded workbook/CSV evidence. Compare expected outputs with actual outputs and list any broken references or formula errors.",
+    },
+    {
+      label: "Debug macro",
+      displayPrompt: "Debug macro",
+      prompt:
+        "Inspect the workbook macro/VBA evidence if present, explain what the macro is doing, identify failures, and prepare a safe fix or exact next debugging step.",
+    },
+    {
+      label: "Fix references",
+      displayPrompt: "Fix broken references",
+      prompt:
+        "Find broken spreadsheet references, missing sheets, bad named ranges, formula errors, or pivot source issues in the current workbook evidence and prepare a safe fix plan.",
+    },
+  ];
+
+  return variants.filter((action) => !hasActionLabel(actions, action.label)).slice(0, 3);
+}
+
 function projectCommandExecutionAction(content: string, actions: AgentAction[]): AgentAction | null {
   if (hasActionLabel(actions, "Run Gradle validation") || hasActionLabel(actions, "Run project commands")) return null;
 
@@ -1489,10 +1722,14 @@ function workingCopyForPrompt(prompt: string, hasProject: boolean) {
     };
   }
 
-  if (/build|create|generate|full app|full project|android studio|gradle|sdk|vendor|poslink|paxstore|from scratch/i.test(prompt)) {
+  if (
+    /build|create|generate|full app|full project|android studio|gradle|sdk|vendor|poslink|paxstore|from scratch|go ahead|proceed|continue|do it|apply it|patch it|install it|make the update/i.test(
+      prompt,
+    )
+  ) {
     return {
-      message: "Building the project plan...",
-      steps: ["Inspect project", "Inspect SDKs", "Check dependencies", "Plan files", "Preview patch", "Validate"],
+      message: "Carrying out the requested Agent action...",
+      steps: ["Resolve context", "Inspect project", "Check dependencies", "Prepare change", "Validate"],
     };
   }
 
@@ -1666,6 +1903,7 @@ export default function AgentSessionModal({
   const [builderParentPath, setBuilderParentPath] = useState(() => parentPathFromProjectPath(connectedProjectPath));
   const [builderFolderName, setBuilderFolderName] = useState("");
   const [builderStack, setBuilderStack] = useState(PROJECT_STACK_OPTIONS[0]);
+  const [builderBackend, setBuilderBackend] = useState(BACKEND_STACK_OPTIONS[0]);
   const [builderError, setBuilderError] = useState("");
   const [showJumpToBottom, setShowJumpToBottom] = useState(false);
   const agentEndRef = useRef<HTMLDivElement | null>(null);
@@ -1675,6 +1913,8 @@ export default function AgentSessionModal({
   const isProjectBuilder = messages.some((message) => /^PROJECT CREATION BRIEF:/i.test(message.content));
   const generatedProjectPath = generatedProjectPathFromMessages(messages);
   const generatedProjectDeleted = latestGeneratedProjectWasDeleted(messages);
+  const builderNeedsBackend = isProjectBuilder && sketchLikelyNeedsBackend(messages);
+  const builderBackendOptions = backendOptionsForFrontend(builderStack);
   const modeLabel = isProjectBuilder ? "Project builder" : hasProject ? "Engineering mode" : "Action mode";
   const title = isProjectBuilder ? "Create App From Sketch" : hasProject ? "Project Investigation" : "Agent Workspace";
   const visibleFolderEntries = folderBrowser.folders
@@ -1957,11 +2197,16 @@ ${folderName || "(auto-generate a clean folder name from the sketch and app conc
 Preferred stack:
 ${builderStack}
 
+Backend:
+${builderNeedsBackend ? builderBackend : "Frontend-only application detected"}
+
 Requirements:
 - Create the folder under the target parent path.
 - If folder name is blank, choose a clean kebab-case name.
 - Create all files needed for a runnable app from scratch.
 - Use the attached generated sketch/design image and source brief as the product direction.
+- If backend is "Auto-detect", inspect the sketch requirements and choose only the backend/files actually needed.
+- If backend is "None" or frontend-only is detected, do not add backend prompts or server files unless the sketch clearly requires persistence/auth/API behavior.
 - Return the exact path, files created, and run commands.
 - Do not ask another setup question unless the target path is invalid or inaccessible.`;
 
@@ -2578,7 +2823,7 @@ Requirements:
                         className="mt-4 inline-flex h-10 items-center gap-2 rounded-xl bg-blue-600 px-4 text-sm font-black text-white shadow-sm transition hover:bg-blue-500 disabled:cursor-not-allowed disabled:bg-slate-300"
                       >
                         <Send size={16} />
-                        Send to Regular Chat
+                        Open in Regular Chat
                       </button>
                     ) : null}
 
@@ -2871,8 +3116,12 @@ Requirements:
                   </label>
                 </div>
 
-                <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
-                  <div className="flex flex-wrap gap-2">
+                <div className="mt-3 flex flex-wrap items-start justify-between gap-3">
+                  <div className="min-w-0 flex-1">
+                    <div className="mb-2 text-xs font-black uppercase tracking-wide text-cyan-100">
+                      Frontend / app target
+                    </div>
+                    <div className="flex max-h-28 flex-wrap gap-2 overflow-auto rounded-xl bg-slate-950/20 p-2 ring-1 ring-white/10">
                     {PROJECT_STACK_OPTIONS.map((option) => (
                       <button
                         key={option}
@@ -2887,6 +3136,37 @@ Requirements:
                         {option}
                       </button>
                     ))}
+                    </div>
+                    {builderNeedsBackend ? (
+                      <div className="mt-3 rounded-xl bg-white/10 p-3 ring-1 ring-white/10">
+                        <div className="mb-2 text-xs font-black uppercase tracking-wide text-cyan-100">
+                          Backend appears needed
+                        </div>
+                        <p className="mb-2 text-xs font-semibold leading-5 text-cyan-50">
+                          This sketch looks like it may need auth, saved data, payments, reporting, uploads, or APIs. Pick a backend or leave Auto-detect.
+                        </p>
+                        <div className="flex flex-wrap gap-2">
+                          {builderBackendOptions.map((option) => (
+                            <button
+                              key={option}
+                              type="button"
+                              onClick={() => setBuilderBackend(option)}
+                              className={`h-8 rounded-xl px-3 text-xs font-black transition ${
+                                builderBackend === option
+                                  ? "bg-emerald-300 text-slate-950"
+                                  : "bg-white/10 text-slate-100 ring-1 ring-white/10 hover:bg-white/20"
+                              }`}
+                            >
+                              {option}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="mt-3 rounded-xl bg-emerald-400/10 px-3 py-2 text-xs font-black text-emerald-100 ring-1 ring-emerald-300/25">
+                        Frontend-only detected. Backend options stay hidden unless the sketch asks for login, payments, saved data, uploads, APIs, inventory, dashboards, or reporting.
+                      </div>
+                    )}
                   </div>
                   <button
                     type="submit"
