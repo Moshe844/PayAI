@@ -434,13 +434,32 @@ const cases: Case[] = [
     expected: "screenshot-review",
   },
   {
-    name: "screenshot attached to no-output command follow-up is screenshot review",
+    name: "screenshot attached to no-output command follow-up stays on previous command",
     prompt: "nothing is showing up, why?????",
     hasImages: true,
     hasProject: true,
     isPaxAndroidBuiltSession: true,
     previousAssistant: "The current blocker is that .\\gradlew.bat -version exits silently. Send the terminal screenshot and I will check what it shows.",
-    expected: "screenshot-review",
+    expected: "focused-follow-up",
+  },
+  {
+    name: "redirected command no-output follow-up explains redirect instead of screenshot caption",
+    prompt: "nothing is showing up, why????",
+    hasImages: true,
+    hasProject: true,
+    isPaxAndroidBuiltSession: true,
+    previousAssistant:
+      "Run:\n.\\gradlew.bat -version --no-daemon --debug --stacktrace > gradle_log.txt 2>&1",
+    expected: "focused-follow-up",
+  },
+  {
+    name: "this is what I got after previous command is command-result follow-up",
+    prompt: "this is what I got",
+    hasImages: true,
+    hasProject: true,
+    previousAssistant:
+      "Open CMD in the project root and run: npm run build > build_log.txt 2>&1. Send the terminal screenshot if it looks blank.",
+    expected: "focused-follow-up",
   },
   {
     name: "screenshot of settings after previous instructions is screenshot review",

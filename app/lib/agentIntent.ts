@@ -45,6 +45,38 @@ export function hasTerminalCommandOutput(text: string) {
   );
 }
 
+export function previousAssistantSuggestedCommand(previousAssistant: string) {
+  return (
+    /\b(?:Run|Execute|Paste|Type|Use|Try|Check|Verify|Validate)\b[\s\S]{0,180}\b(?:command|terminal|cmd|PowerShell|Gradle|gradlew|npm|pnpm|yarn|mvn|dotnet|cargo|pytest|python|java|keytool|curl)\b/i.test(
+      previousAssistant,
+    ) ||
+    /\b(?:gradlew(?:\.bat)?|\.\\gradlew(?:\.bat)?|\.\/gradlew|npm|pnpm|yarn|mvn|dotnet|cargo|pytest|python(?:\.exe)?|go|composer|bundle|java(?:\.exe)?|keytool(?:\.exe)?|curl|where|type|Get-Content)\b/i.test(
+      previousAssistant,
+    ) ||
+    /(?:^|\n)\s*(?:\.\\|\.\/|[A-Za-z]:\\|%[A-Z_]+%\\bin\\)[^\n]+/i.test(previousAssistant)
+  );
+}
+
+export function previousCommandRedirectedOutput(previousAssistant: string) {
+  return /(?:^|\s)>\s*["']?[^"'\r\n]+\.(?:txt|log|out)["']?(?:\s+2>\s*&\s*1|\s+2>&1)?/i.test(previousAssistant);
+}
+
+export function reportsNoOutputFromPreviousCommand(text: string, previousAssistant = "") {
+  const trimmed = text.trim();
+  if (!trimmed || !previousAssistantSuggestedCommand(previousAssistant)) return false;
+
+  const reportsSilentOrAttachedResult =
+    /\b(nothing (?:is )?(?:showing|shown|shows|showed|prints|printed|happens|happened)|no output|blank|empty|did nothing|why no response|no response|nothing happened|not showing|doesn'?t show|does not show|hit enter|pressed enter|returned? (?:right )?back|goes? back|see screenshot|this is what i got|what i got|here|same issue|same thing|look at this)\b/i.test(
+      trimmed,
+    );
+  const containsFreshConcreteFailure =
+    /\b(ERROR:|BUILD FAILED|CONFIGURE FAILED|FAILURE:|JAVA_HOME is not set|no 'java' command could be found|command not found|is not recognized as an internal or external command|Could not resolve|PKIX path building failed|SSL handshake|certificate_unknown)\b/i.test(
+      trimmed,
+    );
+
+  return reportsSilentOrAttachedResult && !containsFreshConcreteFailure;
+}
+
 export function asksFocusedFollowUpQuestion(text: string) {
   const asksQuestion = /\b(what|why|which|where|how|exactly|explain)\b/i.test(text) || /\?/.test(text);
   const mentionsSpecificTarget =
@@ -496,6 +528,15 @@ export function classifyAgentFollowUpIntent(input: AgentFollowUpIntentInput): Ag
   const { prompt, hasImages, hasProject, isPaxAndroidBuiltSession, previousAssistant } = input;
   const asksForReferencedRun = asksToRunReferencedCommands(prompt);
   const asksForPreviousExecution = asksToExecutePreviousAction(prompt, previousAssistant);
+
+  if (reportsNoOutputFromPreviousCommand(prompt, previousAssistant)) {
+    return {
+      route: "focused-follow-up",
+      reason: previousCommandRedirectedOutput(previousAssistant)
+        ? "The user is reporting no visible terminal output after a previous redirected command; explain the redirect target instead of treating the screenshot as standalone evidence."
+        : "The user is reporting the visible result of a previously suggested command; explain that result before any screenshot/log analysis.",
+    };
+  }
 
   if (!prompt.trim() && hasImages) {
     return {
